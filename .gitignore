@@ -1,0 +1,91 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.manifest
+*.spec
+MANIFEST
+
+# Test / lint / type-check caches
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+.hypothesis/
+.tox/
+.nox/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# ── Secrets / local config ────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+secrets.json
+**/secrets.json
+
+# ── Runtime data / artifacts ────────────────────────────────────────────────
+data/*
+!data/.gitkeep
+*.db
+*.sqlite3
+logs/
+*.log
+
+# ── ML / model artifacts ──────────────────────────────────────────────────────
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.ckpt
+*.h5
+*.pb
+wandb/
+mlruns/
+runs/
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+profile_default/
+ipython_config.py
+
+# ── Editors / OS ──────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# ── AI assistant local state ────────────────────────────────────────────────────
+.claude/
+.cursor/
+
+# ── Docker ────────────────────────────────────────────────────────────────────
+docker-compose.override.yml
+
+# ── Package managers ──────────────────────────────────────────────────────────
+.uv/
+pip-log.txt
+pip-delete-this-directory.txt

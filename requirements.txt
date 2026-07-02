@@ -1,0 +1,53 @@
+# ── Core framework ───────────────────────────────────────────────────────────
+pydantic>=2.7,<3
+pydantic-settings>=2.3
+python-dotenv>=1.0
+structlog>=24.1
+tenacity>=8.3
+httpx>=0.27
+anyio>=4.4
+rich>=13.7
+typing-extensions>=4.11
+
+# ── LLM orchestration ────────────────────────────────────────────────────────
+langchain>=0.2.6
+langchain-core>=0.2.10
+langchain-community>=0.2.6
+langgraph>=0.1.5
+langchain-openai>=0.1.14          # also drives DeepSeek/GLM via OpenAI-compatible API
+langchain-google-genai>=1.0.7     # Gemini
+tiktoken>=0.7
+
+# ── MCP (Model Context Protocol) ─────────────────────────────────────────────
+mcp>=1.0.0
+
+# ── API layer ────────────────────────────────────────────────────────────────
+fastapi>=0.111
+uvicorn[standard]>=0.30
+sse-starlette>=2.1
+python-multipart>=0.0.9
+
+# ── Persistence ──────────────────────────────────────────────────────────────
+sqlalchemy[asyncio]>=2.0.31
+asyncpg>=0.29
+alembic>=1.13
+pgvector>=0.3
+redis>=5.0
+greenlet>=3.0
+
+# ── Knowledge / RAG loaders ──────────────────────────────────────────────────
+numpy>=1.26
+pandas>=2.2
+pypdf>=4.2
+python-docx>=1.1
+python-pptx>=0.6.23
+openpyxl>=3.1
+beautifulsoup4>=4.12
+markdownify>=0.12
+
+# ── Tools ────────────────────────────────────────────────────────────────────
+GitPython>=3.1
+PyGithub>=2.3
+
+# ── Observability ────────────────────────────────────────────────────────────
+prometheus-client>=0.20

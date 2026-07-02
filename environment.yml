@@ -1,0 +1,10 @@
+name: AIEmployee
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - pip>=24
+  - postgresql        # client libs for local tooling
+  - pip:
+      - -r requirements-dev.txt

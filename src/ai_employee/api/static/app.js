@@ -1,0 +1,1476 @@
+/* AI Employee Console — dependency-free SPA.
+ * Tabs = sessions; each session holds an initial run + follow-ups. We poll each
+ * running task and render a live n8n-style flow, logs, and the final result. */
+
+const TERMINAL = new Set(["completed", "failed", "awaiting_approval", "cancelled"]);
+const state = {
+  sessions: new Map(),        // sid -> session object
+  order: [],                  // tab order of sids
+  active: null,               // active sid
+  cache: new Map(),           // taskId -> snapshot
+  pollers: new Map(),         // taskId -> intervalId
+};
+
+// Latest brain config (/config) + coding backend options, cached so the Explain
+// header can show which models are doing the reasoning and the coding.
+let _brainCfg = null;
+const HOSTED_BRAIN_PROVIDERS = ["deepseek", "openai", "gemini", "glm", "opencode"];
+const BRAIN_BALANCE_REFRESH_MS = 5 * 60 * 1000;
+let _brainBalanceTimer = null;
+
+const $ = (sel, root = document) => root.querySelector(sel);
+const el = (html) => { const t = document.createElement("template"); t.innerHTML = html.trim(); return t.content.firstChild; };
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+async function api(method, path, body) {
+  const res = await fetch(path, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+  return res.json();
+}
+
+/* ── Saved-task sidebar ────────────────────────────────────────────────── */
+async function loadSessionList() {
+  let data;
+  try { data = await api("GET", "/ui/api/sessions"); }
+  catch { return; }
+  const list = $("#session-list");
+  list.innerHTML = "";
+  const sessions = (data.sessions || []).slice().reverse();  // newest first
+  if (!sessions.length) {
+    list.innerHTML = `<div class="sidebar-empty">No saved tasks yet.<br>Run one above.</div>`;
+    return;
+  }
+  for (const s of sessions) {
+    const last = s.runs[s.runs.length - 1] || {};
+    const status = s.runs.some(r => r.status === "running" || r.status === "pending")
+      ? "running" : (last.status || "completed");
+    const item = el(`<div class="sess-item ${state.sessions.has(s.id) ? "open" : ""}">
+      <span class="dot ${status}"></span>
+      <div class="meta"><div class="t">${esc(s.title)}</div>
+        <div class="sub">${s.runs.length} run${s.runs.length === 1 ? "" : "s"} · ${fmtDate(s.created_at)}</div></div>
+      <span class="clr-mem" title="Clear this task's memory">🧠</span>
+      <span class="del" title="Delete task">🗑</span></div>`);
+    item.addEventListener("click", (e) => {
+      if (e.target.classList.contains("del")) { deleteSession(s.id); return; }
+      if (e.target.classList.contains("clr-mem")) { clearSessionMemory(s.id, s.title); return; }
+      openSession(s.id);
+    });
+    list.appendChild(item);
+  }
+}
+
+function fmtDate(iso) {
+  try { const d = new Date(iso); return d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }); }
+  catch { return ""; }
+}
+
+async function deleteSession(sid) {
+  if (!confirm("Delete this saved task and its history?\n\nThis also removes recall memory for this task.")) return;
+  try { await api("DELETE", `/ui/api/sessions/${sid}`); } catch {}
+  if (state.sessions.has(sid)) closeSession(sid);
+  loadSessionList();
+}
+
+async function clearSessionMemory(sid, title) {
+  const label = title ? `"${title.slice(0, 48)}"` : "this task";
+  if (!confirm(`Clear recall memory for ${label}?\n\nThe saved run history stays — only what the AI remembers for follow-ups is removed.`)) return;
+  try {
+    const res = await api("DELETE", `/ui/api/sessions/${sid}/memory`);
+    const n = res.records_removed;
+    alert(n != null ? `Cleared ${n} memory record${n === 1 ? "" : "s"} for this task.` : "Task memory cleared.");
+  } catch (e) {
+    alert("Failed to clear task memory: " + e.message);
+  }
+}
+
+async function deleteAllSessions() {
+  if (!confirm(
+    "Delete ALL saved tasks?\n\n" +
+    "This removes every task from the sidebar and deletes their run history. " +
+    "Each task's recall memory is cleared too.\n\n" +
+    "Global memory (🧹) and other tasks' unrelated recall are not wiped unless you use Clear all memories."
+  )) return;
+  const btn = $("#delete-all-sessions");
+  btn.disabled = true;
+  try {
+    const res = await api("DELETE", "/ui/api/sessions");
+    for (const sid of [...state.order]) closeSession(sid);
+    alert(`Deleted ${res.deleted} saved task${res.deleted === 1 ? "" : "s"}.`);
+    loadSessionList();
+  } catch (e) {
+    alert("Failed to delete tasks: " + e.message);
+  }
+  btn.disabled = false;
+}
+
+/* Open (or resume) a saved session as a tab. */
+async function openSession(sid) {
+  if (state.sessions.has(sid)) { setActive(sid); return; }
+  let detail;
+  try { detail = await api("GET", `/ui/api/sessions/${sid}`); }
+  catch { return; }
+  const runs = (detail.runs || []).map(r => ({ id: r.id, goal: r.goal, status: r.status }));
+  detail.runs.forEach(r => state.cache.set(r.id, r));
+  const session = {
+    id: sid, title: detail.title, runs,
+    activeRun: runs.length ? runs[runs.length - 1].id : null, view: "flow",
+  };
+  state.sessions.set(sid, session);
+  state.order.push(sid);
+  buildSection(session);
+  setActive(sid);
+  // Resume polling for any run still in flight (e.g. opened in another tab).
+  runs.filter(r => !TERMINAL.has(r.status)).forEach(r => poll(r.id, sid));
+  renderTabs();
+  loadSessionList();
+}
+
+/* ── Task creation ─────────────────────────────────────────────────────── */
+async function newTask(goal, mode) {
+  const { task_id, session_id } = await api("POST", "/ui/api/tasks", { goal, mode: mode || "task" });
+  const session = {
+    id: session_id, title: goal.slice(0, 42), runs: [{ id: task_id, goal, status: "pending" }],
+    activeRun: task_id, view: "flow",
+  };
+  state.sessions.set(session_id, session);
+  state.order.push(session_id);
+  buildSection(session);
+  setActive(session_id);
+  poll(task_id, session_id);
+  renderTabs();
+  loadSessionList();
+}
+
+async function followUp(sid, goal, approvedOps, mode) {
+  const { task_id } = await api("POST", `/ui/api/sessions/${sid}/followup`, { goal, approved_ops: approvedOps || [], mode: mode || "task" });
+  const s = state.sessions.get(sid);
+  s.runs.push({ id: task_id, goal, status: "pending" });
+  s.activeRun = task_id;
+  poll(task_id, sid);
+  renderSession(s);
+  renderTabs();
+}
+
+/* Approve a paused run and resume it IN PLACE — same run, same tab (no new run
+ * is created). The paused task flips back to running and the poller re-attaches. */
+function resourceApprovalBanner(task, session, na) {
+  const urls = (na.candidate_urls || na.args?.candidate_urls || []).slice(0, 8);
+  const hubs = (na.hubs_searched || na.args?.hubs_searched || []).join(", ");
+  const missing = (na.missing_credentials || na.args?.missing_credentials || []).join(", ");
+  const desc = na.resource_description || na.args?.resource_description || na.message || "Required resource";
+  const urlList = urls.length
+    ? `<ul class="x-list">${urls.map(u => `<li><a href="${esc(u)}" target="_blank" class="x-link">${esc(u)}</a></li>`).join("")}</ul>`
+    : `<p class="x-muted">No candidate URLs — searched: ${esc(hubs || "all hubs")}</p>`;
+  const id = `res-appr-${task.id}`;
+  return `<div class="approval-banner resource-banner" id="${id}">
+    <div><b>Resource needed:</b> ${esc(desc)}</div>
+    ${missing ? `<div class="x-muted">Missing API keys: ${esc(missing)} — add in 🔑 Keys</div>` : ""}
+    <div class="x-label" style="margin-top:8px">Candidate links</div>${urlList}
+    <div class="resource-appr-form">
+      <label>Decision
+        <select class="res-decision">
+          <option value="provide_local_path">I downloaded it — use local path</option>
+          <option value="provide_url">Try this URL instead</option>
+          <option value="proceed_without">Proceed without this resource</option>
+          <option value="abort">Stop — resource is required</option>
+        </select>
+      </label>
+      <label>Local path (workspace) <input class="res-path" placeholder="./data/my_file.mp4" /></label>
+      <label>URL <input class="res-url" placeholder="https://…" /></label>
+      <label>Note <input class="res-note" placeholder="optional" /></label>
+      <button class="btn primary res-approve-btn">Continue with choice</button>
+    </div>
+  </div>`;
+}
+
+function wireResourceApproval(task, session) {
+  const wrap = document.getElementById(`res-appr-${task.id}`);
+  if (!wrap) return;
+  const btn = $(".res-approve-btn", wrap);
+  if (!btn || btn._wired) return;
+  btn._wired = true;
+  btn.addEventListener("click", () => {
+    const decision = $(".res-decision", wrap).value;
+    const body = {
+      decision,
+      local_path: $(".res-path", wrap).value.trim() || undefined,
+      resource_url: $(".res-url", wrap).value.trim() || undefined,
+      note: $(".res-note", wrap).value.trim() || undefined,
+    };
+    approveTask(session.id, task.id, body);
+  });
+}
+
+async function approveTask(sid, taskId, body) {
+  try { await api("POST", `/ui/api/tasks/${taskId}/approve`, body || undefined); }
+  catch (e) { alert("Approve failed: " + e.message); return; }
+  const s = state.sessions.get(sid);
+  if (s) {
+    const run = s.runs.find(r => r.id === taskId);
+    if (run) run.status = "running";
+    s.activeRun = taskId;              // stay on the same run
+    renderSession(s);
+  }
+  poll(taskId, sid);                   // resume polling the same task id
+  renderTabs();
+}
+
+/* Stop a run in flight. The poller picks up the resulting "cancelled" status. */
+async function cancelTask(taskId) {
+  try { await api("POST", `/ui/api/tasks/${taskId}/cancel`); } catch {}
+}
+
+/* ── Polling ───────────────────────────────────────────────────────────── */
+function poll(taskId, sid) {
+  const tick = async () => {
+    let snap;
+    try { snap = await api("GET", `/ui/api/tasks/${taskId}`); }
+    catch { return; }
+    state.cache.set(taskId, snap);
+    const s = state.sessions.get(sid);
+    if (s) {
+      const run = s.runs.find(r => r.id === taskId);
+      if (run) run.status = snap.status;
+      // Adopt the auto-generated session title once it's ready.
+      if (snap.session_title && s.title !== snap.session_title) {
+        s.title = snap.session_title;
+        loadSessionList();
+      }
+    }
+    if (state.active === sid && s && s.activeRun === taskId) renderActiveView(s);
+    renderTabs();
+    if (TERMINAL.has(snap.status)) {
+      clearInterval(state.pollers.get(taskId));
+      state.pollers.delete(taskId);
+      loadSessionList();  // reflect final status in the saved-tasks panel
+    }
+  };
+  tick();
+  state.pollers.set(taskId, setInterval(tick, 1000));
+}
+
+/* ── Tabs ──────────────────────────────────────────────────────────────── */
+function sessionStatus(s) {
+  if (s.runs.some(r => r.status === "running" || r.status === "pending")) return "running";
+  return s.runs[s.runs.length - 1]?.status || "pending";
+}
+
+function renderTabs() {
+  const tabs = $("#tabs");
+  tabs.innerHTML = "";
+  for (const sid of state.order) {
+    const s = state.sessions.get(sid);
+    const tab = el(`<div class="tab ${sid === state.active ? "active" : ""}">
+      <span class="dot ${sessionStatus(s)}"></span>
+      <span class="title">${esc(s.title)}</span>
+      <span class="close" title="Close">×</span></div>`);
+    tab.addEventListener("click", (e) => {
+      if (e.target.classList.contains("close")) { closeSession(sid); return; }
+      setActive(sid);
+    });
+    tabs.appendChild(tab);
+  }
+}
+
+function closeSession(sid) {
+  const s = state.sessions.get(sid);
+  s.runs.forEach(r => { clearInterval(state.pollers.get(r.id)); state.pollers.delete(r.id); });
+  if (s._el) s._el.remove();
+  state.sessions.delete(sid);
+  state.order = state.order.filter(x => x !== sid);
+  if (state.active === sid) state.active = state.order[state.order.length - 1] || null;
+  if (state.active) setActive(state.active); else showEmpty();
+  renderTabs();
+}
+
+function showEmpty() {
+  $("#workspace").querySelectorAll(".session").forEach(n => n.style.display = "none");
+  let empty = $("#empty-state");
+  if (empty) empty.style.display = "flex";
+}
+
+function setActive(sid) {
+  state.active = sid;
+  const empty = $("#empty-state"); if (empty) empty.style.display = "none";
+  $("#workspace").querySelectorAll(".session").forEach(n => n.style.display = "none");
+  const s = state.sessions.get(sid);
+  s._el.style.display = "flex";
+  renderSession(s);
+  renderTabs();
+}
+
+/* ── Section (per session) ─────────────────────────────────────────────── */
+function buildSection(session) {
+  const node = $("#session-template").content.firstElementChild.cloneNode(true);
+  session._el = node;
+  $("#workspace").appendChild(node);
+
+  node.querySelectorAll(".subtab").forEach(btn => {
+    btn.addEventListener("click", () => {
+      session.view = btn.dataset.view;
+      renderSession(session);
+    });
+  });
+  $(".followup", node).addEventListener("submit", (e) => {
+    e.preventDefault();
+    const input = $(".followup-input", node);
+    const goal = input.value.trim();
+    if (!goal) return;
+    input.value = "";
+    followUp(session.id, goal);
+  });
+  $(".sess-clear-memory", node).addEventListener("click", () => clearSessionMemory(session.id, session.title));
+  $(".sess-delete", node).addEventListener("click", () => deleteSession(session.id));
+}
+
+function renderSession(s) {
+  // runs strip
+  const strip = $(".runs-strip", s._el);
+  strip.innerHTML = "";
+  s.runs.forEach((r, i) => {
+    const chip = el(`<div class="run-chip ${r.id === s.activeRun ? "active" : ""}">
+      <span class="dot ${r.status}"></span>${i === 0 ? "Task" : "Follow-up " + i}: ${esc(r.goal.slice(0, 30))}</div>`);
+    chip.addEventListener("click", () => { s.activeRun = r.id; renderSession(s); });
+    strip.appendChild(chip);
+  });
+  // Stop button for the active run while it's still in flight.
+  const active = s.runs.find(r => r.id === s.activeRun);
+  if (active && !TERMINAL.has(active.status)) {
+    const stop = el(`<button class="btn stop-btn" title="Stop this run">■ Stop</button>`);
+    stop.addEventListener("click", () => {
+      stop.disabled = true;
+      stop.textContent = "Stopping…";
+      cancelTask(active.id);
+    });
+    strip.appendChild(stop);
+  }
+  // subtab active state
+  s._el.querySelectorAll(".subtab").forEach(b => b.classList.toggle("active", b.dataset.view === s.view));
+  renderActiveView(s);
+}
+
+function renderActiveView(s) {
+  const task = state.cache.get(s.activeRun);
+  const flow = $(".flow-view", s._el), explain = $(".explain-view", s._el),
+        logs = $(".logs-view", s._el), result = $(".result-view", s._el);
+  flow.classList.toggle("active", s.view === "flow");
+  explain.classList.toggle("active", s.view === "explain");
+  logs.classList.toggle("active", s.view === "logs");
+  result.classList.toggle("active", s.view === "result");
+  const lc = $(".log-count", s._el);
+  if (lc) lc.textContent = task ? `(${(task.events || []).length})` : "";
+
+  if (!task) { flow.innerHTML = explain.innerHTML = logs.innerHTML = result.innerHTML = `<div class="placeholder">Waiting for the employee to start…</div>`; return; }
+  if (s.view === "flow") flow.innerHTML = renderFlow(task, s);
+  else if (s.view === "explain") {
+    // Preserve which <details> the user expanded/collapsed, so the poller's
+    // re-render doesn't slam them shut a second after they're opened.
+    const prevOpen = new Map();
+    explain.querySelectorAll("details[data-xk]").forEach(d => prevOpen.set(d.getAttribute("data-xk"), d.open));
+    explain.innerHTML = problemHeader(task) + renderExplain(task);
+    explain.querySelectorAll("details[data-xk]").forEach(d => {
+      const k = d.getAttribute("data-xk");
+      if (prevOpen.has(k)) d.open = prevOpen.get(k);  // keep user's state; new nodes keep their default
+    });
+  }
+  else if (s.view === "logs") { logs.innerHTML = renderLogs(task); logs.scrollTop = logs.scrollHeight; }
+  else result.innerHTML = problemHeader(task) + renderResult(task, s);
+}
+
+/* The base problem (the goal the user gave) — pinned to the top of Result & Explain. */
+function problemHeader(task) {
+  const goal = (task && task.goal) || "";
+  if (!goal) return "";
+  const tag = task.mode === "research" ? `<span class="pb-tag">🔬 Research</span>` : "";
+  return `<div class="problem-banner"><div class="pb-head"><span class="pb-label">Problem</span>${tag}${modelBadges()}</div>
+    <div class="pb-goal">${esc(goal)}</div></div>`;
+}
+
+/* Which models are doing the work — brain (reasoning) + coding backend — shown
+ * beside the task so it's clear what produced the output. Sourced from /config
+ * and /ui/api/coding/options (cached by the top-bar badges). */
+function modelBadges() {
+  const cfg = _brainCfg;
+  if (!cfg) return "";
+  const brain = `${cfg.provider}${cfg.model ? " · " + cfg.model : ""}`;
+  // Coding step: "brain" backend reuses the brain model; a CLI backend runs its own.
+  const cb = (_codingOpts && _codingOpts.current) || "brain";
+  const code = cb === "brain"
+    ? `brain · ${cfg.model || cfg.provider}`
+    : `${cb} (CLI)`;
+  return `<span class="pb-models">` +
+    `<span class="pb-model" title="Reasoning brain (LLM provider · model)">🧠 ${esc(brain)}</span>` +
+    `<span class="pb-model" title="Coding backend that writes &amp; runs code">⌨ ${esc(code)}</span>` +
+    `</span>`;
+}
+
+/* ── Flow (derive an n8n-style graph from the event stream) ────────────── */
+function deriveFlow(task) {
+  let plan = null, synth = false, reflect = false, approval = null;
+  const steps = new Map();
+  const ensure = (n, agent) => {
+    if (!steps.has(n)) steps.set(n, { step: n, agent: agent || "?", tools: new Map(), verified: null, confidence: null, retries: 0 });
+    const s = steps.get(n); if (agent) s.agent = agent; return s;
+  };
+  for (const e of (task.events || [])) {
+    const f = e.fields || {};
+    switch (e.event) {
+      case "planner.plan_ready":
+      case "workflow.planned": plan = { steps: f.steps ?? plan?.steps ?? 0 }; break;
+      case "agent.start": if (f.node === "execute" && f.step != null) ensure(f.step, f.agent); break;
+      case "tool.execute": if (f.step != null && f.tool) { const s = ensure(f.step); if (!s.tools.has(f.tool)) s.tools.set(f.tool, { name: f.tool, status: "running" }); } break;
+      case "tool.result": if (f.step != null && f.tool) { const s = ensure(f.step); s.tools.set(f.tool, { name: f.tool, status: f.ok ? "ok" : "fail", latency: f.latency_ms }); } break;
+      case "tool.approval_required": if (f.step != null && f.tool) { ensure(f.step).tools.set(f.tool, { name: f.tool, status: "approval" }); } approval = { ...(approval || {}), tool: f.tool, args: f.args, key: f.key, step: f.step }; break;
+      case "verifier.verdict": if (f.step != null) { const s = ensure(f.step); s.verified = f.passed; s.confidence = f.confidence; } break;
+      case "workflow.retry": if (f.step != null) ensure(f.step).retries = f.attempt || 0; break;
+      case "workflow.node": if (f.node === "synthesize") synth = true; if (f.node === "reflect") reflect = true; break;
+      case "agent.needs_approval": approval = { ...(approval || {}), operation: f.op, tool: f.tool ?? approval?.tool, args: f.args ?? approval?.args }; break;
+    }
+  }
+  return { plan, steps: [...steps.values()].sort((a, b) => a.step - b.step), synth, reflect, approval };
+}
+
+function nodeHtml(cls, type, icon, title, bodyHtml = "") {
+  return `<div class="node ${cls}">
+    <div class="node-head"><span class="node-icon">${icon}</span>${esc(title)}</div>
+    <div class="node-type">${esc(type)}</div>${bodyHtml}</div>`;
+}
+const conn = () => `<div class="connector"></div>`;
+
+/* Turn a pending approval into a human explanation of *what* will run and its
+ * key detail (for shell: the exact command; for file writes: the path/content). */
+function approvalWhat(a) {
+  const tool = a.tool || "";
+  const args = a.args || {};
+  if (tool === "shell")
+    return { verb: "run a shell command", detail: args.command || "", mono: true };
+  if (tool === "write_file")
+    return { verb: `write the file ${args.path || ""}`.trim(),
+             detail: args.content != null ? String(args.content).slice(0, 800) : "", mono: true };
+  if (tool === "make_dir")
+    return { verb: `create the directory ${args.path || ""}`.trim(), detail: "", mono: false };
+  if (tool === "download_resource")
+    return { verb: "download a resource into the workspace", detail: `${args.url || ""} → ${args.destination || ""}`.trim(), mono: true };
+  if (tool === "request_resource_input" || a.operation === "resource_acquisition")
+    return { verb: "ask you how to proceed (resource missing or not downloaded)",
+             detail: (a.message || args.message || "") + (args.candidate_urls ? "\nURLs: " + args.candidate_urls.join(", ") : ""),
+             mono: false };
+  const keys = Object.keys(args);
+  return { verb: tool ? `use the ${tool} tool` : "perform a sensitive operation",
+           detail: keys.length ? JSON.stringify(args, null, 2) : "", mono: true };
+}
+
+function approvalNode(a, task) {
+  const w = approvalWhat(a);
+  const op = a.operation || a.key || "sensitive operation";
+  const detail = w.detail
+    ? `<div class="appr-detail ${w.mono ? "mono" : ""}">${esc(w.detail)}</div>` : "";
+  const via = a.tool ? ` <span class="muted">via <code>${esc(a.tool)}</code></span>` : "";
+  const btn = task.status === "awaiting_approval"
+    ? `<button class="btn primary appr-btn" id="fapprove-${task.id}">Approve &amp; continue</button>` : "";
+  return `<div class="node approval">
+    <div class="node-head"><span class="node-icon">⏸</span>Approval required</div>
+    <div class="node-type">${esc(op)}${a.step != null ? " · step " + esc(a.step) : ""}</div>
+    <div class="appr-body">
+      <div class="appr-what">Wants to <b>${esc(w.verb)}</b>${via}</div>
+      ${detail}${btn}
+    </div></div>`;
+}
+
+function renderFlow(task, session) {
+  const fl = deriveFlow(task);
+  const agents = new Set(fl.steps.map(s => s.agent));
+  if (fl.synth) agents.add("ceo");
+  const tools = new Set();
+  fl.steps.forEach(s => s.tools.forEach(t => tools.add(t.name)));
+
+  const summary = `<div class="flow-summary">
+    <div class="stat"><div class="v">${fl.steps.length || (fl.plan?.steps || 0)}</div><div class="k">Steps</div></div>
+    <div class="stat"><div class="v">${agents.size}</div><div class="k">Agents</div></div>
+    <div class="stat"><div class="v">${tools.size}</div><div class="k">Tools used</div></div>
+    <div class="stat"><div class="v">${esc(statusLabel(task.status))}</div><div class="k">Status</div></div>
+  </div>`;
+
+  const nodes = [];
+  nodes.push(nodeHtml("plan", "Planner", "◇",
+    "Plan", `<div class="node-sub">${fl.plan ? fl.plan.steps + " step(s) decomposed" : "planning…"}</div>`));
+
+  for (const s of fl.steps) {
+    let chips = "";
+    if (s.tools.size) {
+      chips = `<div class="tool-chips">` + [...s.tools.values()].map(t =>
+        `<span class="chip"><span class="s ${t.status}"></span>${esc(t.name)}${t.latency != null ? `<span class="muted">${Math.round(t.latency)}ms</span>` : ""}</span>`).join("") + `</div>`;
+    }
+    let badge = "";
+    if (s.verified === true) badge = `<div class="badge ok">✓ verified${s.confidence != null ? " · " + s.confidence : ""}</div>`;
+    else if (s.verified === false) badge = `<div class="badge fail">✗ needs work</div>`;
+    const retry = s.retries ? `<div class="node-sub">retried ×${s.retries}</div>` : "";
+    nodes.push(nodeHtml("step", `Step ${s.step} · agent`, "▣", s.agent, chips + badge + retry));
+  }
+  if (fl.approval && task.status === "awaiting_approval")
+    nodes.push(approvalNode(fl.approval, task));
+  if (fl.synth) nodes.push(nodeHtml("synthesize", "CEO", "★", "Synthesize", `<div class="node-sub">integrate step outputs</div>`));
+  if (fl.reflect) nodes.push(nodeHtml("reflect", "Memory", "↻", "Reflect", `<div class="node-sub">store outcome + learn skill</div>`));
+  if (task.status === "completed") nodes.push(nodeHtml("result", "Output", "✓", "Result", `<div class="node-sub">final deliverable ready</div>`));
+
+  // Wire the in-flow approve button once it's in the DOM (mirrors the Result tab).
+  if (fl.approval && task.status === "awaiting_approval" && session) {
+    setTimeout(() => {
+      const btn = document.getElementById(`fapprove-${task.id}`);
+      if (btn) btn.addEventListener("click", () => approveTask(session.id, task.id));
+    }, 0);
+  }
+
+  return summary + `<div class="flow">` + nodes.join(conn()) + `</div>`;
+}
+
+function statusLabel(s) {
+  return { running: "Running", pending: "Starting", completed: "Done", failed: "Failed", awaiting_approval: "Needs approval", cancelled: "Cancelled" }[s] || s;
+}
+
+/* ── Explain (input → reasoning → output, per component) ───────────────── */
+/* Walk the event stream and group it into the components the user sees: the
+ * Planner, each executed Step (with its LLM calls, tool calls and verification),
+ * the Synthesis, and Reflection. Every LLM call captures the exact messages in
+ * and the content/usage out; every tool call its args in and output out. */
+function buildTrace(task) {
+  const comps = [];
+  const steps = new Map();
+  let planner = null, synth = null, reflect = null;
+
+  const mkPlanner = () => planner || (comps.push(planner = { kind: "planner", title: "Planner", icon: "◇", input: null, output: null, llm: [] }), planner);
+  const mkStep = (n) => {
+    if (!steps.has(n)) { const c = { kind: "step", step: n, agent: "?", title: "Step " + n, icon: "▣", input: null, answer: null, llm: [], tools: [], verify: { input: null, verdict: null, llm: [] } }; steps.set(n, c); comps.push(c); }
+    return steps.get(n);
+  };
+  const mkSynth = () => synth || (comps.push(synth = { kind: "synthesize", title: "Synthesize", icon: "★", agent: "ceo", input: null, output: null, llm: [] }), synth);
+  const mkReflect = () => reflect || (comps.push(reflect = { kind: "reflect", title: "Reflect", icon: "↻", llm: [], notes: "Persist the outcome to long-term memory and distill a reusable skill." }), reflect);
+
+  // Pick the right LLM-call bucket for a brain.* event from its bound context.
+  const llmBucket = (f) => {
+    if (f.step != null) { const s = mkStep(f.step); return f.phase === "verify" ? s.verify.llm : s.llm; }
+    if (f.node === "plan" || f.purpose === "planner") return mkPlanner().llm;
+    if (f.node === "synthesize" || f.purpose === "synthesize") return mkSynth().llm;
+    if (f.node === "reflect") return mkReflect().llm;
+    return mkSynth().llm;
+  };
+
+  for (const e of (task.events || [])) {
+    const f = e.fields || {};
+    switch (e.event) {
+      case "planner.input": mkPlanner().input = { goal: f.goal, agents: f.agents || [] }; break;
+      case "planner.plan_ready": mkPlanner().output = { steps: f.steps, reasoning: f.reasoning, plan: f.plan || [] }; break;
+      case "agent.start": if (f.step != null) mkStep(f.step).agent = f.agent || "?"; break;
+      case "agent.context":
+        if (f.step != null) { const s = mkStep(f.step); s.agent = f.agent || s.agent; s.input = { system: f.system, memories: f.memories || [], task: f.task }; }
+        else if (f.node === "synthesize") mkSynth().input = { system: f.system, memories: f.memories || [], task: f.task };
+        break;
+      case "agent.answer":
+        if (f.step != null) { mkStep(f.step).answer = { output: f.output, note: f.note }; }
+        else if (f.node === "synthesize") mkSynth().output = { output: f.output };
+        break;
+      case "brain.request": llmBucket(f).push({ req: f, resp: null }); break;
+      case "brain.response": { const b = llmBucket(f); for (let i = b.length - 1; i >= 0; i--) if (!b[i].resp) { b[i].resp = f; break; } break; }
+      case "tool.execute": if (f.step != null) mkStep(f.step).tools.push({ name: f.tool, args: f.args, status: "running" }); break;
+      case "tool.result": if (f.step != null) { const ts = mkStep(f.step).tools; for (let i = ts.length - 1; i >= 0; i--) if (ts[i].name === f.tool && ts[i].status === "running") { Object.assign(ts[i], { status: f.ok ? "ok" : "fail", output: f.output, error: f.error, latency: f.latency_ms }); break; } } break;
+      case "verifier.input": if (f.step != null) mkStep(f.step).verify.input = { task: f.task, criteria: f.criteria, output: f.output }; break;
+      case "verifier.verdict": if (f.step != null) mkStep(f.step).verify.verdict = { passed: f.passed, confidence: f.confidence, issues: f.issues || [], suggestion: f.suggestion }; break;
+      case "workflow.node": if (f.node === "synthesize") mkSynth(); if (f.node === "reflect") mkReflect(); break;
+      case "approval.granted": comps.push({ kind: "approval", idx: comps.length, title: "Approved", icon: "✅", op: f.op, tool: f.tool, args: f.args }); break;
+    }
+  }
+  return comps;
+}
+
+const _jsonBlk = (obj) => `<pre class="x-json">${esc(typeof obj === "string" ? obj : JSON.stringify(obj, null, 2))}</pre>`;
+const _field = (label, html) => `<div class="x-field"><div class="x-label">${esc(label)}</div>${html}</div>`;
+const _text = (t) => `<div class="x-text">${esc(t ?? "")}</div>`;
+
+function msgsBlock(msgs) {
+  if (!Array.isArray(msgs) || !msgs.length) return _text("(no messages)");
+  return `<div class="x-msgs">` + msgs.map((m, idx) => {
+    let extra = "";
+    if (m.tool_calls && m.tool_calls.length) extra = `<div class="x-toolcalls">→ calls: ${m.tool_calls.map(c => `<code>${esc(c.name)}(${esc(JSON.stringify(c.args))})</code>`).join(" ")}</div>`;
+    const roleLabel = m.role === "tool" && m.name ? `${m.role}:${esc(m.name)}` : esc(m.role);
+    return `<div class="x-msg"><span class="x-role ${esc(m.role)}">${roleLabel}</span><span class="x-msg-idx">#${idx + 1}</span><div class="x-body"><span class="x-content">${esc(m.content || (extra ? "" : "(empty)"))}</span>${extra}</div></div>`;
+  }).join("") + `</div>`;
+}
+
+function llmInpSummary(messages) {
+  if (!messages || !messages.length) return "0 msg";
+  const roles = messages.map(m => m.role === "tool" && m.name ? `tool:${m.name}` : m.role);
+  return `${messages.length} msg · ${roles.join(" → ")}`;
+}
+
+function llmOutSummary(resp, req) {
+  if (!resp) return "waiting…";
+  if (req.kind === "structured") return `JSON · ${esc(req.schema || "structured")}`;
+  const tc = resp.tool_calls || [];
+  if (tc.length) return `tool_calls · ${tc.map(t => t.name).join(", ")}`;
+  const txt = (resp.content || "").trim();
+  if (txt) return `text · ${txt.length > 48 ? txt.slice(0, 48) + "…" : txt}`;
+  if (resp.reasoning) return "reasoning only";
+  return esc(resp.finish_reason || "—");
+}
+
+function llmInpDelta(prevMessages, messages) {
+  if (!prevMessages || !messages || messages.length <= prevMessages.length) return "";
+  const added = messages.length - prevMessages.length;
+  const newOnes = messages.slice(prevMessages.length);
+  const roles = newOnes.map(m => m.role === "tool" && m.name ? `tool:${m.name}` : m.role);
+  return `+${added} since previous call (${roles.join(", ")}) — this is why INP looks similar at the top; scroll down for new context.`;
+}
+
+function llmBlock(call, i, keyBase = "", prevCall = null) {
+  const req = call.req || {}, resp = call.resp || {};
+  const prevMsgs = prevCall && prevCall.req ? prevCall.req.messages : null;
+  const inpNote = llmInpDelta(prevMsgs, req.messages);
+  const tag = req.kind === "structured" ? `JSON ${esc(req.schema || "")}` : (resp.finish_reason ? esc(resp.finish_reason) : "");
+  const tokens = resp.usage ? `${resp.usage.total_tokens} tok` : "";
+  const outShort = llmOutSummary(resp, req);
+  const summary =
+    `🧠 LLM ${i + 1} · <span class="x-io"><span class="x-inp-tag">INP</span>→<span class="x-out-tag">OUT</span></span>` +
+    ` · <span class="x-muted">${esc(llmInpSummary(req.messages))}</span>` +
+    ` · <span class="x-out-short">OUT: ${outShort}</span>` +
+    (tag ? ` · ${tag}` : "") +
+    (tokens ? ` · <span class="x-muted">${tokens}</span>` : "") +
+    (!call.resp ? ` · <span class="x-muted">running…</span>` : "");
+
+  let body = `<div class="x-llm-inp">`;
+  body += `<div class="x-llm-section-label"><span class="x-inp-tag">INP</span> — messages sent to the model</div>`;
+  if (inpNote) body += `<div class="x-inp-delta">${esc(inpNote)}</div>`;
+  body += msgsBlock(req.messages);
+  if (req.tools && req.tools.length) body += _field("Tools offered to model", `<div class="x-text">${req.tools.map(t => `<code>${esc(t)}</code>`).join(" ")}</div>`);
+  body += `</div>`;
+
+  body += `<div class="x-llm-out">`;
+  body += `<div class="x-llm-section-label"><span class="x-out-tag">OUT</span> — model response</div>`;
+  if (!call.resp) body += _text("(waiting for response…)");
+  else if (req.kind === "structured") body += _jsonBlk(resp.output);
+  else {
+    if (resp.reasoning) body += _field("Reasoning (chain-of-thought)", _text(resp.reasoning));
+    body += _field("Text content", _text(resp.content || "(no text — see tool calls below)"));
+    if (resp.tool_calls && resp.tool_calls.length) body += _field("Tool calls requested", _jsonBlk(resp.tool_calls));
+    if (resp.finish_reason) body += _field("Finish reason", _text(resp.finish_reason));
+    if (resp.usage) body += _field("Token usage", _text(`${resp.usage.prompt_tokens} prompt + ${resp.usage.completion_tokens} completion = ${resp.usage.total_tokens} total`));
+  }
+  body += `</div>`;
+
+  return `<details class="x-call x-llm-call" data-xk="${esc(keyBase)}:llm:${i}"><summary>${summary}</summary><div class="x-call-body">${body}</div></details>`;
+}
+
+function toolBlock(t, i = 0, keyBase = "") {
+  const stClass = t.status === "ok" ? "ok" : (t.status === "fail" ? "fail" : "run");
+  const lat = t.latency != null ? `<span class="x-muted">· ${Math.round(t.latency)}ms</span>` : "";
+  const mark = t.status === "ok" ? "✓" : (t.status === "fail" ? "✗" : "…");
+  let body = _field("Input (arguments)", _jsonBlk(t.args || {}));
+  if (t.error) body += _field("Error", _text(t.error));
+  body += _field("Output", _text(t.output ?? "(no output captured)"));
+  return `<details class="x-call tool ${stClass}" data-xk="${esc(keyBase)}:tool:${i}"><summary>🔧 ${esc(t.name)} <span class="x-mark ${stClass}">${mark}</span> ${lat}</summary><div class="x-call-body">${body}</div></details>`;
+}
+
+function verifyBlock(v, keyBase = "") {
+  const vd = v.verdict;
+  const badge = vd ? (vd.passed ? `<span class="x-mark ok">✓ passed</span>` : `<span class="x-mark fail">✗ needs work</span>`) : `<span class="x-muted">running…</span>`;
+  const conf = vd && vd.confidence != null ? `<span class="x-muted">· ${(vd.confidence * 100).toFixed(0)}% conf</span>` : "";
+  let body = "";
+  if (v.input) body += _field("Input (what was reviewed)", _text(v.input.output));
+  v.llm.forEach((c, i) => body += llmBlock(c, i, keyBase + ":verify", i > 0 ? v.llm[i - 1] : null));
+  if (vd) {
+    if (vd.issues && vd.issues.length) body += _field("Issues found", `<ul class="x-list">${vd.issues.map(x => `<li>${esc(x)}</li>`).join("")}</ul>`);
+    if (vd.suggestion) body += _field("Suggested fix", _text(vd.suggestion));
+  }
+  return `<details class="x-call verify" data-xk="${esc(keyBase)}:verify"><summary>🔎 Verification ${badge} ${conf}</summary><div class="x-call-body">${body || _text("(no verification data)")}</div></details>`;
+}
+
+function compCard(c) {
+  // Stable key per component so the poller can restore expand/collapse state
+  // across re-renders (otherwise a running task collapses whatever you open).
+  const ck = "comp:" + c.kind + (c.kind === "step" ? ":" + c.step : (c.kind === "approval" ? ":" + c.idx : ""));
+  let body = "";
+  if (c.kind === "approval") {
+    const w = approvalWhat({ tool: c.tool, args: c.args });
+    body += `<div class="appr-what">You approved: <b>${esc(w.verb)}</b>${c.tool ? ` <span class="muted">via <code>${esc(c.tool)}</code></span>` : ""}</div>`;
+    if (w.detail) body += `<div class="appr-detail ${w.mono ? "mono" : ""}">${esc(w.detail)}</div>`;
+  } else if (c.kind === "planner") {
+    if (c.input) body += _field("Input (goal)", _text(c.input.goal)) + _field("Available agents", `<div class="x-text">${(c.input.agents || []).map(a => `<code>${esc(a)}</code>`).join(" ")}</div>`);
+    c.llm.forEach((l, i) => body += llmBlock(l, i, ck, i > 0 ? c.llm[i - 1] : null));
+    if (c.output) {
+      if (c.output.reasoning) body += _field("Reasoning", _text(c.output.reasoning));
+      body += _field("Output (plan)", (c.output.plan || []).length
+        ? `<ol class="x-plan">${c.output.plan.map(p => `<li><b>${esc(p.agent)}</b>: ${esc(p.description)}${p.success_criteria ? `<div class="x-muted">✓ ${esc(p.success_criteria)}</div>` : ""}</li>`).join("")}</ol>`
+        : _text("(planning…)"));
+    }
+  } else if (c.kind === "step") {
+    if (c.input) {
+      body += _field("Input (task given to agent)", _text(c.input.task));
+      if (c.input.system) body += _field("Agent role (system prompt)", _text(c.input.system));
+      if (c.input.memories && c.input.memories.length) body += _field("Recalled knowledge", `<ul class="x-list">${c.input.memories.map(m => `<li>${esc(m)}</li>`).join("")}</ul>`);
+    }
+    if (c.llm.length || c.tools.length) {
+      body += `<div class="x-label">Reasoning & actions</div><div class="x-proc">`;
+      // Interleave isn't tracked; show LLM thoughts then the tools they triggered.
+      c.llm.forEach((l, i) => body += llmBlock(l, i, ck, i > 0 ? c.llm[i - 1] : null));
+      c.tools.forEach((t, i) => body += toolBlock(t, i, ck));
+      body += `</div>`;
+    }
+    if (c.answer) body += _field("Output (agent's answer)", _text(c.answer.output) + (c.answer.note ? `<div class="x-muted">⚠ ${esc(c.answer.note)}</div>` : ""));
+    if (c.verify.input || c.verify.verdict || c.verify.llm.length) body += verifyBlock(c.verify, ck);
+  } else if (c.kind === "synthesize") {
+    if (c.input) body += _field("Input (team's step outputs)", _text(c.input.task));
+    c.llm.forEach((l, i) => body += llmBlock(l, i, ck, i > 0 ? c.llm[i - 1] : null));
+    if (c.output) body += _field("Output (final deliverable)", _text(c.output.output));
+  } else if (c.kind === "reflect") {
+    body += _text(c.notes);
+    c.llm.forEach((l, i) => body += llmBlock(l, i, ck, i > 0 ? c.llm[i - 1] : null));
+  }
+
+  let sub = "";
+  if (c.kind === "step") sub = `agent: ${esc(c.agent)}`;
+  else if (c.kind === "synthesize") sub = "CEO integrates the work";
+  return `<details class="x-comp ${c.kind}" data-xk="${esc(ck)}" open><summary><span class="x-icon">${c.icon || "•"}</span><b>${esc(c.title)}</b>${sub ? `<span class="x-sub">${sub}</span>` : ""}</summary><div class="x-comp-body">${body || _text("…")}</div></details>`;
+}
+
+function renderExplain(task) {
+  const comps = buildTrace(task);
+  if (!comps.length) return `<div class="placeholder">No explainable steps yet… the trace appears as the employee works.</div>`;
+  const intro = `<div class="x-intro">Each 🧠 LLM row is one model round-trip: <span class="x-inp-tag">INP</span> (messages sent) and <span class="x-out-tag">OUT</span> (what came back). 🔧 tools run <i>between</i> LLM calls and are not LLM calls.</div>`;
+  return intro + `<div class="x-trace">` + comps.map(compCard).join(`<div class="x-conn"></div>`) + `</div>`;
+}
+
+/* ── Logs ──────────────────────────────────────────────────────────────── */
+function renderLogs(task) {
+  const lines = (task.events || []).map(e => {
+    const f = e.fields || {};
+    const fields = Object.entries(f).map(([k, v]) =>
+      `<b>${esc(k)}</b>=${esc(typeof v === "object" ? JSON.stringify(v) : v)}`).join(" ");
+    const ts = (e.ts || "").slice(11, 19);
+    const approved = e.event === "approval.granted";
+    return `<div class="log-line${approved ? " approved" : ""}">
+      <span class="log-ts">${esc(ts)}</span>
+      <span class="log-lvl ${esc(e.level)}">${approved ? "✅" : esc(e.level)}</span>
+      <span class="log-event">${approved ? "APPROVED" : esc(e.event)}</span>
+      <span class="log-fields">${fields}</span></div>`;
+  });
+  if (!lines.length) return `<div class="placeholder">No log events yet…</div>`;
+  return `<div class="logs">${lines.join("")}</div>`;
+}
+
+/* ── Result ────────────────────────────────────────────────────────────── */
+function renderResult(task, session) {
+  if (task.status === "failed") return `<div class="approval-banner" style="border-color:var(--red);color:var(--red);background:rgba(239,94,107,.12)">Task failed: ${esc(task.error || "unknown error")}</div>`;
+  if (task.status === "cancelled") return `<div class="approval-banner" style="border-color:var(--muted);color:var(--muted);background:rgba(140,140,150,.10)">Task stopped: ${esc(task.error || "cancelled by user")}</div>`;
+  const r = task.result;
+  if (!r) return `<div class="placeholder"><span class="spin">◌</span> Working… the result will appear here.</div>`;
+
+  if (task.mode === "research" && r.result) return renderResearch(task, session, r);
+
+  let html = "";
+  if (r.needs_approval) {
+    const na = r.needs_approval;
+    const op = na.operation || "operation";
+    if (op === "resource_acquisition" || na.tool === "request_resource_input") {
+      html += resourceApprovalBanner(task, session, na);
+    } else {
+      html += `<div class="approval-banner"><span>⏸ This task paused for approval of <b>${esc(op)}</b>.</span>
+        <button class="btn primary" id="approve-${task.id}">Approve & continue</button></div>`;
+    }
+  }
+  const conf = r.confidence != null ? r.confidence : 0;
+  html += `<div class="result-answer">${esc(r.answer || "(no answer produced)")}</div>
+    <div class="result-meta">
+      <span class="muted">Confidence</span>
+      <div class="conf-bar"><div class="conf-fill" style="width:${Math.round(conf * 100)}%"></div></div>
+      <span>${(conf * 100).toFixed(0)}%</span>
+    </div>`;
+
+  const steps = r.steps || [];
+  if (steps.length) {
+    html += `<div class="steps-list"><h3>Step outputs</h3>` + steps.map(st =>
+      `<div class="step-card"><h4>Step ${esc(st.id)} · ${esc(st.agent)} ${st.verified ? "✓" : ""}</h4>
+        <div class="out">${esc((st.output || "").slice(0, 1200))}</div></div>`).join("") + `</div>`;
+  }
+
+  html += tokensBlock(r.tokens);
+
+  // Defer wiring the approve button until the node is in the DOM.
+  setTimeout(() => {
+    const btn = document.getElementById(`approve-${task.id}`);
+    if (btn) btn.addEventListener("click", () => approveTask(session.id, task.id));
+    wireResourceApproval(task, session);
+  }, 0);
+  return html;
+}
+
+/* ── Token usage card (overall + per-agent) ─────────────────────────────── */
+function tokensBlock(tokens) {
+  if (!tokens || !tokens.total_tokens) return "";
+  const by = tokens.by_purpose || {};
+  const vals = Object.values(by).map(v => v.total_tokens);
+  const max = Math.max(1, ...vals);
+  const rows = Object.entries(by)
+    .sort((a, b) => b[1].total_tokens - a[1].total_tokens)
+    .map(([k, v]) => `<div class="tok-row">
+      <span class="tok-name">${esc(k.replace(/^agent:/, ""))}</span>
+      <span class="tok-bar"><span style="width:${Math.round(v.total_tokens / max * 100)}%"></span></span>
+      <span class="tok-val">${v.total_tokens.toLocaleString()} <span class="x-muted">· ${v.calls} call${v.calls === 1 ? "" : "s"}</span></span>
+    </div>`).join("");
+  return `<div class="tokens-card"><h3>🧮 Token usage
+    <span class="tok-total">${tokens.total_tokens.toLocaleString()} total · ${tokens.calls} calls</span></h3>
+    ${rows || `<div class="x-muted">no per-agent breakdown</div>`}</div>`;
+}
+
+/* ── Research result (found models / datasets / papers / hardware) ──────── */
+function _link(url) { return url ? `<a href="${esc(url)}" target="_blank" class="x-link">↗</a>` : ""; }
+
+function findingsBlock(title, items, fmt) {
+  items = items || [];
+  if (!items.length)
+    return `<div class="steps-list"><h3>${title}</h3><div class="step-card x-muted">none found</div></div>`;
+  return `<div class="steps-list"><h3>${title} <span class="x-muted">(${items.length})</span></h3>` +
+    items.map(it => `<div class="step-card"><div class="out">${fmt(it)}</div></div>`).join("") + `</div>`;
+}
+
+function renderResearch(task, session, r) {
+  const res = r.result || {};
+  let html = "";
+  if (r.needs_approval) {
+    const op = r.needs_approval.operation || "operation";
+    html += `<div class="approval-banner"><span>⏸ Paused for approval of <b>${esc(op)}</b> — running the generated code locally.</span>
+      <button class="btn primary" id="approve-${task.id}">Approve &amp; run</button></div>`;
+  }
+  const branchLabel = {
+    both: "Model + dataset found", model_only: "Model only",
+    data_only: "Dataset only", neither: "No ready model/dataset — reproduced from paper",
+  }[res.branch] || res.branch || "";
+  html += `<div class="result-answer"><b>${esc(branchLabel)}.</b> ${esc(res.summary || "")}</div>`;
+
+  html += findingsBlock("📦 Models", res.found_model, m =>
+    `<b>${esc(m.id || "")}</b> ${_link(m.url)} ${m.task ? `<span class="x-muted">· ${esc(m.task)}</span>` : ""} ${m.popularity ? `<span class="x-muted">· ${esc(String(m.popularity))}</span>` : ""}`);
+  html += findingsBlock("🗂 Datasets", res.found_dataset, d =>
+    `<b>${esc(d.id || "")}</b> ${_link(d.url)}`);
+  html += findingsBlock("📄 Papers", res.papers, p =>
+    `<b>${esc(p.title || "")}</b> ${_link(p.url)} ${p.code_url ? `· code ${_link(p.code_url)}` : ""}`);
+
+  if (res.hardware && res.hardware.summary)
+    html += `<div class="steps-list"><h3>🖥 Hardware</h3><div class="step-card"><div class="out">${esc(res.hardware.summary)}</div></div></div>`;
+  if (res.generated && res.generated.instructions)
+    html += `<div class="steps-list"><h3>🛠 Generated code &amp; instructions</h3><div class="step-card"><div class="out">${esc(res.generated.instructions.slice(0, 4000))}</div></div></div>`;
+  if (res.accuracy && res.accuracy.report)
+    html += `<div class="steps-list"><h3>🎯 Accuracy</h3><div class="step-card"><div class="out">${esc(res.accuracy.report.slice(0, 2000))}</div></div></div>`;
+
+  html += tokensBlock(r.tokens || res.tokens);
+
+  setTimeout(() => {
+    const btn = document.getElementById(`approve-${task.id}`);
+    if (btn) btn.addEventListener("click", () => approveTask(session.id, task.id));
+  }, 0);
+  return html;
+}
+
+/* ── Bootstrap ─────────────────────────────────────────────────────────── */
+$("#new-task-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const input = $("#new-task-input");
+  const goal = input.value.trim();
+  if (!goal) return;
+  input.value = "";
+  const mode = $("#task-mode") ? $("#task-mode").value : "task";
+  newTask(goal, mode).catch(err => alert("Failed to start task: " + err.message));
+});
+
+$("#refresh-sessions").addEventListener("click", loadSessionList);
+$("#delete-all-sessions").addEventListener("click", deleteAllSessions);
+
+async function clearAllMemories() {
+  if (!confirm(
+    "Clear ALL stored memories?\n\n" +
+    "This removes long-term recall, skills, conversation history, and knowledge " +
+    "chunks. Saved tasks stay — but follow-ups will not remember past runs.\n\n" +
+    "A backup is kept so you can restore with ↩ if needed."
+  )) return;
+  const btn = $("#clear-memories");
+  btn.disabled = true;
+  try {
+    const res = await api("DELETE", "/ui/api/memory");
+    const n = res.records_removed;
+    alert(n != null ? `Cleared ${n} memory record${n === 1 ? "" : "s"}.` : "All memories cleared.");
+    await loadMemoryBadge();
+  } catch (e) {
+    alert("Failed to clear memories: " + e.message);
+  }
+  btn.disabled = false;
+}
+
+async function restoreArchivedMemories() {
+  if (!confirm("Restore memory from before the last clear?\n\nThis replaces current memory with the archived backup.")) return;
+  const btn = $("#restore-memories");
+  btn.disabled = true;
+  try {
+    const res = await api("POST", "/ui/api/memory/restore");
+    alert(`Restored ${res.records_restored} memory record${res.records_restored === 1 ? "" : "s"}.`);
+    await loadMemoryBadge();
+  } catch (e) {
+    alert("Failed to restore memory: " + e.message);
+  }
+  btn.disabled = false;
+}
+
+let _memoryPop = null;
+let _memorySettings = null;
+
+async function loadMemoryBadge() {
+  const badge = $("#memory-badge");
+  let st;
+  try { st = await api("GET", "/ui/api/memory/settings"); }
+  catch { badge.textContent = "memory: ?"; return; }
+  _memorySettings = st;
+  const on = st.use_stored_memory;
+  badge.classList.toggle("warn", !on);
+  badge.innerHTML =
+    `<span class="b-led"></span><span>Memory: ${on ? "On" : "Off"}</span><span class="caret">▾</span>`;
+  badge.title = on
+    ? "Using stored memories for recall. Click to change."
+    : "Ignoring stored memories (fresh context). Click to change.";
+  const restoreBtn = $("#restore-memories");
+  if (restoreBtn) {
+    restoreBtn.disabled = !st.backup_available;
+    restoreBtn.title = st.backup_available
+      ? `Restore ${st.backup_records} archived record(s) from before last clear`
+      : "No archived memory to restore";
+  }
+}
+
+function openMemoryPicker() {
+  if (_memoryPop) { _memoryPop.remove(); _memoryPop = null; return; }
+  const st = _memorySettings || { use_stored_memory: true, backup_available: false };
+  const pop = el(`<div class="brain-pop memory-pop">
+    <h4>Stored memory</h4>
+    <label class="bp-save-wrap"><input type="checkbox" class="mp-use" ${st.use_stored_memory ? "checked" : ""} />
+      <span>Use stored memory (recall prior knowledge &amp; save new outcomes)</span></label>
+    <label class="bp-save-wrap"><input type="checkbox" class="mp-save-default" />
+      <span>Set as default (remember after refresh)</span></label>
+    <p class="hint mp-hint">${st.use_stored_memory
+      ? "Agents will recall long-term memory and skills when planning."
+      : "Tasks run with a fresh context — no recall, no new long-term writes."}</p>
+    <button class="btn mp-restore" style="width:100%;margin-top:8px" ${st.backup_available ? "" : "disabled"}>
+      ↩ Restore previous memory (${st.backup_available ? st.backup_records : 0} records)
+    </button>
+    <div class="row">
+      <button class="btn mp-cancel">Cancel</button>
+      <button class="btn primary mp-apply">Apply</button>
+    </div></div>`);
+  document.body.appendChild(pop);
+  _memoryPop = pop;
+  const close = () => { pop.remove(); _memoryPop = null; };
+  const useCb = $(".mp-use", pop);
+  const hint = $(".mp-hint", pop);
+  useCb.addEventListener("change", () => {
+    hint.textContent = useCb.checked
+      ? "Agents will recall long-term memory and skills when planning."
+      : "Tasks run with a fresh context — no recall, no new long-term writes.";
+  });
+  const saveDefault = $(".mp-save-default", pop);
+  saveDefault.checked = typeof st.saved_default === "boolean" ? st.saved_default : false;
+  $(".mp-cancel", pop).addEventListener("click", close);
+  $(".mp-restore", pop).addEventListener("click", async () => {
+    if (!st.backup_available) return;
+    if (!confirm("Restore memory from before the last clear?")) return;
+    const btn = $(".mp-restore", pop);
+    btn.disabled = true;
+    try {
+      const res = await api("POST", "/ui/api/memory/restore");
+      alert(`Restored ${res.records_restored} record(s).`);
+      close();
+      await loadMemoryBadge();
+    } catch (e) {
+      alert("Restore failed: " + e.message);
+      btn.disabled = false;
+    }
+  });
+  $(".mp-apply", pop).addEventListener("click", async () => {
+    const applyBtn = $(".mp-apply", pop);
+    applyBtn.textContent = "Applying…"; applyBtn.disabled = true;
+    try {
+      await api("POST", "/ui/api/memory/settings", {
+        use_stored_memory: useCb.checked,
+        save_default: saveDefault.checked,
+      });
+      close();
+      await loadMemoryBadge();
+    } catch (e) {
+      hint.className = "hint mp-hint warn";
+      hint.textContent = "Failed: " + e.message;
+      applyBtn.textContent = "Apply"; applyBtn.disabled = false;
+    }
+  });
+  const badge = $("#memory-badge");
+  const r = badge.getBoundingClientRect();
+  pop.style.position = "absolute";
+  pop.style.top = (r.bottom + 6) + "px";
+  pop.style.right = (window.innerWidth - r.right) + "px";
+}
+
+$("#clear-memories").addEventListener("click", clearAllMemories);
+$("#restore-memories").addEventListener("click", restoreArchivedMemories);
+$("#memory-badge").addEventListener("click", openMemoryPicker);
+$("#brain-badge").addEventListener("click", openBrainPicker);
+$("#coding-badge").addEventListener("click", openCodingPicker);
+$("#keys-badge").addEventListener("click", openKeysModal);
+$("#usage-badge").addEventListener("click", openUsageModal);
+
+/* ── Token usage dashboard (per brain, by date) ─────────────────────────── */
+let _usageModal = null;
+
+async function openUsageModal() {
+  if (_usageModal) return;
+  const overlay = el(`<div class="modal-overlay"><div class="modal usage-modal">
+    <div class="modal-head"><h3>📊 Token usage</h3><button class="icon-btn modal-close" title="Close">✕</button></div>
+    <div class="usage-filter">
+      <label>From <input type="date" class="u-start" /></label>
+      <label>To <input type="date" class="u-end" /></label>
+      <button class="btn u-apply">Apply</button>
+      <button class="btn u-clear">All time</button>
+    </div>
+    <div class="usage-body"><div class="placeholder"><span class="spin">◌</span> Loading…</div></div>
+  </div></div>`);
+  document.body.appendChild(overlay);
+  _usageModal = overlay;
+  const close = () => { overlay.remove(); _usageModal = null; };
+  $(".modal-close", overlay).addEventListener("click", close);
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+
+  const load = async () => {
+    const start = $(".u-start", overlay).value, end = $(".u-end", overlay).value;
+    const qs = new URLSearchParams();
+    if (start) qs.set("start", start);
+    if (end) qs.set("end", end);
+    let data;
+    try { data = await api("GET", "/ui/api/usage" + (qs.toString() ? "?" + qs : "")); }
+    catch (e) { $(".usage-body", overlay).innerHTML = `<div class="key-status err">✗ ${esc(e.message)}</div>`; return; }
+    renderUsage(overlay, data);
+  };
+  $(".u-apply", overlay).addEventListener("click", load);
+  $(".u-clear", overlay).addEventListener("click", () => {
+    $(".u-start", overlay).value = ""; $(".u-end", overlay).value = ""; load();
+  });
+  load();
+}
+
+function renderUsage(overlay, data) {
+  const body = $(".usage-body", overlay);
+  const t = data.total || {};
+  if (!t.total_tokens) { body.innerHTML = `<div class="x-muted" style="padding:16px 0">No usage recorded${data.range && (data.range.start || data.range.end) ? " in this range" : " yet"}.</div>`; return; }
+  const n = (x) => (x || 0).toLocaleString();
+
+  const provRows = Object.entries(data.by_provider || {}).map(([prov, v]) =>
+    `<tr><td><b>${esc(prov)}</b></td><td>${n(v.total_tokens)}</td>
+      <td class="x-muted">${n(v.prompt_tokens)}</td><td class="x-muted">${n(v.completion_tokens)}</td>
+      <td>${n(v.calls)}</td></tr>`).join("");
+
+  const dateRows = Object.entries(data.by_date || {}).reverse().map(([d, v]) =>
+    `<tr><td>${esc(d)}</td><td>${n(v.total_tokens)}</td><td>${n(v.calls)}</td></tr>`).join("");
+
+  body.innerHTML = `
+    <div class="usage-total">${n(t.total_tokens)} <span class="x-muted">tokens · ${n(t.calls)} calls · ${data.days} day${data.days === 1 ? "" : "s"}</span></div>
+    <h4>By brain (provider)</h4>
+    <table class="usage-table"><thead><tr><th>Brain</th><th>Total</th><th>Prompt</th><th>Completion</th><th>Calls</th></tr></thead>
+      <tbody>${provRows}</tbody></table>
+    <h4>By date</h4>
+    <table class="usage-table"><thead><tr><th>Date</th><th>Total</th><th>Calls</th></tr></thead>
+      <tbody>${dateRows}</tbody></table>`;
+}
+
+/* ── API keys modal (add / remove keys at runtime) ──────────────────────── */
+let _keysModal = null;
+
+async function openKeysModal() {
+  if (_keysModal) return;
+  let data;
+  try { data = await api("GET", "/ui/api/keys"); }
+  catch (e) { alert("Failed to load keys: " + e.message); return; }
+
+  const overlay = el(`<div class="modal-overlay"><div class="modal keys-modal">
+    <div class="modal-head"><h3>🔑 API keys</h3><button class="icon-btn modal-close" title="Close">✕</button></div>
+    <p class="modal-sub">Saved on the server and overlaid on <code>.env</code>. Values are masked;
+       saving overwrites, removing reveals any <code>.env</code> value on next restart.</p>
+    <div class="keys-body"></div>
+  </div></div>`);
+  document.body.appendChild(overlay);
+  _keysModal = overlay;
+
+  const close = () => { overlay.remove(); _keysModal = null; };
+  $(".modal-close", overlay).addEventListener("click", close);
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+  renderKeys(overlay, data.keys);
+}
+
+function renderKeys(overlay, keys) {
+  const body = $(".keys-body", overlay);
+  body.innerHTML = "";
+  const groups = { search: "Search & data sources", llm: "LLM providers" };
+  for (const [cat, title] of Object.entries(groups)) {
+    const inCat = keys.filter(k => k.category === cat);
+    if (!inCat.length) continue;
+    const group = el(`<div class="key-group"><h4>${esc(title)}</h4></div>`);
+    inCat.forEach(k => group.appendChild(keyRow(overlay, k)));
+    body.appendChild(group);
+  }
+}
+
+function keyRow(overlay, k) {
+  const status = k.configured
+    ? `<span class="key-set">${esc(k.masked)}</span>`
+    : `<span class="key-unset">not set</span>`;
+  const tag = k.requires_rebuild ? ` <span class="key-tag">restarts brain</span>` : "";
+  const row = el(`<div class="key-row">
+    <div class="key-info">
+      <div class="key-label">${esc(k.label)} ${status}${tag}</div>
+      <div class="key-desc">${esc(k.description)}</div>
+    </div>
+    <div class="key-actions">
+      <input class="key-input" type="${k.secret ? "password" : "text"}"
+             placeholder="${k.configured ? "replace…" : "paste value…"}" />
+      <button class="btn key-test">Test</button>
+      ${k.category === "llm" ? `<button class="btn key-credits">Credits</button>` : ""}
+      <button class="btn key-save">Save</button>
+      <button class="btn key-del" ${k.configured ? "" : "disabled"}>Remove</button>
+    </div>
+    <div class="key-status"></div></div>`);
+
+  const input = $(".key-input", row);
+  const statusEl = $(".key-status", row);
+  const refresh = async () => renderKeys(overlay, (await api("GET", "/ui/api/keys")).keys);
+
+  $(".key-test", row).addEventListener("click", async () => {
+    const btn = $(".key-test", row); btn.textContent = "Testing…"; btn.disabled = true;
+    statusEl.className = "key-status"; statusEl.textContent = "";
+    try {
+      const value = input.value.trim() || undefined;  // test typed value, else stored
+      const res = await api("POST", `/ui/api/keys/${k.name}/test`, { value });
+      statusEl.className = "key-status " + (res.ok ? "ok" : "err");
+      statusEl.textContent = (res.ok ? "✓ " : "✗ ") + res.message + (res.detail ? `  (${res.detail})` : "");
+    } catch (e) {
+      statusEl.className = "key-status err"; statusEl.textContent = "✗ " + e.message;
+    }
+    btn.textContent = "Test"; btn.disabled = false;
+  });
+
+  const creditsBtn = $(".key-credits", row);
+  if (creditsBtn) creditsBtn.addEventListener("click", async () => {
+    creditsBtn.textContent = "Checking…"; creditsBtn.disabled = true;
+    statusEl.className = "key-status"; statusEl.textContent = "";
+    try {
+      const value = input.value.trim() || undefined;  // check typed value, else stored
+      const res = await api("POST", `/ui/api/keys/${k.name}/credits`, { value });
+      // supported=false → provider has no balance API (show a neutral hint + dashboard link).
+      const cls = !res.supported ? "" : (res.ok ? "ok" : "err");
+      const icon = !res.supported ? "ℹ " : (res.ok ? "✓ " : "✗ ");
+      const isLink = res.detail && /^https?:\/\//.test(res.detail);
+      statusEl.className = "key-status " + cls;
+      statusEl.innerHTML = icon + esc(res.message) + (
+        isLink ? ` — <a href="${esc(res.detail)}" target="_blank" rel="noopener">open dashboard</a>`
+               : (res.detail ? `  (${esc(res.detail)})` : ""));
+    } catch (e) {
+      statusEl.className = "key-status err"; statusEl.textContent = "✗ " + e.message;
+    }
+    creditsBtn.textContent = "Credits"; creditsBtn.disabled = false;
+  });
+
+  $(".key-save", row).addEventListener("click", async () => {
+    const value = input.value.trim();
+    if (!value) { input.focus(); return; }
+    const btn = $(".key-save", row); btn.textContent = "Saving…"; btn.disabled = true;
+    try {
+      await api("PUT", `/ui/api/keys/${k.name}`, { value });
+      if (k.requires_rebuild) loadBrainBadge();
+      await refresh();
+    } catch (e) {
+      alert("Failed: " + e.message); btn.textContent = "Save"; btn.disabled = false;
+    }
+  });
+  $(".key-del", row).addEventListener("click", async () => {
+    if (!confirm(`Remove ${k.label}?`)) return;
+    try {
+      await api("DELETE", `/ui/api/keys/${k.name}`);
+      if (k.requires_rebuild) loadBrainBadge();
+      await refresh();
+    } catch (e) { alert("Failed: " + e.message); }
+  });
+  return row;
+}
+
+/* ── Coding-agent backend badge + picker (brain / Claude / Codex / Cursor) ─ */
+let _codingOpts = null, _codingPop = null;
+
+async function loadCodingBadge() {
+  const badge = $("#coding-badge");
+  let opts;
+  try { opts = await api("GET", "/ui/api/coding/options"); }
+  catch { badge.textContent = "code: ?"; return; }
+  _codingOpts = opts;
+  const label = (opts.labels && opts.labels[opts.current]) || opts.current;
+  badge.classList.toggle("warn", opts.current !== "brain" && opts.available[opts.current] === false);
+  badge.innerHTML =
+    `<span class="b-led"></span><span class="b-prov">code</span>` +
+    `<span class="b-model">${esc(opts.current)}</span><span class="caret">▾</span>`;
+  badge.title = `Coding agent: ${label}\nClick to use the current brain, Claude Code, Codex, or Cursor.`;
+}
+
+async function openCodingPicker() {
+  if (_codingPop) { _codingPop.remove(); _codingPop = null; return; }
+  let opts = _codingOpts;
+  try { if (!opts) opts = await api("GET", "/ui/api/coding/options"); }
+  catch { return; }
+
+  const pop = el(`<div class="brain-pop coding-pop">
+    <h4>Coding agent</h4>
+    <label>Backend (writes &amp; runs the code)</label>
+    <select class="cp-backend"></select>
+    <label class="cp-save-wrap"><input type="checkbox" class="cp-save-default" />
+      <span>Set as default (remember after refresh)</span></label>
+    <div class="hint cp-hint"></div>
+    <div class="row">
+      <button class="btn cp-cancel">Cancel</button>
+      <button class="btn primary cp-apply">Apply</button>
+    </div></div>`);
+  document.body.appendChild(pop);
+  _codingPop = pop;
+
+  const sel = $(".cp-backend", pop), hint = $(".cp-hint", pop);
+  const saveDefault = $(".cp-save-default", pop);
+  saveDefault.checked = Boolean(opts.saved && opts.saved.coding_backend);
+  opts.backends.forEach(b => {
+    const o = document.createElement("option");
+    o.value = b;
+    const avail = opts.available[b] !== false;
+    o.textContent = ((opts.labels && opts.labels[b]) || b) + (avail ? "" : " — not installed");
+    o.disabled = !avail;
+    if (b === opts.current) o.selected = true;
+    sel.appendChild(o);
+  });
+  const upd = () => {
+    const b = sel.value, avail = opts.available[b] !== false;
+    hint.className = "hint cp-hint" + (avail ? "" : " warn");
+    hint.textContent = b === "brain"
+      ? "Uses the configured LLM through the normal tool-using loop."
+      : (!avail
+        ? `The ${b} CLI isn't installed or on PATH. Install it (and sign in) to use this backend.`
+        : `Delegates the coding step to the ${b} CLI, which writes AND runs the code in the workspace.`);
+  };
+  upd();
+  sel.addEventListener("change", upd);
+
+  $(".cp-cancel", pop).addEventListener("click", () => { pop.remove(); _codingPop = null; });
+  $(".cp-apply", pop).addEventListener("click", async () => {
+    const backend = sel.value, btn = $(".cp-apply", pop);
+    btn.textContent = "Applying…"; btn.disabled = true;
+    try {
+      await api("POST", "/ui/api/coding", { backend, save_default: saveDefault.checked });
+      pop.remove(); _codingPop = null;
+      await loadCodingBadge();
+    } catch (e) {
+      hint.className = "hint cp-hint warn";
+      hint.textContent = "Failed: " + e.message;
+      btn.textContent = "Apply"; btn.disabled = false;
+    }
+  });
+}
+
+/* ── Active brain badge ────────────────────────────────────────────────── */
+function formatCreditsHtml(res) {
+  const cls = !res.supported ? "" : (res.ok ? "ok" : "err");
+  const icon = !res.supported ? "ℹ " : (res.ok ? "✓ " : "✗ ");
+  const isLink = res.detail && /^https?:\/\//.test(res.detail);
+  const extra = isLink
+    ? ` — <a href="${esc(res.detail)}" target="_blank" rel="noopener">open dashboard</a>`
+    : (res.detail ? ` (${esc(res.detail)})` : "");
+  return { cls, html: icon + esc(res.message) + extra };
+}
+
+async function fetchBrainCredits(provider, apiKey) {
+  if (!HOSTED_BRAIN_PROVIDERS.includes(provider)) return null;
+  try {
+    return await api("POST", "/ui/api/brain/credits", {
+      provider,
+      api_key: apiKey || undefined,
+    });
+  } catch {
+    return null;
+  }
+}
+
+function scheduleBrainBalanceRefresh() {
+  clearInterval(_brainBalanceTimer);
+  _brainBalanceTimer = null;
+  const cfg = _brainCfg;
+  if (
+    cfg && cfg.needs_api_key && cfg.has_api_key
+    && HOSTED_BRAIN_PROVIDERS.includes(cfg.provider)
+  ) {
+    _brainBalanceTimer = setInterval(() => { loadBrainBadge(); }, BRAIN_BALANCE_REFRESH_MS);
+  }
+}
+
+async function loadBrainBadge() {
+  const badge = $("#brain-badge");
+  let cfg;
+  try { cfg = await api("GET", "/config"); }
+  catch { badge.textContent = "brain: unknown"; return; }
+  _brainCfg = cfg;  // cache for the Explain header's model badges
+  // Warn when the answers won't be "real": offline mock, or a hosted provider w/o a key.
+  const warn = cfg.offline_mock || (cfg.needs_api_key && !cfg.has_api_key);
+  badge.classList.toggle("warn", warn);
+  let note = "";
+  if (cfg.offline_mock) note = " · offline (placeholder answers)";
+  else if (warn) note = " · ⚠ no API key";
+  let balanceNote = "";
+  let balanceTitle = "";
+  if (cfg.needs_api_key && cfg.has_api_key) {
+    const cr = await fetchBrainCredits(cfg.provider);
+    if (cr) {
+      if (cr.supported && cr.balance) {
+        balanceNote = ` · ${cr.balance}`;
+        balanceTitle = `\nBalance: ${cr.balance}`;
+      } else if (cr.supported) {
+        balanceTitle = `\n${cr.message}`;
+      }
+    }
+  }
+  badge.innerHTML =
+    `<span class="b-led"></span><span class="b-prov">${esc(cfg.provider)}</span>` +
+    `<span class="b-model">${esc(cfg.model || "")}${esc(note)}${esc(balanceNote)}</span>`;
+  badge.innerHTML += `<span class="caret">▾</span>`;
+  badge.title =
+    `Brain: ${cfg.provider} (${cfg.model})${balanceTitle}\n` +
+    `Embeddings: ${cfg.embedding_provider} (${cfg.embedding_model})\n` +
+    `Memory backend: ${cfg.memory_backend}\n` +
+    `Click to change the brain & model.`;
+  scheduleBrainBalanceRefresh();
+}
+
+/* ── Brain picker popover (change provider + model from the GUI) ────────── */
+let _brainPop = null;
+
+async function openBrainPicker() {
+  if (_brainPop) { _brainPop.remove(); _brainPop = null; return; }
+  let opts;
+  try { opts = await api("GET", "/ui/api/brain/options"); }
+  catch { return; }
+
+  const pop = el(`<div class="brain-pop">
+    <h4>Change brain</h4>
+    <label>Provider</label>
+    <select class="bp-provider"></select>
+    <label>Model</label>
+    <select class="bp-model"></select>
+    <input class="bp-model-custom" placeholder="…or type a custom model name" style="margin-top:6px" />
+    <div class="bp-key-wrap"><label>API key (optional, this session only)</label>
+      <input class="bp-key" type="password" placeholder="paste key to use without editing .env" /></div>
+    <div class="bp-balance"></div>
+    <label class="bp-save-wrap"><input type="checkbox" class="bp-save-default" />
+      <span>Set as default (remember after refresh)</span></label>
+    <div class="hint bp-hint"></div>
+    <div class="row">
+      <button class="btn bp-cancel">Cancel</button>
+      <button class="btn primary bp-apply">Apply</button>
+    </div></div>`);
+  document.body.appendChild(pop);
+  _brainPop = pop;
+
+  const provSel = $(".bp-provider", pop), modelSel = $(".bp-model", pop);
+  const keyWrap = $(".bp-key-wrap", pop), hint = $(".bp-hint", pop);
+  const balanceEl = $(".bp-balance", pop);
+  const keyInput = $(".bp-key", pop);
+  let balanceTimer = null;
+
+  const refreshBalance = async () => {
+    const prov = provSel.value;
+    if (!HOSTED_BRAIN_PROVIDERS.includes(prov)) {
+      balanceEl.innerHTML = "";
+      return;
+    }
+    balanceEl.className = "bp-balance loading";
+    balanceEl.innerHTML = `<span class="spin">◌</span> Checking remaining balance…`;
+    const cr = await fetchBrainCredits(prov, keyInput.value.trim());
+    if (!cr) {
+      balanceEl.className = "bp-balance err";
+      balanceEl.textContent = "Could not check balance.";
+      return;
+    }
+    const fmt = formatCreditsHtml(cr);
+    balanceEl.className = "bp-balance " + fmt.cls;
+    balanceEl.innerHTML = fmt.html;
+  };
+
+  const scheduleBalance = () => {
+    clearTimeout(balanceTimer);
+    balanceTimer = setTimeout(refreshBalance, 400);
+  };
+  for (const p of opts.providers) {
+    const o = document.createElement("option");
+    o.value = p; o.textContent = p; if (p === opts.current.provider) o.selected = true;
+    provSel.appendChild(o);
+  }
+  const customInput = $(".bp-model-custom", pop);
+  const fillModels = (prov) => {
+    modelSel.innerHTML = "";
+    const list = [...(opts.models[prov] || [])];
+    // Make the currently-active model selectable even if it's a custom value not
+    // in the suggested list (e.g. a hand-typed or local model name).
+    if (prov === opts.current.provider && opts.current.model && !list.includes(opts.current.model))
+      list.unshift(opts.current.model);
+    list.forEach(m => {
+      const o = document.createElement("option"); o.value = m; o.textContent = m;
+      if (prov === opts.current.provider && m === opts.current.model) o.selected = true;
+      modelSel.appendChild(o);
+    });
+    customInput.value = "";  // switching provider clears any half-typed custom name
+    const needsKey = ["deepseek", "openai", "gemini", "glm", "opencode"].includes(prov);
+    keyWrap.style.display = needsKey ? "block" : "none";
+    hint.className = "hint bp-hint" + (prov === "mock" ? " warn" : "");
+    hint.textContent = prov === "mock"
+      ? "Mock is offline — answers are placeholders."
+      : (prov === "local" ? "Local model via Ollama/OpenAI-compatible server."
+        : "Hosted provider — needs an API key (paste above or set it in .env).");
+    scheduleBalance();
+  };
+  fillModels(opts.current.provider);
+  provSel.addEventListener("change", () => fillModels(provSel.value));
+  keyInput.addEventListener("input", scheduleBalance);
+  const saveDefault = $(".bp-save-default", pop);
+  saveDefault.checked = Boolean(opts.saved && opts.saved.brain);
+  // Picking a listed model must win over a stale custom entry — clear it so the
+  // dropdown selection is what gets applied (fixes a half-typed name sticking).
+  modelSel.addEventListener("change", () => { customInput.value = ""; });
+
+  $(".bp-cancel", pop).addEventListener("click", () => { pop.remove(); _brainPop = null; });
+  $(".bp-apply", pop).addEventListener("click", async () => {
+    const provider = provSel.value;
+    const model = ($(".bp-model-custom", pop).value.trim()) || modelSel.value;
+    const api_key = $(".bp-key", pop).value.trim() || undefined;
+    const applyBtn = $(".bp-apply", pop);
+    applyBtn.textContent = "Applying…"; applyBtn.disabled = true;
+    try {
+      await api("POST", "/ui/api/brain", {
+        provider, model, api_key, save_default: saveDefault.checked,
+      });
+      pop.remove(); _brainPop = null;
+      await loadBrainBadge();
+    } catch (e) {
+      hint.className = "hint bp-hint warn";
+      hint.textContent = "Failed: " + e.message;
+      applyBtn.textContent = "Apply"; applyBtn.disabled = false;
+    }
+  });
+}
+
+// Populate the saved-tasks panel + brain/coding badges on load.
+loadSessionList();
+loadBrainBadge();
+loadCodingBadge();
+loadMemoryBadge();

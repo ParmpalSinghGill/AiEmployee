@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI Employee — Console</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">◆</span> AI Employee <span class="brand-sub">Console</span>
+    </div>
+    <form id="new-task-form" class="composer">
+      <input id="new-task-input" type="text" autocomplete="off"
+             placeholder="Give the employee a goal…  (e.g. Research X and write a brief)" />
+      <select id="task-mode" title="Pipeline">
+        <option value="task">Task</option>
+        <option value="research">🔬 Research</option>
+      </select>
+      <button type="submit" class="btn primary">▶ Run</button>
+    </form>
+    <div id="brain-badge" class="brain-badge" title="Active LLM provider & model">
+      <span class="spin">◌</span> checking brain…
+    </div>
+    <div id="coding-badge" class="brain-badge coding-badge" title="Coding-agent backend">
+      <span class="spin">◌</span> code…
+    </div>
+    <button id="memory-badge" class="brain-badge" title="Stored memory recall on/off">🧠 Memory</button>
+    <button id="usage-badge" class="brain-badge" title="Token usage per brain, by date">📊 Usage</button>
+    <button id="keys-badge" class="brain-badge" title="Manage API keys (Roboflow, Kaggle, GitHub, LLM…)">🔑 Keys</button>
+    <a class="docs-link" href="/docs" target="_blank">API docs ↗</a>
+  </header>
+
+  <div class="body">
+    <aside id="sidebar" class="sidebar">
+      <div class="sidebar-head">
+        <span>Saved tasks</span>
+        <div class="sidebar-actions">
+          <button id="delete-all-sessions" class="icon-btn" title="Delete all saved tasks">🗑</button>
+          <button id="restore-memories" class="icon-btn" title="Restore memory from before last clear" disabled>↩</button>
+          <button id="clear-memories" class="icon-btn" title="Clear all stored memories (keeps saved tasks)">🧹</button>
+          <button id="refresh-sessions" class="icon-btn" title="Refresh">⟳</button>
+        </div>
+      </div>
+      <div id="session-list" class="session-list"></div>
+    </aside>
+
+    <div class="main-col">
+      <nav id="tabs" class="tabs"></nav>
+      <main id="workspace" class="workspace">
+        <div id="empty-state" class="empty-state">
+          <div class="empty-icon">◆</div>
+          <h1>Start a task</h1>
+          <p>Type a goal above and hit <b>Run task</b>. Each task opens its own tab where you
+             can watch the agents and tools work, read the logs, see the result, and ask
+             follow-up questions.</p>
+          <p class="muted">Past tasks are saved automatically — find them in the
+             <b>Saved tasks</b> panel on the left to reopen and continue.</p>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <template id="session-template">
+    <section class="session">
+      <div class="session-toolbar">
+        <button type="button" class="btn sess-clear-memory" title="Clear this task's recall memory (keeps history)">🧠 Clear memory</button>
+        <button type="button" class="btn sess-delete" title="Delete this saved task">🗑 Delete task</button>
+      </div>
+      <div class="runs-strip"></div>
+      <div class="subtabs">
+        <button class="subtab active" data-view="flow">⬡ Flow</button>
+        <button class="subtab" data-view="explain">🔎 Explain</button>
+        <button class="subtab" data-view="logs">≡ Logs <span class="count log-count"></span></button>
+        <button class="subtab" data-view="result">★ Result</button>
+      </div>
+      <div class="subviews">
+        <div class="subview flow-view active"></div>
+        <div class="subview explain-view"></div>
+        <div class="subview logs-view"></div>
+        <div class="subview result-view"></div>
+      </div>
+      <form class="followup">
+        <input type="text" class="followup-input" autocomplete="off"
+               placeholder="Ask a follow-up or add a related task…" />
+        <button type="submit" class="btn">↳ Ask follow-up</button>
+      </form>
+    </section>
+  </template>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,59 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ai_employee}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ai_employee}
+      POSTGRES_DB: ${POSTGRES_DB:-ai_employee}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ai_employee}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      LLM_PROVIDER: ${LLM_PROVIDER:-deepseek}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-openai}
+      MEMORY_BACKEND: ${MEMORY_BACKEND:-pgvector}
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER:-ai_employee}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ai_employee}
+      POSTGRES_DB: ${POSTGRES_DB:-ai_employee}
+      REDIS_URL: redis://redis:6379/0
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      GLM_API_KEY: ${GLM_API_KEY:-}
+    ports:
+      - "8000:8000"
+    # Run migrations, then serve.
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn ai_employee.api.app:app --host 0.0.0.0 --port 8000"
+    volumes:
+      - workspace:/app/data/workspace
+
+volumes:
+  pgdata:
+  workspace:
