@@ -74,8 +74,15 @@ def create_app() -> FastAPI:
             "docs": "/docs",
             "ui": "/ui",
             "endpoints": [
-                "/chat", "/task", "/agents", "/tools", "/memory",
-                "/knowledge/ingest", "/knowledge/query", "/workflows", "/config",
+                "/chat",
+                "/task",
+                "/agents",
+                "/tools",
+                "/memory",
+                "/knowledge/ingest",
+                "/knowledge/query",
+                "/workflows",
+                "/config",
             ],
         }
 

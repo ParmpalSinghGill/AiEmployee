@@ -48,9 +48,7 @@ class PythonExecTool(Tool):
 
     async def _run(self, args: PythonExecTool.Args) -> ToolResult:
         ws = ensure_workspace(self._ws)
-        code, out, err = await _run_subprocess(
-            ["python", "-c", args.code], ws, args.timeout
-        )
+        code, out, err = await _run_subprocess(["python", "-c", args.code], ws, args.timeout)
         return ToolResult(
             ok=(code == 0),
             output={"stdout": out, "stderr": err, "returncode": code},
@@ -98,7 +96,12 @@ class PipInstallTool(Tool):
         code, out, err = await _run_subprocess(cmd, ws, args.timeout)
         return ToolResult(
             ok=(code == 0),
-            output={"stdout": out[-4000:], "stderr": err[-4000:], "returncode": code, "installed": pkgs},
+            output={
+                "stdout": out[-4000:],
+                "stderr": err[-4000:],
+                "returncode": code,
+                "installed": pkgs,
+            },
             error=None if code == 0 else (err[-1000:].strip() or f"pip exited {code}"),
         )
 
@@ -114,8 +117,24 @@ class ShellTool(Tool):
 
     # Commands considered safe (read-only) and exempt from approval.
     _READ_ONLY = {
-        "ls", "cat", "head", "tail", "grep", "find", "wc", "echo", "pwd",
-        "which", "stat", "file", "tree", "du", "df", "env", "date", "whoami",
+        "ls",
+        "cat",
+        "head",
+        "tail",
+        "grep",
+        "find",
+        "wc",
+        "echo",
+        "pwd",
+        "which",
+        "stat",
+        "file",
+        "tree",
+        "du",
+        "df",
+        "env",
+        "date",
+        "whoami",
     }
 
     class Args(BaseModel):
@@ -139,9 +158,7 @@ class ShellTool(Tool):
 
     async def _run(self, args: ShellTool.Args) -> ToolResult:
         ws = ensure_workspace(self._ws)
-        code, out, err = await _run_subprocess(
-            ["bash", "-lc", args.command], ws, args.timeout
-        )
+        code, out, err = await _run_subprocess(["bash", "-lc", args.command], ws, args.timeout)
         return ToolResult(
             ok=(code == 0),
             output={"stdout": out, "stderr": err, "returncode": code},

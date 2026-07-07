@@ -46,16 +46,12 @@ class ResilientVectorStore(VectorStore):
                 )
         except Exception as exc:  # noqa: BLE001
             self._degrade(exc)
-        return await self._fallback.search(
-            namespace, query_embedding, k=k, session_id=session_id
-        )
+        return await self._fallback.search(namespace, query_embedding, k=k, session_id=session_id)
 
     async def recent(self, namespace, *, limit=20, session_id=None):
         try:
             if not self._degraded:
-                return await self._primary.recent(
-                    namespace, limit=limit, session_id=session_id
-                )
+                return await self._primary.recent(namespace, limit=limit, session_id=session_id)
         except Exception as exc:  # noqa: BLE001
             self._degrade(exc)
         return await self._fallback.recent(namespace, limit=limit, session_id=session_id)

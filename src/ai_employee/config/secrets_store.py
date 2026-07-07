@@ -34,26 +34,58 @@ class KeySpec:
 
 
 MANAGED_KEYS: tuple[KeySpec, ...] = (
-    KeySpec("roboflow_api_key", "Roboflow API key", "search",
-            "Roboflow Universe — computer-vision datasets & models."),
-    KeySpec("kaggle_username", "Kaggle username", "search",
-            "Kaggle account username (paired with the Kaggle API key).", secret=False),
+    KeySpec(
+        "roboflow_api_key",
+        "Roboflow API key",
+        "search",
+        "Roboflow Universe — computer-vision datasets & models.",
+    ),
+    KeySpec(
+        "kaggle_username",
+        "Kaggle username",
+        "search",
+        "Kaggle account username (paired with the Kaggle API key).",
+        secret=False,
+    ),
     KeySpec("kaggle_key", "Kaggle API key", "search", "Kaggle API token for dataset search."),
-    KeySpec("github_token", "GitHub token", "search",
-            "Raises the GitHub repo-search rate limit."),
-    KeySpec("tavily_api_key", "Tavily API key", "search",
-            "Higher-quality web search than the keyless fallback."),
-    KeySpec("deepseek_api_key", "DeepSeek API key", "llm",
-            "DeepSeek LLM provider.", requires_rebuild=True),
-    KeySpec("openai_api_key", "OpenAI API key", "llm",
-            "OpenAI LLM provider.", requires_rebuild=True),
-    KeySpec("google_api_key", "Google (Gemini) API key", "llm",
-            "Google Gemini LLM provider.", requires_rebuild=True),
-    KeySpec("glm_api_key", "GLM API key", "llm",
-            "Zhipu GLM LLM provider.", requires_rebuild=True),
-    KeySpec("opencode_api_key", "OpenCode Zen API key", "llm",
-            "OpenCode Zen gateway (Claude/GPT/DeepSeek/GLM/… via one key).",
-            requires_rebuild=True),
+    KeySpec("github_token", "GitHub token", "search", "Raises the GitHub repo-search rate limit."),
+    KeySpec(
+        "huggingface_token",
+        "Hugging Face token",
+        "search",
+        "HF_TOKEN for gated/private models & datasets (public repos work without it).",
+    ),
+    KeySpec(
+        "tavily_api_key",
+        "Tavily API key",
+        "search",
+        "Higher-quality web search than the keyless fallback.",
+    ),
+    KeySpec(
+        "deepseek_api_key",
+        "DeepSeek API key",
+        "llm",
+        "DeepSeek LLM provider.",
+        requires_rebuild=True,
+    ),
+    KeySpec(
+        "openai_api_key", "OpenAI API key", "llm", "OpenAI LLM provider.", requires_rebuild=True
+    ),
+    KeySpec(
+        "google_api_key",
+        "Google (Gemini) API key",
+        "llm",
+        "Google Gemini LLM provider.",
+        requires_rebuild=True,
+    ),
+    KeySpec("glm_api_key", "GLM API key", "llm", "Zhipu GLM LLM provider.", requires_rebuild=True),
+    KeySpec(
+        "opencode_api_key",
+        "OpenCode Zen API key",
+        "llm",
+        "OpenCode Zen gateway (Claude/GPT/DeepSeek/GLM/… via one key).",
+        requires_rebuild=True,
+    ),
 )
 
 _BY_NAME = {k.name: k for k in MANAGED_KEYS}

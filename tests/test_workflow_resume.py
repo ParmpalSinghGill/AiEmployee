@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from ai_employee.agents import AgentRegistry, AgentResult
@@ -103,22 +105,63 @@ def test_checkpoint_from_state_serializes_cursor_and_results():
 def test_taskrecord_from_snapshot_preserves_awaiting_approval():
     from ai_employee.observability.tasks import TaskRecord, TaskStatus
 
-    rec = TaskRecord.from_snapshot({
-        "id": "t1", "goal": "g", "session_id": "s1", "parent_id": None,
-        "status": "awaiting_approval",
-        "events": [{"seq": 1, "ts": "t", "event": "agent.needs_approval", "fields": {}}],
-        "last_seq": 1,
-        "result": {
-            "needs_approval": {"operation": "shell_write"},
-            "workflow_checkpoint": {
-                "goal": "g", "session_id": "s1",
-                "plan": {"steps": [{"id": 1}]}, "cursor": 0, "step_results": [],
+    rec = TaskRecord.from_snapshot(
+        {
+            "id": "t1",
+            "goal": "g",
+            "session_id": "s1",
+            "parent_id": None,
+            "status": "awaiting_approval",
+            "events": [{"seq": 1, "ts": "t", "event": "agent.needs_approval", "fields": {}}],
+            "last_seq": 1,
+            "result": {
+                "needs_approval": {"operation": "shell_write"},
+                "workflow_checkpoint": {
+                    "goal": "g",
+                    "session_id": "s1",
+                    "plan": {"steps": [{"id": 1}]},
+                    "cursor": 0,
+                    "step_results": [],
+                },
             },
-        },
-        "error": None,
-    })
+            "error": None,
+        }
+    )
     assert rec.status == TaskStatus.awaiting_approval
     assert rec.result["workflow_checkpoint"]["cursor"] == 0
+
+
+def test_taskrecord_from_snapshot_marks_interrupted_checkpoint_resumable():
+    from ai_employee.observability.tasks import TaskRecord, TaskStatus
+
+    rec = TaskRecord.from_snapshot(
+        {
+            "id": "t2",
+            "goal": "g",
+            "session_id": "s1",
+            "parent_id": None,
+            "status": "running",
+            "events": [{"seq": 1, "ts": "t", "event": "approval.granted", "fields": {}}],
+            "last_seq": 1,
+            "result": {
+                "answer": "",
+                "needs_approval": None,
+                "workflow_checkpoint": {
+                    "goal": "g",
+                    "session_id": "s1",
+                    "plan": {"steps": [{"id": 1}, {"id": 2}]},
+                    "cursor": 0,
+                    "step_results": [],
+                },
+            },
+            "error": None,
+            "approved_ops": ["shell_write"],
+        }
+    )
+    assert rec.status == TaskStatus.failed
+    assert rec.resumable is True
+    assert rec.can_resume() is True
+    assert "resume available" in (rec.error or "")
 
 
 async def test_orchestrator_halts_with_checkpoint_then_resumes(resume_orchestrator):
@@ -141,3 +184,75 @@ async def test_orchestrator_halts_with_checkpoint_then_resumes(resume_orchestrat
     # Resume must not re-plan; coding runs once with approval granted.
     assert orch._test_plan_invocations == [1]
     assert orch._test_coding_invocations == [set(), {"shell_write"}]
+
+
+class _ResumeOnlyEmployee:
+    async def run(
+        self,
+        goal,
+        *,
+        session_id=None,
+        approved_ops=None,
+        resource_decision=None,
+        workflow_checkpoint=None,
+        session_context=None,
+    ):
+        assert workflow_checkpoint is not None
+        return {
+            "answer": "resumed successfully",
+            "confidence": 0.9,
+            "needs_approval": None,
+            "workflow_checkpoint": workflow_checkpoint,
+        }
+
+    async def name_task(self, goal):
+        return "Resume task"
+
+    def persist_memory(self):
+        pass
+
+
+async def test_taskmanager_manual_resume_uses_saved_checkpoint():
+    from ai_employee.observability.tasks import TaskManager, TaskRecord, TaskStatus, _Session
+
+    tm = TaskManager(None)
+    rec = TaskRecord.from_snapshot(
+        {
+            "id": "resume123abc",
+            "goal": "resume me from checkpoint",
+            "session_id": "s1",
+            "status": "running",
+            "events": [{"seq": 1, "ts": "t", "event": "approval.granted", "fields": {}}],
+            "result": {
+                "answer": "",
+                "needs_approval": None,
+                "workflow_checkpoint": {
+                    "goal": "resume me from checkpoint",
+                    "session_id": "s1",
+                    "plan": {"steps": [{"id": 1}]},
+                    "cursor": 0,
+                    "step_results": [],
+                },
+            },
+            "approved_ops": ["shell_write"],
+        }
+    )
+    session = _Session("resume me")
+    session.id = "s1"
+    session.task_ids = [rec.id]
+    tm._sessions[session.id] = session
+    tm._tasks[rec.id] = rec
+
+    resumed = tm.resume(_ResumeOnlyEmployee(), rec.id)
+    assert resumed is rec
+    assert tm.get_task(rec.id).status == TaskStatus.running
+
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if tm.get_task(rec.id).status == TaskStatus.completed:
+            break
+
+    done = tm.get_task(rec.id)
+    assert done.status == TaskStatus.completed
+    assert done.result["answer"] == "resumed successfully"
+    assert done.resumable is False

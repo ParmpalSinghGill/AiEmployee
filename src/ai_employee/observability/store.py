@@ -42,6 +42,11 @@ class SessionStore:
         d = self._sdir(session_id)
         _write_json(d / "runs" / f"{snapshot['id']}.json", snapshot)
 
+    def delete_task(self, session_id: str, task_id: str) -> None:
+        path = self.root / session_id / "runs" / f"{task_id}.json"
+        if path.exists():
+            path.unlink()
+
     def delete_session(self, session_id: str) -> None:
         import shutil
 

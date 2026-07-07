@@ -120,9 +120,7 @@ class ExplainBrain(Brain):
             kind="chat",
             content=clip(result.content),
             reasoning=clip((result.extra or {}).get("reasoning_content", "")),
-            tool_calls=[
-                {"name": c.name, "args": clip_obj(c.arguments)} for c in result.tool_calls
-            ],
+            tool_calls=[{"name": c.name, "args": clip_obj(c.arguments)} for c in result.tool_calls],
             finish_reason=result.finish_reason,
             usage=result.usage.model_dump(),
         )

@@ -51,7 +51,12 @@ class CodingAgent(ToolUsingAgent):
             task=clip(task, 1200),
         )
         res = await run_external_code_agent(backend, task)
-        log.info("agent.answer", agent=self.name, output=clip(res["output"], 4000), note=f"backend={backend}")
+        log.info(
+            "agent.answer",
+            agent=self.name,
+            output=clip(res["output"], 4000),
+            note=f"backend={backend}",
+        )
         return AgentResult(
             agent=self.name,
             success=res["ok"],
@@ -144,8 +149,8 @@ class CEOAgent(BaseAgent):
                 "- If nothing was obtained, state **Status: NOT FOUND** clearly — do not invent paths."
             )
             if resource_sections:
-                resource_hint += (
-                    "\n\nAUDITED RESOURCES FROM TEAM STEPS:\n" + "\n\n".join(resource_sections)
+                resource_hint += "\n\nAUDITED RESOURCES FROM TEAM STEPS:\n" + "\n\n".join(
+                    resource_sections
                 )
 
         system = (

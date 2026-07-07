@@ -27,16 +27,26 @@ from ai_employee.tools.invocation_history import (
     clear_task_tool_history,
 )
 from ai_employee.tools.registry import ToolRegistry
-from ai_employee.verification import Verifier, audit_resources
+from ai_employee.verification import Verifier, audit_resources, build_waiting_for_user_payload
 
 log = get_logger("workflow")
 
 # Phrases that signal an agent declined on policy/legal grounds rather than failing
 # mechanically. Retrying such a step just reproduces the same refusal, so we don't.
 _REFUSAL_MARKERS = (
-    "i cannot", "i can't", "cannot provide", "can't provide", "cannot share",
-    "cannot fulfill", "cannot comply", "unable to provide", "not able to provide",
-    "legally restricted", "against policy", "not permitted", "i'm unable",
+    "i cannot",
+    "i can't",
+    "cannot provide",
+    "can't provide",
+    "cannot share",
+    "cannot fulfill",
+    "cannot comply",
+    "unable to provide",
+    "not able to provide",
+    "legally restricted",
+    "against policy",
+    "not permitted",
+    "i'm unable",
 )
 
 
@@ -50,7 +60,10 @@ def _looks_unusable(record: dict[str, Any]) -> bool:
     if record.get("skipped"):
         return True
     audit = record.get("resource_audit") or {}
-    if audit.get("issues"):
+    outcome = audit.get("outcome", "")
+    if outcome in ("completed", "waiting_for_user", "partial"):
+        return False
+    if audit.get("issues") and outcome not in ("waiting_for_user",):
         return True
     if (
         audit.get("applies")
@@ -76,6 +89,7 @@ def _keep_last(_old: Any, new: Any) -> Any:
 class EmployeeState(TypedDict, total=False):
     goal: str
     session_id: str
+    session_context: str
     plan: dict[str, Any]
     step_results: Annotated[list[dict[str, Any]], lambda old, new: (old or []) + new]
     cursor: Annotated[int, _keep_last]
@@ -132,16 +146,24 @@ class Orchestrator:
         return g.compile()
 
     def _context(self, state: EmployeeState, extra_scratch: dict | None = None) -> AgentContext:
-        from ai_employee.observability.resource_ctx import bind_resource_decision
+        from ai_employee.observability.resource_ctx import (
+            bind_approved_ops,
+            bind_resource_decision,
+            bind_resource_session,
+        )
 
         decision = state.get("resource_decision")
+        approved = set(state.get("approved_ops") or [])
         bind_resource_decision(decision)
+        bind_approved_ops(approved)
+        bind_resource_session(state.get("session_id"))
         ctx = AgentContext(
             brain=self._brain,
             tools=self._tools,
             memory=self._memory,
             session_id=state.get("session_id", "default"),
-            approved_ops=set(state.get("approved_ops") or []),
+            approved_ops=approved,
+            session_context=state.get("session_context") or "",
         )
         ctx.scratch["agent_catalog"] = self._agents.catalog()
         if extra_scratch:
@@ -149,6 +171,14 @@ class Orchestrator:
         return ctx
 
     # ── Nodes ────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _goal_with_session_context(state: EmployeeState) -> str:
+        goal = state.get("goal") or ""
+        ctx = (state.get("session_context") or "").strip()
+        if not ctx:
+            return goal
+        return f"{ctx}\n\nCURRENT GOAL:\n{goal}"
+
     async def _plan_node(self, state: EmployeeState) -> EmployeeState:
         bind_context(node="plan", session=state.get("session_id"))
         if state.get("resume_execute") and state.get("plan"):
@@ -159,7 +189,7 @@ class Orchestrator:
             )
             return {"trace": [{"node": "plan", "resumed": True}]}
         ctx = self._context(state)
-        result = await self._agents.get("planner").run(state["goal"], ctx)
+        result = await self._agents.get("planner").run(self._goal_with_session_context(state), ctx)
         plan = result.metadata.get("plan", {})
         log.info("workflow.planned", steps=len(plan.get("steps", [])))
         return {
@@ -182,7 +212,9 @@ class Orchestrator:
         if settings.skip_on_failed_dependency:
             unmet = self._unmet_dependencies(step, results)
             if unmet:
-                log.info("workflow.skip_step", step=step["id"], reason="unmet_dependency", deps=unmet)
+                log.info(
+                    "workflow.skip_step", step=step["id"], reason="unmet_dependency", deps=unmet
+                )
                 skip_record = {
                     "id": step["id"],
                     "description": step["description"],
@@ -199,7 +231,9 @@ class Orchestrator:
                 return {
                     "step_results": [skip_record],
                     "cursor": cursor + 1,
-                    "trace": [{"node": "execute", "step": step["id"], "skipped": True, "deps": unmet}],
+                    "trace": [
+                        {"node": "execute", "step": step["id"], "skipped": True, "deps": unmet}
+                    ],
                 }
 
         agent = self._resolve_agent(step["agent"])
@@ -211,11 +245,32 @@ class Orchestrator:
 
         # Approval gate: stop the whole run and surface the request.
         if result.needs_approval:
-            return {
-                "needs_approval": result.needs_approval,
-                "cursor": cursor,  # stay put so it can resume after approval
-                "trace": [{"node": "execute", "step": step["id"], "halted": "approval"}],
-            }
+            op = (result.needs_approval or {}).get("operation")
+            approved = set(state.get("approved_ops") or [])
+            n_ok = sum(
+                1
+                for t in result.tool_trace
+                if t.get("tool") == "download_resource" and t.get("ok")
+            )
+            # Partial downloads or acquisition already granted — don't re-prompt.
+            if op == "waiting_for_user" and (
+                n_ok > 0
+                or approved & {"resource_acquisition", "waiting_for_user"}
+            ):
+                log.info(
+                    "workflow.skip_reapproval",
+                    succeeded=n_ok,
+                    op=op,
+                    approved=sorted(approved),
+                )
+                result = result.model_copy(update={"needs_approval": None, "success": True})
+            else:
+                return {
+                    "needs_approval": result.needs_approval,
+                    "cursor": cursor,
+                    "approved_ops": list(state.get("approved_ops") or []),
+                    "trace": [{"node": "execute", "step": step["id"], "halted": "approval"}],
+                }
 
         resource_audit = audit_resources(
             task=step["description"],
@@ -224,6 +279,30 @@ class Orchestrator:
             tool_trace=result.tool_trace,
             workspace=settings.workspace_dir,
         )
+
+        if resource_audit.get("outcome") == "waiting_for_user":
+            approved = set(state.get("approved_ops") or [])
+            if approved & {"resource_acquisition", "waiting_for_user"}:
+                log.info("workflow.skip_wait_audit", approved=sorted(approved))
+            elif not resource_audit.get("download_attempted"):
+                log.info(
+                    "workflow.skip_wait_no_download_attempt",
+                    outcome=resource_audit.get("outcome"),
+                )
+            else:
+                payload = build_waiting_for_user_payload(
+                    task=step["description"],
+                    resource_audit=resource_audit,
+                    tool_trace=result.tool_trace,
+                )
+                return {
+                    "needs_approval": payload,
+                    "cursor": cursor,
+                    "approved_ops": list(state.get("approved_ops") or []),
+                    "trace": [
+                        {"node": "execute", "step": step["id"], "halted": "waiting_for_user"}
+                    ],
+                }
 
         # Verify and (bounded) retry — but don't loop pointlessly.
         verdict = await self._verifier.verify(
@@ -402,6 +481,7 @@ class Orchestrator:
             "plan": state.get("plan"),
             "cursor": state.get("cursor", 0),
             "step_results": list(state.get("step_results") or []),
+            "approved_ops": list(state.get("approved_ops") or []),
         }
 
     # ── Public API ───────────────────────────────────────────────────────────
@@ -413,10 +493,14 @@ class Orchestrator:
         approved_ops: set[str] | None = None,
         resource_decision: dict[str, Any] | None = None,
         workflow_checkpoint: dict[str, Any] | None = None,
+        session_context: str = "",
     ) -> EmployeeState:
         begin_task_tool_history()
         try:
-            ops = sorted(approved_ops or [])
+            merged = set(approved_ops or [])
+            if workflow_checkpoint:
+                merged |= set(workflow_checkpoint.get("approved_ops") or [])
+            ops = sorted(merged)
             if workflow_checkpoint and workflow_checkpoint.get("plan"):
                 initial: EmployeeState = {
                     "goal": workflow_checkpoint.get("goal") or goal,
@@ -438,6 +522,7 @@ class Orchestrator:
                 initial = {
                     "goal": goal,
                     "session_id": session_id,
+                    "session_context": session_context or "",
                     "step_results": [],
                     "cursor": 0,
                     "trace": [],

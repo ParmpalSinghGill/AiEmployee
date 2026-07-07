@@ -10,7 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from ai_employee.api.deps import get_employee, rebuild_employee
@@ -52,7 +52,7 @@ _SUGGESTED = {
 class NewTaskRequest(BaseModel):
     goal: str = Field(min_length=1)
     approved_ops: list[str] = Field(default_factory=list)
-    mode: str = "task"  # "task" (general pipeline) or "research" (model/dataset scout)
+    mode: str = "task"  # "task", "research", or "download" (direct URL downloader)
 
 
 class BrainChangeRequest(BaseModel):
@@ -88,17 +88,29 @@ class KeyTestRequest(BaseModel):
 _CODING_BACKENDS = ["brain", "claude", "codex", "cursor"]
 
 
+def _static_version() -> int:
+    """Bump when app.js / styles.css change so browsers reload the dashboard assets."""
+    mtimes = []
+    for name in ("app.js", "styles.css"):
+        p = _STATIC / name
+        if p.exists():
+            mtimes.append(int(p.stat().st_mtime))
+    return max(mtimes) if mtimes else 0
+
+
 # ── Pages ────────────────────────────────────────────────────────────────────
 @router.get("/ui", include_in_schema=False)
-async def ui_index() -> FileResponse:
-    return FileResponse(_STATIC / "index.html")
+async def ui_index() -> HTMLResponse:
+    html = (_STATIC / "index.html").read_text(encoding="utf-8")
+    v = _static_version()
+    html = html.replace('href="/static/styles.css"', f'href="/static/styles.css?v={v}"')
+    html = html.replace('src="/static/app.js"', f'src="/static/app.js?v={v}"')
+    return HTMLResponse(html)
 
 
 # ── JSON API ─────────────────────────────────────────────────────────────────
 @router.post("/ui/api/tasks", tags=["ui"])
-async def create_task(
-    req: NewTaskRequest, emp: AIEmployee = Depends(get_employee)
-) -> dict:
+async def create_task(req: NewTaskRequest, emp: AIEmployee = Depends(get_employee)) -> dict:
     """Start a brand-new task (creates a new session/tab)."""
     tm = get_task_manager()
     task = tm.start(emp, req.goal, approved_ops=set(req.approved_ops), mode=req.mode)
@@ -124,6 +136,7 @@ class ApproveTaskRequest(BaseModel):
     local_path: str | None = None
     resource_url: str | None = None
     note: str | None = None
+    approve_all_similar: bool = True  # pre-approve this op + related (e.g. all downloads in run)
 
 
 @router.post("/ui/api/tasks/{task_id}/approve", tags=["ui"])
@@ -147,9 +160,14 @@ async def approve_task(
             }.items()
             if v
         } or None
-    task = tm.approve(emp, task_id, resource_decision=decision)
+    task = tm.approve(
+        emp,
+        task_id,
+        resource_decision=decision,
+        approve_all_similar=req.approve_all_similar if req else True,
+    )
     if task is None:
-        raise HTTPException(409, "task is not awaiting approval")
+        raise HTTPException(409, "task is not awaiting approval or waiting for user input")
     return {"task_id": task.id, "session_id": task.session_id}
 
 
@@ -379,6 +397,15 @@ async def delete_all_sessions(emp: AIEmployee = Depends(get_employee)) -> dict:
     return {"deleted": len(ids), "session_ids": ids, "memory_records_removed": removed_memory}
 
 
+@router.delete("/ui/api/sessions/{session_id}/runs/{task_id}", tags=["ui"])
+async def delete_followup(session_id: str, task_id: str) -> dict:
+    """Delete a single follow-up run. The session's initial task is kept."""
+    tm = get_task_manager()
+    if not tm.delete_run(session_id, task_id):
+        raise HTTPException(404, "unknown session, run, or cannot delete the initial task")
+    return {"deleted": task_id, "session_id": session_id}
+
+
 @router.delete("/ui/api/sessions/{session_id}", tags=["ui"])
 async def delete_session(session_id: str, emp: AIEmployee = Depends(get_employee)) -> dict:
     tm = get_task_manager()
@@ -393,9 +420,7 @@ async def delete_session(session_id: str, emp: AIEmployee = Depends(get_employee
 
 
 @router.delete("/ui/api/sessions/{session_id}/memory", tags=["ui"])
-async def clear_session_memory(
-    session_id: str, emp: AIEmployee = Depends(get_employee)
-) -> dict:
+async def clear_session_memory(session_id: str, emp: AIEmployee = Depends(get_employee)) -> dict:
     """Clear recall memory for one task/session. Saved run history is kept."""
     tm = get_task_manager()
     if not tm.session_runs(session_id):
@@ -456,6 +481,18 @@ async def cancel_task(task_id: str) -> dict:
     if tm.get_task(task_id) is None:
         raise HTTPException(404, "unknown task")
     return {"task_id": task_id, "cancelled": tm.cancel(task_id)}
+
+
+@router.post("/ui/api/tasks/{task_id}/resume", tags=["ui"])
+async def resume_task(task_id: str, emp: AIEmployee = Depends(get_employee)) -> dict:
+    """Resume an interrupted run from its last saved workflow checkpoint."""
+    tm = get_task_manager()
+    if tm.get_task(task_id) is None:
+        raise HTTPException(404, "unknown task")
+    task = tm.resume(emp, task_id)
+    if task is None:
+        raise HTTPException(409, "task is not resumable")
+    return {"task_id": task.id, "session_id": task.session_id}
 
 
 @router.get("/ui/api/tasks/{task_id}", tags=["ui"])

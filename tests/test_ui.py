@@ -56,6 +56,60 @@ async def test_create_task_runs_and_captures_events(client):
     assert "verifier.verdict" in events
 
 
+async def test_download_mode_routes_to_employee_download():
+    from ai_employee.api.app import create_app
+    from ai_employee.api.deps import get_employee
+
+    calls = []
+
+    class _FakeEmployee:
+        async def download(self, goal, *, session_id=None, approved_ops=None, resource_decision=None):
+            calls.append(
+                {
+                    "goal": goal,
+                    "session_id": session_id,
+                    "approved_ops": set(approved_ops or ()),
+                    "resource_decision": resource_decision,
+                }
+            )
+            return {
+                "goal": goal,
+                "answer": "downloaded ok",
+                "confidence": 1.0,
+                "steps": [],
+                "tokens": {"calls": 0},
+                "needs_approval": None,
+                "trace": [],
+            }
+
+        async def run(self, *args, **kwargs):
+            raise AssertionError("run() should not be used for download mode")
+
+        async def research(self, *args, **kwargs):
+            raise AssertionError("research() should not be used for download mode")
+
+        async def name_task(self, goal):
+            return "Download URL"
+
+        def persist_memory(self):
+            return None
+
+    app = create_app()
+    app.dependency_overrides[get_employee] = lambda: _FakeEmployee()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        r = await client.post(
+            "/ui/api/tasks",
+            json={"goal": "https://github.com/org/repo", "mode": "download"},
+        )
+        assert r.status_code == 200
+        task_id = r.json()["task_id"]
+        snap = await _wait_done(client, task_id)
+        assert snap["mode"] == "download"
+        assert snap["result"]["answer"] == "downloaded ok"
+        assert calls and calls[0]["goal"] == "https://github.com/org/repo"
+
+
 async def test_sessions_listed(client):
     await client.post("/ui/api/tasks", json={"goal": "List me later"})
     sessions = (await client.get("/ui/api/sessions")).json()["sessions"]
@@ -228,6 +282,29 @@ async def test_delete_all_sessions(client):
     assert listed == []
 
 
+async def test_delete_followup_run(client):
+    r1 = await client.post("/ui/api/tasks", json={"goal": "main task"})
+    sid = r1.json()["session_id"]
+    first_id = r1.json()["task_id"]
+    r2 = await client.post(f"/ui/api/sessions/{sid}/followup", json={"goal": "extra follow up"})
+    follow_id = r2.json()["task_id"]
+    listed = (await client.get("/ui/api/sessions")).json()["sessions"]
+    sess = next(s for s in listed if s["id"] == sid)
+    assert len(sess["runs"]) == 2
+
+    dr = await client.delete(f"/ui/api/sessions/{sid}/runs/{follow_id}")
+    assert dr.status_code == 200
+    assert dr.json()["deleted"] == follow_id
+
+    listed = (await client.get("/ui/api/sessions")).json()["sessions"]
+    sess = next(s for s in listed if s["id"] == sid)
+    assert len(sess["runs"]) == 1
+    assert sess["runs"][0]["id"] == first_id
+
+    bad = await client.delete(f"/ui/api/sessions/{sid}/runs/{first_id}")
+    assert bad.status_code == 404
+
+
 # ── Cancellation ───────────────────────────────────────────────────────────
 class _SlowEmployee:
     """Fake employee whose run() blocks long enough to be cancelled mid-flight."""
@@ -269,13 +346,89 @@ async def test_cancel_unknown_task_404(client):
     assert r.status_code == 404
 
 
+async def test_resume_endpoint_resumes_interrupted_task(monkeypatch):
+    from ai_employee.api import ui as ui_module
+    from ai_employee.api.app import create_app
+    from ai_employee.api.deps import get_employee
+    from ai_employee.observability.tasks import TaskManager, TaskRecord, _Session
+
+    tm = TaskManager(None)
+    rec = TaskRecord.from_snapshot(
+        {
+            "id": "resume-task-1",
+            "goal": "resume interrupted task",
+            "session_id": "sess-1",
+            "status": "running",
+            "events": [{"seq": 1, "ts": "t", "event": "approval.granted", "fields": {}}],
+            "result": {
+                "answer": "",
+                "needs_approval": None,
+                "workflow_checkpoint": {
+                    "goal": "resume interrupted task",
+                    "session_id": "sess-1",
+                    "plan": {"steps": [{"id": 1}]},
+                    "cursor": 0,
+                    "step_results": [],
+                },
+            },
+            "approved_ops": ["shell_write"],
+        }
+    )
+    session = _Session("Resume interrupted task")
+    session.id = "sess-1"
+    session.task_ids = [rec.id]
+    tm._sessions[session.id] = session
+    tm._tasks[rec.id] = rec
+
+    class _ResumeEmployee:
+        async def run(
+            self,
+            goal,
+            *,
+            session_id=None,
+            approved_ops=None,
+            resource_decision=None,
+            workflow_checkpoint=None,
+            session_context=None,
+        ):
+            assert workflow_checkpoint is not None
+            return {
+                "answer": "resumed from api",
+                "confidence": 0.9,
+                "needs_approval": None,
+                "workflow_checkpoint": workflow_checkpoint,
+            }
+
+        async def name_task(self, goal):
+            return "Resume task"
+
+        def persist_memory(self):
+            pass
+
+    monkeypatch.setattr(ui_module, "get_task_manager", lambda: tm)
+    app = create_app()
+    app.dependency_overrides[get_employee] = lambda: _ResumeEmployee()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        r = await client.post(f"/ui/api/tasks/{rec.id}/resume")
+        assert r.status_code == 200
+        snap = await _wait_done(client, rec.id)
+        assert snap["status"] == "completed"
+        assert snap["result"]["answer"] == "resumed from api"
+
+
 # ── Approval: resume in place + resume-on-startup ──────────────────────────
 class _ApprovalEmployee:
     """Pauses for approval on the first run, completes once the op is approved."""
 
     _PLAN = {
         "steps": [
-            {"id": 1, "agent": "coding", "description": "run gated shell", "success_criteria": "done"},
+            {
+                "id": 1,
+                "agent": "coding",
+                "description": "run gated shell",
+                "success_criteria": "done",
+            },
         ],
     }
 
@@ -300,6 +453,7 @@ class _ApprovalEmployee:
         approved_ops=None,
         resource_decision=None,
         workflow_checkpoint=None,
+        session_context=None,
     ):
         self.calls += 1
         self.last_checkpoint = workflow_checkpoint
@@ -351,6 +505,8 @@ async def test_approve_resumes_in_place_same_run():
 
     same = tm.approve(emp, task.id)
     assert same is task  # SAME record — no new run/tab is created
+    assert tm.get_task(task.id).status == TaskStatus.running
+    assert tm.get_task(task.id).result.get("needs_approval") is None
 
     await _wait_status(tm, task.id, "completed")
     rec = tm.get_task(task.id)
@@ -406,11 +562,17 @@ async def test_resume_interrupted_relaunches_pending():
 
     tm = TaskManager(None)
     # A run persisted mid-flight (pending, no result) with a prior approval.
-    rec = TaskRecord.from_snapshot({
-        "id": "abc123def456", "goal": "resume me", "session_id": "s1",
-        "status": "pending", "events": [], "result": None,
-        "approved_ops": ["shell_write"],
-    })
+    rec = TaskRecord.from_snapshot(
+        {
+            "id": "abc123def456",
+            "goal": "resume me",
+            "session_id": "s1",
+            "status": "pending",
+            "events": [],
+            "result": None,
+            "approved_ops": ["shell_write"],
+        }
+    )
     assert rec.status == TaskStatus.pending and rec.resumable is True
     tm._tasks[rec.id] = rec
 

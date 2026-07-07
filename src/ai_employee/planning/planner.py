@@ -24,9 +24,7 @@ class PlanStep(BaseModel):
     depends_on: list[int] = Field(
         default_factory=list, description="Step ids that must finish first."
     )
-    success_criteria: str = Field(
-        default="", description="How to tell this step succeeded."
-    )
+    success_criteria: str = Field(default="", description="How to tell this step succeeded.")
 
 
 class Plan(BaseModel):
@@ -45,7 +43,9 @@ class Planner:
 
     async def make_plan(self, goal: str, *, agent_catalog: list[dict[str, str]]) -> Plan:
         """Decompose ``goal`` into steps assigned to agents from ``agent_catalog``."""
-        roster = "\n".join(f"- {a['name']}: {a['role']} — {a['description']}" for a in agent_catalog)
+        roster = "\n".join(
+            f"- {a['name']}: {a['role']} — {a['description']}" for a in agent_catalog
+        )
         valid_names = {a["name"] for a in agent_catalog}
         # The planner's *input*: the goal, and the agents it may delegate to.
         log.info("planner.input", goal=clip(goal, 1200), agents=sorted(valid_names))
@@ -56,11 +56,17 @@ class Planner:
             "exactly one agent from the roster (use the agent's `name`). Add depends_on "
             "links where order matters. Keep it minimal but complete.\n\n"
             "RESOURCE TASKS (data, video, dataset, file, model weights):\n"
+            "- Step 1 should LOCATE suitable resources, ATTEMPT automatic download, and "
+            "record the original URL plus local path when download succeeds.\n"
+            "- If automatic download cannot complete (403, login, CAPTCHA, etc.), the "
+            "step succeeds by returning the download URL and entering WAITING_FOR_USER "
+            "for a manual local path — do NOT treat that as failure.\n"
             "- Use research or scout to FIND and verify URLs across hubs.\n"
-            "- Use resource_acquirer to DOWNLOAD into the workspace (or ask the human "
-            "if automatic download fails).\n"
+            "- Use resource_acquirer to search, download, or pause for manual download.\n"
             "- Do not assign download work to research alone.\n"
-            "- If the goal cannot proceed without the resource, say so in success_criteria.\n\n"
+            "- Success criteria must NOT require a workspace file before download is "
+            "attempted. Accept: (found + downloaded) OR (found + manual download needed).\n"
+            "- Never mark a step failed when a suitable URL exists but automation was blocked.\n\n"
             "AGENT ROSTER:\n"
             f"{roster}"
         )
@@ -75,9 +81,7 @@ class Planner:
                 log.debug("planner.invalid_agent", agent=step.agent)
                 step.agent = "research" if "research" in valid_names else next(iter(valid_names))
         if not plan.steps:
-            plan.steps = [
-                PlanStep(id=1, description=goal, agent=next(iter(valid_names)))
-            ]
+            plan.steps = [PlanStep(id=1, description=goal, agent=next(iter(valid_names)))]
         # The planner's *output*: its rationale and the concrete step breakdown.
         log.info(
             "planner.plan_ready",

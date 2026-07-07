@@ -2,13 +2,14 @@
  * Tabs = sessions; each session holds an initial run + follow-ups. We poll each
  * running task and render a live n8n-style flow, logs, and the final result. */
 
-const TERMINAL = new Set(["completed", "failed", "awaiting_approval", "cancelled"]);
+const TERMINAL = new Set(["completed", "failed", "awaiting_approval", "waiting_for_user", "cancelled"]);
 const state = {
   sessions: new Map(),        // sid -> session object
   order: [],                  // tab order of sids
   active: null,               // active sid
   cache: new Map(),           // taskId -> snapshot
   pollers: new Map(),         // taskId -> intervalId
+  explainOpen: new Map(),     // taskId -> Map(data-xk -> bool) for Explain expand state
 };
 
 // Latest brain config (/config) + coding backend options, cached so the Explain
@@ -21,6 +22,23 @@ let _brainBalanceTimer = null;
 const $ = (sel, root = document) => root.querySelector(sel);
 const el = (html) => { const t = document.createElement("template"); t.innerHTML = html.trim(); return t.content.firstChild; };
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+// Escape then turn http(s) URLs into clickable links (Explain + Result prose).
+function linkify(s) {
+  const safe = esc(s);
+  return safe.replace(
+    /(https?:\/\/[^\s<>&"]+)/g,
+    (url) => {
+      let href = url;
+      let tail = "";
+      while (/[.,;:!?)}\]]$/.test(href)) {
+        tail = href.slice(-1) + tail;
+        href = href.slice(0, -1);
+      }
+      if (!href) return url;
+      return `<a href="${href}" target="_blank" rel="noopener noreferrer" class="x-link">${href}</a>${tail}`;
+    }
+  );
+}
 
 async function api(method, path, body) {
   const res = await fetch(path, {
@@ -68,6 +86,25 @@ function fmtDate(iso) {
   catch { return ""; }
 }
 
+async function deleteFollowup(sid, taskId, index) {
+  if (index === 0) return;
+  const s = state.sessions.get(sid);
+  const run = s?.runs.find(r => r.id === taskId);
+  if (!run) return;
+  const preview = run.goal.length > 80 ? run.goal.slice(0, 80) + "…" : run.goal;
+  if (!confirm(`Delete this follow-up?\n\n"${preview}"\n\nThe original task and other runs are kept.`)) return;
+  try { await api("DELETE", `/ui/api/sessions/${sid}/runs/${taskId}`); }
+  catch (e) { alert("Delete failed: " + e.message); return; }
+  clearInterval(state.pollers.get(taskId));
+  state.pollers.delete(taskId);
+  state.cache.delete(taskId);
+  s.runs = s.runs.filter(r => r.id !== taskId);
+  if (s.activeRun === taskId) s.activeRun = s.runs[s.runs.length - 1]?.id || null;
+  renderSession(s);
+  renderTabs();
+  loadSessionList();
+}
+
 async function deleteSession(sid) {
   if (!confirm("Delete this saved task and its history?\n\nThis also removes recall memory for this task.")) return;
   try { await api("DELETE", `/ui/api/sessions/${sid}`); } catch {}
@@ -109,15 +146,18 @@ async function deleteAllSessions() {
 
 /* Open (or resume) a saved session as a tab. */
 async function openSession(sid) {
-  if (state.sessions.has(sid)) { setActive(sid); return; }
   let detail;
   try { detail = await api("GET", `/ui/api/sessions/${sid}`); }
   catch { return; }
-  const runs = (detail.runs || []).map(r => ({ id: r.id, goal: r.goal, status: r.status }));
   detail.runs.forEach(r => state.cache.set(r.id, r));
+  if (state.sessions.has(sid)) {
+    setActive(sid);
+    return;
+  }
+  const runs = (detail.runs || []).map(r => ({ id: r.id, goal: r.goal, status: r.status }));
   const session = {
     id: sid, title: detail.title, runs,
-    activeRun: runs.length ? runs[runs.length - 1].id : null, view: "flow",
+    activeRun: runs.length ? runs[runs.length - 1].id : null, view: "flow", explainOrder: "grouped",
   };
   state.sessions.set(sid, session);
   state.order.push(sid);
@@ -133,8 +173,8 @@ async function openSession(sid) {
 async function newTask(goal, mode) {
   const { task_id, session_id } = await api("POST", "/ui/api/tasks", { goal, mode: mode || "task" });
   const session = {
-    id: session_id, title: goal.slice(0, 42), runs: [{ id: task_id, goal, status: "pending" }],
-    activeRun: task_id, view: "flow",
+    id: session_id, title: goal.slice(0, 42), runs: [{ id: task_id, goal, status: "pending", mode: mode || "task" }],
+    activeRun: task_id, view: "flow", explainOrder: "grouped",
   };
   state.sessions.set(session_id, session);
   state.order.push(session_id);
@@ -148,7 +188,7 @@ async function newTask(goal, mode) {
 async function followUp(sid, goal, approvedOps, mode) {
   const { task_id } = await api("POST", `/ui/api/sessions/${sid}/followup`, { goal, approved_ops: approvedOps || [], mode: mode || "task" });
   const s = state.sessions.get(sid);
-  s.runs.push({ id: task_id, goal, status: "pending" });
+  s.runs.push({ id: task_id, goal, status: "pending", mode: mode || "task" });
   s.activeRun = task_id;
   poll(task_id, sid);
   renderSession(s);
@@ -157,19 +197,29 @@ async function followUp(sid, goal, approvedOps, mode) {
 
 /* Approve a paused run and resume it IN PLACE — same run, same tab (no new run
  * is created). The paused task flips back to running and the poller re-attaches. */
-function resourceApprovalBanner(task, session, na) {
+function resourceApprovalBanner(task, session, na, waiting = false) {
   const urls = (na.candidate_urls || na.args?.candidate_urls || []).slice(0, 8);
   const hubs = (na.hubs_searched || na.args?.hubs_searched || []).join(", ");
   const missing = (na.missing_credentials || na.args?.missing_credentials || []).join(", ");
   const desc = na.resource_description || na.args?.resource_description || na.message || "Required resource";
+  const reason = na.download_failure_reason || na.args?.download_failure_reason || "";
+  const preset = na.message || na.args?.message || "";
   const urlList = urls.length
     ? `<ul class="x-list">${urls.map(u => `<li><a href="${esc(u)}" target="_blank" class="x-link">${esc(u)}</a></li>`).join("")}</ul>`
     : `<p class="x-muted">No candidate URLs — searched: ${esc(hubs || "all hubs")}</p>`;
   const id = `res-appr-${task.id}`;
-  return `<div class="approval-banner resource-banner" id="${id}">
-    <div><b>Resource needed:</b> ${esc(desc)}</div>
-    ${missing ? `<div class="x-muted">Missing API keys: ${esc(missing)} — add in 🔑 Keys</div>` : ""}
-    <div class="x-label" style="margin-top:8px">Candidate links</div>${urlList}
+  const head = waiting
+    ? `<div><b>Status:</b> <span class="wait-tag">WAITING_FOR_USER</span></div>
+       <div class="wait-msg">${linkify(preset || `I found a suitable resource: ${desc}`)}</div>
+       ${reason ? `<div class="x-muted" style="margin-top:8px">Reason: ${linkify(reason)}</div>` : ""}`
+    : `<div><b>Resource needed:</b> ${linkify(desc)}</div>
+       ${missing ? `<div class="x-muted">Missing API keys: ${esc(missing)} — add in 🔑 Keys</div>` : ""}`;
+  const explain = `<div class="appr-body result-appr-explain">${approvalExplainBody(na, task, { linkify: true })}</div>`;
+  return `<div class="approval-banner resource-banner ${waiting ? "waiting-banner" : ""}" id="${id}">
+    <div class="result-appr-head">⏸ Approval required — <b>${esc(na.operation || "resource")}</b></div>
+    ${explain}
+    ${head}
+    <div class="x-label" style="margin-top:8px">${waiting ? "Download URL" : "Candidate links"}</div>${urlList}
     <div class="resource-appr-form">
       <label>Decision
         <select class="res-decision">
@@ -182,7 +232,8 @@ function resourceApprovalBanner(task, session, na) {
       <label>Local path (workspace) <input class="res-path" placeholder="./data/my_file.mp4" /></label>
       <label>URL <input class="res-url" placeholder="https://…" /></label>
       <label>Note <input class="res-note" placeholder="optional" /></label>
-      <button class="btn primary res-approve-btn">Continue with choice</button>
+      ${approvalAllowAllHtml(task.id, na)}
+      <button class="btn primary res-approve-btn">${waiting ? "Continue with path" : "Continue with choice"}</button>
     </div>
   </div>`;
 }
@@ -206,16 +257,53 @@ function wireResourceApproval(task, session) {
 }
 
 async function approveTask(sid, taskId, body) {
-  try { await api("POST", `/ui/api/tasks/${taskId}/approve`, body || undefined); }
+  const cb = document.getElementById(`appr-allow-all-${taskId}`);
+  const payload = { ...(body || {}) };
+  payload.approve_all_similar = cb ? cb.checked : true;
+  try { await api("POST", `/ui/api/tasks/${taskId}/approve`, payload); }
   catch (e) { alert("Approve failed: " + e.message); return; }
   const s = state.sessions.get(sid);
   if (s) {
     const run = s.runs.find(r => r.id === taskId);
-    if (run) run.status = "running";
-    s.activeRun = taskId;              // stay on the same run
+    if (run) {
+      run.status = "running";
+      if (run.result) run.result = { ...run.result, needs_approval: null };
+    }
+    s.activeRun = taskId;
     renderSession(s);
   }
+  const cached = state.cache.get(taskId);
+  if (cached) {
+    state.cache.set(taskId, {
+      ...cached,
+      status: "running",
+      result: cached.result ? { ...cached.result, needs_approval: null } : cached.result,
+    });
+  }
   poll(taskId, sid);                   // resume polling the same task id
+  renderTabs();
+}
+
+async function resumeTask(sid, taskId) {
+  try { await api("POST", `/ui/api/tasks/${taskId}/resume`); }
+  catch (e) { alert("Resume failed: " + e.message); return; }
+  const s = state.sessions.get(sid);
+  if (s) {
+    const run = s.runs.find(r => r.id === taskId);
+    if (run) run.status = "running";
+    s.activeRun = taskId;
+    renderSession(s);
+  }
+  const cached = state.cache.get(taskId);
+  if (cached) {
+    state.cache.set(taskId, {
+      ...cached,
+      status: "running",
+      resumable: false,
+      error: null,
+    });
+  }
+  poll(taskId, sid);
   renderTabs();
 }
 
@@ -235,6 +323,10 @@ function poll(taskId, sid) {
     if (s) {
       const run = s.runs.find(r => r.id === taskId);
       if (run) run.status = snap.status;
+      if (run && snap.result !== undefined) {
+        run.result = snap.result;
+        run.status = snap.status;
+      }
       // Adopt the auto-generated session title once it's ready.
       if (snap.session_title && s.title !== snap.session_title) {
         s.title = snap.session_title;
@@ -308,6 +400,7 @@ function buildSection(session) {
   const node = $("#session-template").content.firstElementChild.cloneNode(true);
   session._el = node;
   $("#workspace").appendChild(node);
+  wireExplainView($(".explain-view", node), session);
 
   node.querySelectorAll(".subtab").forEach(btn => {
     btn.addEventListener("click", () => {
@@ -321,10 +414,48 @@ function buildSection(session) {
     const goal = input.value.trim();
     if (!goal) return;
     input.value = "";
-    followUp(session.id, goal);
+    const active = state.cache.get(session.activeRun);
+    followUp(session.id, goal, undefined, active?.mode === "download" ? "download" : "task");
   });
   $(".sess-clear-memory", node).addEventListener("click", () => clearSessionMemory(session.id, session.title));
   $(".sess-delete", node).addEventListener("click", () => deleteSession(session.id));
+}
+
+function captureExplainOpen(explain, taskId) {
+  if (!taskId || !explain.querySelector("details[data-xk]")) return;
+  let m = state.explainOpen.get(taskId);
+  if (!m) { m = new Map(); state.explainOpen.set(taskId, m); }
+  explain.querySelectorAll("details[data-xk]").forEach(d => m.set(d.getAttribute("data-xk"), d.open));
+}
+
+function restoreExplainOpen(explain, taskId) {
+  const prevOpen = state.explainOpen.get(taskId);
+  if (!prevOpen) return;
+  explain.querySelectorAll("details[data-xk]").forEach(d => {
+    const k = d.getAttribute("data-xk");
+    if (prevOpen.has(k)) d.open = prevOpen.get(k);
+  });
+}
+
+function wireExplainView(explain, session) {
+  if (explain._wired) return;
+  explain._wired = true;
+  explain.addEventListener("toggle", (e) => {
+    const det = e.target;
+    if (!det.matches("details[data-xk]")) return;
+    const taskId = session.activeRun;
+    if (!taskId) return;
+    let m = state.explainOpen.get(taskId);
+    if (!m) { m = new Map(); state.explainOpen.set(taskId, m); }
+    m.set(det.getAttribute("data-xk"), det.open);
+    // Expanding an LLM call opens both INP and OUT; user can collapse either after.
+    if (det.classList.contains("x-llm-call") && det.open) {
+      det.querySelectorAll(".x-llm-section[data-xk]").forEach(s => {
+        s.open = true;
+        m.set(s.getAttribute("data-xk"), true);
+      });
+    }
+  }, true);
 }
 
 function renderSession(s) {
@@ -332,13 +463,27 @@ function renderSession(s) {
   const strip = $(".runs-strip", s._el);
   strip.innerHTML = "";
   s.runs.forEach((r, i) => {
+    const label = i === 0 ? "Task" : "Follow-up " + i;
     const chip = el(`<div class="run-chip ${r.id === s.activeRun ? "active" : ""}">
-      <span class="dot ${r.status}"></span>${i === 0 ? "Task" : "Follow-up " + i}: ${esc(r.goal.slice(0, 30))}</div>`);
-    chip.addEventListener("click", () => { s.activeRun = r.id; renderSession(s); });
+      <span class="dot ${r.status}"></span>
+      <span class="run-chip-label">${label}: ${esc(r.goal.slice(0, 30))}</span>
+      ${i > 0 ? `<button type="button" class="run-chip-del" title="Delete this follow-up">×</button>` : ""}
+    </div>`);
+    chip.addEventListener("click", (e) => {
+      if (e.target.closest(".run-chip-del")) return;
+      s.activeRun = r.id;
+      renderSession(s);
+    });
+    const del = $(".run-chip-del", chip);
+    if (del) del.addEventListener("click", (e) => {
+      e.stopPropagation();
+      deleteFollowup(s.id, r.id, i);
+    });
     strip.appendChild(chip);
   });
   // Stop button for the active run while it's still in flight.
   const active = s.runs.find(r => r.id === s.activeRun);
+  const activeTask = active ? state.cache.get(active.id) : null;
   if (active && !TERMINAL.has(active.status)) {
     const stop = el(`<button class="btn stop-btn" title="Stop this run">■ Stop</button>`);
     stop.addEventListener("click", () => {
@@ -347,10 +492,27 @@ function renderSession(s) {
       cancelTask(active.id);
     });
     strip.appendChild(stop);
+  } else if (active && activeTask && activeTask.resumable) {
+    const resume = el(`<button class="btn primary resume-btn" title="Resume this interrupted run">▶ Resume</button>`);
+    resume.addEventListener("click", () => {
+      resume.disabled = true;
+      resume.textContent = "Resuming…";
+      resumeTask(s.id, active.id);
+    });
+    strip.appendChild(resume);
   }
   // subtab active state
   s._el.querySelectorAll(".subtab").forEach(b => b.classList.toggle("active", b.dataset.view === s.view));
   renderActiveView(s);
+}
+
+function wireExplainControls(explain, session) {
+  explain.querySelectorAll("[data-explain-order]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      session.explainOrder = btn.dataset.explainOrder || "grouped";
+      renderSession(session);
+    });
+  });
 }
 
 function renderActiveView(s) {
@@ -367,15 +529,11 @@ function renderActiveView(s) {
   if (!task) { flow.innerHTML = explain.innerHTML = logs.innerHTML = result.innerHTML = `<div class="placeholder">Waiting for the employee to start…</div>`; return; }
   if (s.view === "flow") flow.innerHTML = renderFlow(task, s);
   else if (s.view === "explain") {
-    // Preserve which <details> the user expanded/collapsed, so the poller's
-    // re-render doesn't slam them shut a second after they're opened.
-    const prevOpen = new Map();
-    explain.querySelectorAll("details[data-xk]").forEach(d => prevOpen.set(d.getAttribute("data-xk"), d.open));
-    explain.innerHTML = problemHeader(task) + renderExplain(task);
-    explain.querySelectorAll("details[data-xk]").forEach(d => {
-      const k = d.getAttribute("data-xk");
-      if (prevOpen.has(k)) d.open = prevOpen.get(k);  // keep user's state; new nodes keep their default
-    });
+    const taskId = s.activeRun;
+    captureExplainOpen(explain, taskId);
+    explain.innerHTML = problemHeader(task) + renderExplain(task, s);
+    wireExplainControls(explain, s);
+    restoreExplainOpen(explain, taskId);
   }
   else if (s.view === "logs") { logs.innerHTML = renderLogs(task); logs.scrollTop = logs.scrollHeight; }
   else result.innerHTML = problemHeader(task) + renderResult(task, s);
@@ -385,9 +543,11 @@ function renderActiveView(s) {
 function problemHeader(task) {
   const goal = (task && task.goal) || "";
   if (!goal) return "";
-  const tag = task.mode === "research" ? `<span class="pb-tag">🔬 Research</span>` : "";
+  const tag = task.mode === "research"
+    ? `<span class="pb-tag">🔬 Research</span>`
+    : (task.mode === "download" ? `<span class="pb-tag">⬇ Download</span>` : "");
   return `<div class="problem-banner"><div class="pb-head"><span class="pb-label">Problem</span>${tag}${modelBadges()}</div>
-    <div class="pb-goal">${esc(goal)}</div></div>`;
+    <div class="pb-goal">${linkify(goal)}</div></div>`;
 }
 
 /* Which models are doing the work — brain (reasoning) + coding backend — shown
@@ -446,6 +606,7 @@ const conn = () => `<div class="connector"></div>`;
 function approvalWhat(a) {
   const tool = a.tool || "";
   const args = a.args || {};
+  const batched = a.batched_calls || [];
   if (tool === "shell")
     return { verb: "run a shell command", detail: args.command || "", mono: true };
   if (tool === "write_file")
@@ -455,30 +616,85 @@ function approvalWhat(a) {
     return { verb: `create the directory ${args.path || ""}`.trim(), detail: "", mono: false };
   if (tool === "download_resource")
     return { verb: "download a resource into the workspace", detail: `${args.url || ""} → ${args.destination || ""}`.trim(), mono: true };
+  if (batched.length > 1 && batched.every(b => b.tool === "download_resource")) {
+    const lines = batched.map(b => {
+      const u = (b.args || {}).url || "";
+      const d = (b.args || {}).destination || "";
+      return `${u} → ${d}`.trim();
+    });
+    return {
+      verb: `download ${batched.length} resources into the workspace`,
+      detail: lines.join("\n"),
+      mono: true,
+    };
+  }
   if (tool === "request_resource_input" || a.operation === "resource_acquisition")
     return { verb: "ask you how to proceed (resource missing or not downloaded)",
              detail: (a.message || args.message || "") + (args.candidate_urls ? "\nURLs: " + args.candidate_urls.join(", ") : ""),
+             mono: false };
+  if (a.operation === "waiting_for_user")
+    return { verb: "wait for you to download the resource and provide a local path",
+             detail: a.message || args.message || "",
              mono: false };
   const keys = Object.keys(args);
   return { verb: tool ? `use the ${tool} tool` : "perform a sensitive operation",
            detail: keys.length ? JSON.stringify(args, null, 2) : "", mono: true };
 }
 
-function approvalNode(a, task) {
+/** True when the task is paused and the approval UI should be shown. */
+function taskAwaitingApproval(task) {
+  return task.status === "awaiting_approval" || task.status === "waiting_for_user";
+}
+
+function approvalAllowAllHtml(taskId, approval) {
+  const batched = (approval && approval.batched_calls) || [];
+  const n = batched.length;
+  const hint = n > 1
+    ? ` (covers all ${n} pending downloads)`
+  : " (won't ask again for each video/folder write in this run)";
+  return `<label class="appr-allow-all">
+    <input type="checkbox" id="appr-allow-all-${taskId}" class="appr-allow-all-cb" checked />
+    <span>Allow all similar operations for this run${hint}</span>
+  </label>`;
+}
+
+/** Shared “what is it asking for?” block — used in Flow and Results. */
+function approvalExplainBody(a, task, opts = {}) {
   const w = approvalWhat(a);
-  const op = a.operation || a.key || "sensitive operation";
-  const detail = w.detail
-    ? `<div class="appr-detail ${w.mono ? "mono" : ""}">${esc(w.detail)}</div>` : "";
+  const detailText = w.detail || "";
+  const detail = detailText
+    ? `<div class="appr-detail ${w.mono ? "mono" : ""}">${
+        opts.linkify ? linkify(detailText) : esc(detailText)
+      }</div>`
+    : "";
   const via = a.tool ? ` <span class="muted">via <code>${esc(a.tool)}</code></span>` : "";
-  const btn = task.status === "awaiting_approval"
-    ? `<button class="btn primary appr-btn" id="fapprove-${task.id}">Approve &amp; continue</button>` : "";
+  let actions = "";
+  if (
+    opts.showActions
+    && (task.status === "awaiting_approval" || task.status === "waiting_for_user")
+  ) {
+    const btnId = opts.buttonId || `approve-${task.id}`;
+    const btnLabel = opts.buttonLabel
+      || (task.status === "waiting_for_user" ? "Continue" : "Approve & continue");
+    const btnClass = opts.buttonClass ? ` ${opts.buttonClass}` : "";
+    actions = `${approvalAllowAllHtml(task.id, a)}<button class="btn primary${btnClass}" id="${esc(btnId)}">${btnLabel}</button>`;
+  }
+  return `<div class="appr-what">Wants to <b>${esc(w.verb)}</b>${via}</div>${detail}${actions}`;
+}
+
+function approvalNode(a, task) {
+  const op = a.operation || a.key || "sensitive operation";
+  const paused = task.status === "awaiting_approval" || task.status === "waiting_for_user";
+  const body = approvalExplainBody(a, task, paused ? {
+    showActions: true,
+    buttonId: `fapprove-${task.id}`,
+    buttonClass: "appr-btn",
+    buttonLabel: task.status === "waiting_for_user" ? "Continue" : "Approve & continue",
+  } : {});
   return `<div class="node approval">
     <div class="node-head"><span class="node-icon">⏸</span>Approval required</div>
     <div class="node-type">${esc(op)}${a.step != null ? " · step " + esc(a.step) : ""}</div>
-    <div class="appr-body">
-      <div class="appr-what">Wants to <b>${esc(w.verb)}</b>${via}</div>
-      ${detail}${btn}
-    </div></div>`;
+    <div class="appr-body">${body}</div></div>`;
 }
 
 function renderFlow(task, session) {
@@ -511,17 +727,22 @@ function renderFlow(task, session) {
     const retry = s.retries ? `<div class="node-sub">retried ×${s.retries}</div>` : "";
     nodes.push(nodeHtml("step", `Step ${s.step} · agent`, "▣", s.agent, chips + badge + retry));
   }
-  if (fl.approval && task.status === "awaiting_approval")
+  if (fl.approval && (task.status === "awaiting_approval" || task.status === "waiting_for_user"))
     nodes.push(approvalNode(fl.approval, task));
   if (fl.synth) nodes.push(nodeHtml("synthesize", "CEO", "★", "Synthesize", `<div class="node-sub">integrate step outputs</div>`));
   if (fl.reflect) nodes.push(nodeHtml("reflect", "Memory", "↻", "Reflect", `<div class="node-sub">store outcome + learn skill</div>`));
   if (task.status === "completed") nodes.push(nodeHtml("result", "Output", "✓", "Result", `<div class="node-sub">final deliverable ready</div>`));
 
   // Wire the in-flow approve button once it's in the DOM (mirrors the Result tab).
-  if (fl.approval && task.status === "awaiting_approval" && session) {
+  if (fl.approval && (task.status === "awaiting_approval" || task.status === "waiting_for_user") && session) {
     setTimeout(() => {
       const btn = document.getElementById(`fapprove-${task.id}`);
-      if (btn) btn.addEventListener("click", () => approveTask(session.id, task.id));
+      if (btn) btn.addEventListener("click", () => {
+        const body = task.status === "waiting_for_user"
+          ? { decision: "proceed_without" }
+          : undefined;
+        approveTask(session.id, task.id, body);
+      });
     }, 0);
   }
 
@@ -529,7 +750,7 @@ function renderFlow(task, session) {
 }
 
 function statusLabel(s) {
-  return { running: "Running", pending: "Starting", completed: "Done", failed: "Failed", awaiting_approval: "Needs approval", cancelled: "Cancelled" }[s] || s;
+  return { running: "Running", pending: "Starting", completed: "Done", failed: "Failed", awaiting_approval: "Needs approval", waiting_for_user: "Waiting for you", cancelled: "Cancelled" }[s] || s;
 }
 
 /* ── Explain (input → reasoning → output, per component) ───────────────── */
@@ -542,21 +763,23 @@ function buildTrace(task) {
   const steps = new Map();
   let planner = null, synth = null, reflect = null;
 
-  const mkPlanner = () => planner || (comps.push(planner = { kind: "planner", title: "Planner", icon: "◇", input: null, output: null, llm: [] }), planner);
+  const mkPlanner = () => planner || (comps.push(planner = { kind: "planner", title: "Planner", icon: "◇", input: null, output: null, llm: [], timeline: [] }), planner);
   const mkStep = (n) => {
-    if (!steps.has(n)) { const c = { kind: "step", step: n, agent: "?", title: "Step " + n, icon: "▣", input: null, answer: null, llm: [], tools: [], verify: { input: null, verdict: null, llm: [] } }; steps.set(n, c); comps.push(c); }
+    if (!steps.has(n)) { const c = { kind: "step", step: n, agent: "?", title: "Step " + n, icon: "▣", input: null, answer: null, llm: [], tools: [], timeline: [], verify: { input: null, verdict: null, llm: [], timeline: [] } }; steps.set(n, c); comps.push(c); }
     return steps.get(n);
   };
-  const mkSynth = () => synth || (comps.push(synth = { kind: "synthesize", title: "Synthesize", icon: "★", agent: "ceo", input: null, output: null, llm: [] }), synth);
-  const mkReflect = () => reflect || (comps.push(reflect = { kind: "reflect", title: "Reflect", icon: "↻", llm: [], notes: "Persist the outcome to long-term memory and distill a reusable skill." }), reflect);
+  const mkSynth = () => synth || (comps.push(synth = { kind: "synthesize", title: "Synthesize", icon: "★", agent: "ceo", input: null, output: null, llm: [], timeline: [] }), synth);
+  const mkReflect = () => reflect || (comps.push(reflect = { kind: "reflect", title: "Reflect", icon: "↻", llm: [], timeline: [], notes: "Persist the outcome to long-term memory and distill a reusable skill." }), reflect);
 
-  // Pick the right LLM-call bucket for a brain.* event from its bound context.
-  const llmBucket = (f) => {
-    if (f.step != null) { const s = mkStep(f.step); return f.phase === "verify" ? s.verify.llm : s.llm; }
-    if (f.node === "plan" || f.purpose === "planner") return mkPlanner().llm;
-    if (f.node === "synthesize" || f.purpose === "synthesize") return mkSynth().llm;
-    if (f.node === "reflect") return mkReflect().llm;
-    return mkSynth().llm;
+  const traceTarget = (f) => {
+    if (f.step != null) {
+      const s = mkStep(f.step);
+      return f.phase === "verify" ? { box: s.verify, comp: s } : { box: s, comp: s };
+    }
+    if (f.node === "plan" || f.purpose === "planner") return { box: mkPlanner(), comp: mkPlanner() };
+    if (f.node === "synthesize" || f.purpose === "synthesize") return { box: mkSynth(), comp: mkSynth() };
+    if (f.node === "reflect") return { box: mkReflect(), comp: mkReflect() };
+    return { box: mkSynth(), comp: mkSynth() };
   };
 
   for (const e of (task.events || [])) {
@@ -573,9 +796,26 @@ function buildTrace(task) {
         if (f.step != null) { mkStep(f.step).answer = { output: f.output, note: f.note }; }
         else if (f.node === "synthesize") mkSynth().output = { output: f.output };
         break;
-      case "brain.request": llmBucket(f).push({ req: f, resp: null }); break;
-      case "brain.response": { const b = llmBucket(f); for (let i = b.length - 1; i >= 0; i--) if (!b[i].resp) { b[i].resp = f; break; } break; }
-      case "tool.execute": if (f.step != null) mkStep(f.step).tools.push({ name: f.tool, args: f.args, status: "running" }); break;
+      case "brain.request": {
+        const t = traceTarget(f);
+        const call = { req: f, resp: null };
+        t.box.llm.push(call);
+        t.box.timeline.push({ type: "llm", ref: call });
+        break;
+      }
+      case "brain.response": {
+        const b = traceTarget(f).box.llm;
+        for (let i = b.length - 1; i >= 0; i--) if (!b[i].resp) { b[i].resp = f; break; }
+        break;
+      }
+      case "tool.execute":
+        if (f.step != null) {
+          const s = mkStep(f.step);
+          const tool = { name: f.tool, args: f.args, status: "running" };
+          s.tools.push(tool);
+          s.timeline.push({ type: "tool", ref: tool });
+        }
+        break;
       case "tool.result": if (f.step != null) { const ts = mkStep(f.step).tools; for (let i = ts.length - 1; i >= 0; i--) if (ts[i].name === f.tool && ts[i].status === "running") { Object.assign(ts[i], { status: f.ok ? "ok" : "fail", output: f.output, error: f.error, latency: f.latency_ms }); break; } } break;
       case "verifier.input": if (f.step != null) mkStep(f.step).verify.input = { task: f.task, criteria: f.criteria, output: f.output }; break;
       case "verifier.verdict": if (f.step != null) mkStep(f.step).verify.verdict = { passed: f.passed, confidence: f.confidence, issues: f.issues || [], suggestion: f.suggestion }; break;
@@ -588,7 +828,7 @@ function buildTrace(task) {
 
 const _jsonBlk = (obj) => `<pre class="x-json">${esc(typeof obj === "string" ? obj : JSON.stringify(obj, null, 2))}</pre>`;
 const _field = (label, html) => `<div class="x-field"><div class="x-label">${esc(label)}</div>${html}</div>`;
-const _text = (t) => `<div class="x-text">${esc(t ?? "")}</div>`;
+const _text = (t) => `<div class="x-text">${linkify(t ?? "")}</div>`;
 
 function msgsBlock(msgs) {
   if (!Array.isArray(msgs) || !msgs.length) return _text("(no messages)");
@@ -596,7 +836,7 @@ function msgsBlock(msgs) {
     let extra = "";
     if (m.tool_calls && m.tool_calls.length) extra = `<div class="x-toolcalls">→ calls: ${m.tool_calls.map(c => `<code>${esc(c.name)}(${esc(JSON.stringify(c.args))})</code>`).join(" ")}</div>`;
     const roleLabel = m.role === "tool" && m.name ? `${m.role}:${esc(m.name)}` : esc(m.role);
-    return `<div class="x-msg"><span class="x-role ${esc(m.role)}">${roleLabel}</span><span class="x-msg-idx">#${idx + 1}</span><div class="x-body"><span class="x-content">${esc(m.content || (extra ? "" : "(empty)"))}</span>${extra}</div></div>`;
+    return `<div class="x-msg"><span class="x-role ${esc(m.role)}">${roleLabel}</span><span class="x-msg-idx">#${idx + 1}</span><div class="x-body"><span class="x-content">${linkify(m.content || (extra ? "" : "(empty)"))}</span>${extra}</div></div>`;
   }).join("") + `</div>`;
 }
 
@@ -632,6 +872,7 @@ function llmBlock(call, i, keyBase = "", prevCall = null) {
   const tag = req.kind === "structured" ? `JSON ${esc(req.schema || "")}` : (resp.finish_reason ? esc(resp.finish_reason) : "");
   const tokens = resp.usage ? `${resp.usage.total_tokens} tok` : "";
   const outShort = llmOutSummary(resp, req);
+  const llmKey = `${keyBase}:llm:${i}`;
   const summary =
     `🧠 LLM ${i + 1} · <span class="x-io"><span class="x-inp-tag">INP</span>→<span class="x-out-tag">OUT</span></span>` +
     ` · <span class="x-muted">${esc(llmInpSummary(req.messages))}</span>` +
@@ -640,27 +881,37 @@ function llmBlock(call, i, keyBase = "", prevCall = null) {
     (tokens ? ` · <span class="x-muted">${tokens}</span>` : "") +
     (!call.resp ? ` · <span class="x-muted">running…</span>` : "");
 
-  let body = `<div class="x-llm-inp">`;
-  body += `<div class="x-llm-section-label"><span class="x-inp-tag">INP</span> — messages sent to the model</div>`;
-  if (inpNote) body += `<div class="x-inp-delta">${esc(inpNote)}</div>`;
-  body += msgsBlock(req.messages);
-  if (req.tools && req.tools.length) body += _field("Tools offered to model", `<div class="x-text">${req.tools.map(t => `<code>${esc(t)}</code>`).join(" ")}</div>`);
-  body += `</div>`;
+  let inpBody = "";
+  if (inpNote) inpBody += `<div class="x-inp-delta">${esc(inpNote)}</div>`;
+  inpBody += msgsBlock(req.messages);
+  if (req.tools && req.tools.length) inpBody += _field("Tools offered to model", `<div class="x-text">${req.tools.map(t => `<code>${esc(t)}</code>`).join(" ")}</div>`);
 
-  body += `<div class="x-llm-out">`;
-  body += `<div class="x-llm-section-label"><span class="x-out-tag">OUT</span> — model response</div>`;
-  if (!call.resp) body += _text("(waiting for response…)");
-  else if (req.kind === "structured") body += _jsonBlk(resp.output);
+  let outBody = "";
+  if (!call.resp) outBody += _text("(waiting for response…)");
+  else if (req.kind === "structured") outBody += _jsonBlk(resp.output);
   else {
-    if (resp.reasoning) body += _field("Reasoning (chain-of-thought)", _text(resp.reasoning));
-    body += _field("Text content", _text(resp.content || "(no text — see tool calls below)"));
-    if (resp.tool_calls && resp.tool_calls.length) body += _field("Tool calls requested", _jsonBlk(resp.tool_calls));
-    if (resp.finish_reason) body += _field("Finish reason", _text(resp.finish_reason));
-    if (resp.usage) body += _field("Token usage", _text(`${resp.usage.prompt_tokens} prompt + ${resp.usage.completion_tokens} completion = ${resp.usage.total_tokens} total`));
+    if (resp.reasoning) outBody += _field("Reasoning (chain-of-thought)", _text(resp.reasoning));
+    outBody += _field("Text content", _text(resp.content || "(no text — see tool calls below)"));
+    if (resp.tool_calls && resp.tool_calls.length) outBody += _field("Tool calls requested", _jsonBlk(resp.tool_calls));
+    if (resp.finish_reason) outBody += _field("Finish reason", _text(resp.finish_reason));
+    if (resp.usage) outBody += _field("Token usage", _text(`${resp.usage.prompt_tokens} prompt + ${resp.usage.completion_tokens} completion = ${resp.usage.total_tokens} total`));
   }
-  body += `</div>`;
 
-  return `<details class="x-call x-llm-call" data-xk="${esc(keyBase)}:llm:${i}"><summary>${summary}</summary><div class="x-call-body">${body}</div></details>`;
+  const inpSummary =
+    `<span class="x-inp-tag">INP</span> — messages sent to the model` +
+    ` · <span class="x-muted">${esc(llmInpSummary(req.messages))}</span>`;
+  const outSummary =
+    `<span class="x-out-tag">OUT</span> — model response` +
+    ` · <span class="x-muted">${outShort}</span>`;
+
+  const inpSection =
+    `<details class="x-llm-section x-llm-inp" data-xk="${esc(llmKey)}:inp" open>` +
+    `<summary>${inpSummary}</summary><div class="x-llm-section-body">${inpBody}</div></details>`;
+  const outSection =
+    `<details class="x-llm-section x-llm-out" data-xk="${esc(llmKey)}:out" open>` +
+    `<summary>${outSummary}</summary><div class="x-llm-section-body">${outBody}</div></details>`;
+
+  return `<details class="x-call x-llm-call" data-xk="${esc(llmKey)}"><summary>${summary}</summary><div class="x-call-body">${inpSection}${outSection}</div></details>`;
 }
 
 function toolBlock(t, i = 0, keyBase = "") {
@@ -681,13 +932,38 @@ function verifyBlock(v, keyBase = "") {
   if (v.input) body += _field("Input (what was reviewed)", _text(v.input.output));
   v.llm.forEach((c, i) => body += llmBlock(c, i, keyBase + ":verify", i > 0 ? v.llm[i - 1] : null));
   if (vd) {
-    if (vd.issues && vd.issues.length) body += _field("Issues found", `<ul class="x-list">${vd.issues.map(x => `<li>${esc(x)}</li>`).join("")}</ul>`);
+    if (vd.issues && vd.issues.length) body += _field("Issues found", `<ul class="x-list">${vd.issues.map(x => `<li>${linkify(x)}</li>`).join("")}</ul>`);
     if (vd.suggestion) body += _field("Suggested fix", _text(vd.suggestion));
   }
   return `<details class="x-call verify" data-xk="${esc(keyBase)}:verify"><summary>🔎 Verification ${badge} ${conf}</summary><div class="x-call-body">${body || _text("(no verification data)")}</div></details>`;
 }
 
-function compCard(c) {
+function procBlocksGrouped(llm, tools, keyBase) {
+  let body = "";
+  llm.forEach((l, i) => body += llmBlock(l, i, keyBase, i > 0 ? llm[i - 1] : null));
+  tools.forEach((t, i) => body += toolBlock(t, i, keyBase));
+  return body;
+}
+
+function procBlocksTimeline(timeline, keyBase) {
+  let body = "";
+  let llmIdx = 0;
+  let toolIdx = 0;
+  let prevLlm = null;
+  for (const item of (timeline || [])) {
+    if (item.type === "llm") {
+      body += llmBlock(item.ref, llmIdx, keyBase, prevLlm);
+      prevLlm = item.ref;
+      llmIdx += 1;
+    } else if (item.type === "tool") {
+      body += toolBlock(item.ref, toolIdx, keyBase);
+      toolIdx += 1;
+    }
+  }
+  return body;
+}
+
+function compCard(c, explainOrder = "grouped") {
   // Stable key per component so the poller can restore expand/collapse state
   // across re-renders (otherwise a running task collapses whatever you open).
   const ck = "comp:" + c.kind + (c.kind === "step" ? ":" + c.step : (c.kind === "approval" ? ":" + c.idx : ""));
@@ -695,38 +971,38 @@ function compCard(c) {
   if (c.kind === "approval") {
     const w = approvalWhat({ tool: c.tool, args: c.args });
     body += `<div class="appr-what">You approved: <b>${esc(w.verb)}</b>${c.tool ? ` <span class="muted">via <code>${esc(c.tool)}</code></span>` : ""}</div>`;
-    if (w.detail) body += `<div class="appr-detail ${w.mono ? "mono" : ""}">${esc(w.detail)}</div>`;
+    if (w.detail) body += `<div class="appr-detail ${w.mono ? "mono" : ""}">${linkify(w.detail)}</div>`;
   } else if (c.kind === "planner") {
     if (c.input) body += _field("Input (goal)", _text(c.input.goal)) + _field("Available agents", `<div class="x-text">${(c.input.agents || []).map(a => `<code>${esc(a)}</code>`).join(" ")}</div>`);
-    c.llm.forEach((l, i) => body += llmBlock(l, i, ck, i > 0 ? c.llm[i - 1] : null));
+    body += explainOrder === "timeline" ? procBlocksTimeline(c.timeline, ck) : procBlocksGrouped(c.llm, [], ck);
     if (c.output) {
       if (c.output.reasoning) body += _field("Reasoning", _text(c.output.reasoning));
       body += _field("Output (plan)", (c.output.plan || []).length
-        ? `<ol class="x-plan">${c.output.plan.map(p => `<li><b>${esc(p.agent)}</b>: ${esc(p.description)}${p.success_criteria ? `<div class="x-muted">✓ ${esc(p.success_criteria)}</div>` : ""}</li>`).join("")}</ol>`
+        ? `<ol class="x-plan">${c.output.plan.map(p => `<li><b>${esc(p.agent)}</b>: ${linkify(p.description)}${p.success_criteria ? `<div class="x-muted">✓ ${linkify(p.success_criteria)}</div>` : ""}</li>`).join("")}</ol>`
         : _text("(planning…)"));
     }
   } else if (c.kind === "step") {
     if (c.input) {
       body += _field("Input (task given to agent)", _text(c.input.task));
       if (c.input.system) body += _field("Agent role (system prompt)", _text(c.input.system));
-      if (c.input.memories && c.input.memories.length) body += _field("Recalled knowledge", `<ul class="x-list">${c.input.memories.map(m => `<li>${esc(m)}</li>`).join("")}</ul>`);
+      if (c.input.memories && c.input.memories.length) body += _field("Recalled knowledge", `<ul class="x-list">${c.input.memories.map(m => `<li>${linkify(m)}</li>`).join("")}</ul>`);
     }
     if (c.llm.length || c.tools.length) {
       body += `<div class="x-label">Reasoning & actions</div><div class="x-proc">`;
-      // Interleave isn't tracked; show LLM thoughts then the tools they triggered.
-      c.llm.forEach((l, i) => body += llmBlock(l, i, ck, i > 0 ? c.llm[i - 1] : null));
-      c.tools.forEach((t, i) => body += toolBlock(t, i, ck));
+      body += explainOrder === "timeline"
+        ? procBlocksTimeline(c.timeline, ck)
+        : procBlocksGrouped(c.llm, c.tools, ck);
       body += `</div>`;
     }
-    if (c.answer) body += _field("Output (agent's answer)", _text(c.answer.output) + (c.answer.note ? `<div class="x-muted">⚠ ${esc(c.answer.note)}</div>` : ""));
+    if (c.answer) body += _field("Output (agent's answer)", _text(c.answer.output) + (c.answer.note ? `<div class="x-muted">⚠ ${linkify(c.answer.note)}</div>` : ""));
     if (c.verify.input || c.verify.verdict || c.verify.llm.length) body += verifyBlock(c.verify, ck);
   } else if (c.kind === "synthesize") {
     if (c.input) body += _field("Input (team's step outputs)", _text(c.input.task));
-    c.llm.forEach((l, i) => body += llmBlock(l, i, ck, i > 0 ? c.llm[i - 1] : null));
+    body += explainOrder === "timeline" ? procBlocksTimeline(c.timeline, ck) : procBlocksGrouped(c.llm, [], ck);
     if (c.output) body += _field("Output (final deliverable)", _text(c.output.output));
   } else if (c.kind === "reflect") {
     body += _text(c.notes);
-    c.llm.forEach((l, i) => body += llmBlock(l, i, ck, i > 0 ? c.llm[i - 1] : null));
+    body += explainOrder === "timeline" ? procBlocksTimeline(c.timeline, ck) : procBlocksGrouped(c.llm, [], ck);
   }
 
   let sub = "";
@@ -735,11 +1011,19 @@ function compCard(c) {
   return `<details class="x-comp ${c.kind}" data-xk="${esc(ck)}" open><summary><span class="x-icon">${c.icon || "•"}</span><b>${esc(c.title)}</b>${sub ? `<span class="x-sub">${sub}</span>` : ""}</summary><div class="x-comp-body">${body || _text("…")}</div></details>`;
 }
 
-function renderExplain(task) {
+function renderExplain(task, session) {
   const comps = buildTrace(task);
   if (!comps.length) return `<div class="placeholder">No explainable steps yet… the trace appears as the employee works.</div>`;
-  const intro = `<div class="x-intro">Each 🧠 LLM row is one model round-trip: <span class="x-inp-tag">INP</span> (messages sent) and <span class="x-out-tag">OUT</span> (what came back). 🔧 tools run <i>between</i> LLM calls and are not LLM calls.</div>`;
-  return intro + `<div class="x-trace">` + comps.map(compCard).join(`<div class="x-conn"></div>`) + `</div>`;
+  const order = session?.explainOrder || "grouped";
+  const intro = `<div class="x-intro">Each 🧠 LLM row is one model round-trip: <span class="x-inp-tag">INP</span> (messages sent) and <span class="x-out-tag">OUT</span> (what came back) — both expand when you open the call; collapse <span class="x-inp-tag">INP</span> to focus on output. 🔧 tools run <i>between</i> LLM calls and are not LLM calls.</div>`;
+  const toolbar = `<div class="x-explain-toolbar">
+    <div class="x-explain-toolbar-label">Order</div>
+    <div class="x-seg">
+      <button type="button" class="x-seg-btn ${order === "grouped" ? "active" : ""}" data-explain-order="grouped">Grouped</button>
+      <button type="button" class="x-seg-btn ${order === "timeline" ? "active" : ""}" data-explain-order="timeline">Execution Order</button>
+    </div>
+  </div>`;
+  return intro + toolbar + `<div class="x-trace">` + comps.map(c => compCard(c, order)).join(`<div class="x-conn"></div>`) + `</div>`;
 }
 
 /* ── Logs ──────────────────────────────────────────────────────────────── */
@@ -762,26 +1046,49 @@ function renderLogs(task) {
 
 /* ── Result ────────────────────────────────────────────────────────────── */
 function renderResult(task, session) {
-  if (task.status === "failed") return `<div class="approval-banner" style="border-color:var(--red);color:var(--red);background:rgba(239,94,107,.12)">Task failed: ${esc(task.error || "unknown error")}</div>`;
-  if (task.status === "cancelled") return `<div class="approval-banner" style="border-color:var(--muted);color:var(--muted);background:rgba(140,140,150,.10)">Task stopped: ${esc(task.error || "cancelled by user")}</div>`;
+  if (task.resumable) {
+    const reason = task.error || "This run was interrupted before it finished.";
+    const partial = task.result && task.result.answer
+      ? `<div class="result-answer">${linkify(task.result.answer)}</div>`
+      : `<div class="x-muted" style="margin-top:10px">No final answer was produced yet. Resume to continue from the last saved step.</div>`;
+    setTimeout(() => {
+      const btn = document.getElementById(`resume-${task.id}`);
+      if (btn) btn.addEventListener("click", () => resumeTask(session.id, task.id));
+    }, 0);
+    return `<div class="approval-banner result-approval-banner">
+      <div class="result-appr-head">⏸ Run interrupted</div>
+      <div class="appr-body">${linkify(reason)}</div>
+      <button class="btn primary" id="resume-${task.id}" style="margin-top:10px">Resume from last checkpoint</button>
+    </div>${partial}`;
+  }
+  if (task.status === "failed") return `<div class="approval-banner" style="border-color:var(--red);color:var(--red);background:rgba(239,94,107,.12)">Task failed: ${linkify(task.error || "unknown error")}</div>`;
+  if (task.status === "cancelled") return `<div class="approval-banner" style="border-color:var(--muted);color:var(--muted);background:rgba(140,140,150,.10)">Task stopped: ${linkify(task.error || "cancelled by user")}</div>`;
   const r = task.result;
   if (!r) return `<div class="placeholder"><span class="spin">◌</span> Working… the result will appear here.</div>`;
 
   if (task.mode === "research" && r.result) return renderResearch(task, session, r);
 
   let html = "";
-  if (r.needs_approval) {
+  if (r.needs_approval && taskAwaitingApproval(task)) {
     const na = r.needs_approval;
     const op = na.operation || "operation";
-    if (op === "resource_acquisition" || na.tool === "request_resource_input") {
-      html += resourceApprovalBanner(task, session, na);
+    if (op === "waiting_for_user") {
+      html += resourceApprovalBanner(task, session, na, true);
+    } else if (op === "resource_acquisition" || na.tool === "request_resource_input") {
+      html += resourceApprovalBanner(task, session, na, false);
     } else {
-      html += `<div class="approval-banner"><span>⏸ This task paused for approval of <b>${esc(op)}</b>.</span>
-        <button class="btn primary" id="approve-${task.id}">Approve & continue</button></div>`;
+      html += `<div class="approval-banner result-approval-banner">
+        <div class="result-appr-head">⏸ Approval required — <b>${esc(op)}</b></div>
+        <div class="appr-body">${approvalExplainBody(na, task, {
+          showActions: true,
+          linkify: true,
+          buttonId: `approve-${task.id}`,
+        })}</div>
+      </div>`;
     }
   }
   const conf = r.confidence != null ? r.confidence : 0;
-  html += `<div class="result-answer">${esc(r.answer || "(no answer produced)")}</div>
+  html += `<div class="result-answer">${linkify(r.answer || "(no answer produced)")}</div>
     <div class="result-meta">
       <span class="muted">Confidence</span>
       <div class="conf-bar"><div class="conf-fill" style="width:${Math.round(conf * 100)}%"></div></div>
@@ -792,7 +1099,7 @@ function renderResult(task, session) {
   if (steps.length) {
     html += `<div class="steps-list"><h3>Step outputs</h3>` + steps.map(st =>
       `<div class="step-card"><h4>Step ${esc(st.id)} · ${esc(st.agent)} ${st.verified ? "✓" : ""}</h4>
-        <div class="out">${esc((st.output || "").slice(0, 1200))}</div></div>`).join("") + `</div>`;
+        <div class="out">${linkify((st.output || "").slice(0, 1200))}</div></div>`).join("") + `</div>`;
   }
 
   html += tokensBlock(r.tokens);
@@ -800,7 +1107,12 @@ function renderResult(task, session) {
   // Defer wiring the approve button until the node is in the DOM.
   setTimeout(() => {
     const btn = document.getElementById(`approve-${task.id}`);
-    if (btn) btn.addEventListener("click", () => approveTask(session.id, task.id));
+    if (btn) btn.addEventListener("click", () => {
+      const body = task.status === "waiting_for_user"
+        ? { decision: "proceed_without" }
+        : undefined;
+      approveTask(session.id, task.id, body);
+    });
     wireResourceApproval(task, session);
   }, 0);
   return html;
@@ -838,16 +1150,24 @@ function findingsBlock(title, items, fmt) {
 function renderResearch(task, session, r) {
   const res = r.result || {};
   let html = "";
-  if (r.needs_approval) {
-    const op = r.needs_approval.operation || "operation";
-    html += `<div class="approval-banner"><span>⏸ Paused for approval of <b>${esc(op)}</b> — running the generated code locally.</span>
-      <button class="btn primary" id="approve-${task.id}">Approve &amp; run</button></div>`;
+  if (r.needs_approval && taskAwaitingApproval(task)) {
+    const na = r.needs_approval;
+    const op = na.operation || "operation";
+    html += `<div class="approval-banner result-approval-banner">
+      <div class="result-appr-head">⏸ Approval required — <b>${esc(op)}</b> <span class="muted">(run generated code locally)</span></div>
+      <div class="appr-body">${approvalExplainBody(na, task, {
+        showActions: true,
+        linkify: true,
+        buttonId: `approve-${task.id}`,
+        buttonLabel: "Approve &amp; run",
+      })}</div>
+    </div>`;
   }
   const branchLabel = {
     both: "Model + dataset found", model_only: "Model only",
     data_only: "Dataset only", neither: "No ready model/dataset — reproduced from paper",
   }[res.branch] || res.branch || "";
-  html += `<div class="result-answer"><b>${esc(branchLabel)}.</b> ${esc(res.summary || "")}</div>`;
+  html += `<div class="result-answer"><b>${esc(branchLabel)}.</b> ${linkify(res.summary || "")}</div>`;
 
   html += findingsBlock("📦 Models", res.found_model, m =>
     `<b>${esc(m.id || "")}</b> ${_link(m.url)} ${m.task ? `<span class="x-muted">· ${esc(m.task)}</span>` : ""} ${m.popularity ? `<span class="x-muted">· ${esc(String(m.popularity))}</span>` : ""}`);
@@ -857,11 +1177,11 @@ function renderResearch(task, session, r) {
     `<b>${esc(p.title || "")}</b> ${_link(p.url)} ${p.code_url ? `· code ${_link(p.code_url)}` : ""}`);
 
   if (res.hardware && res.hardware.summary)
-    html += `<div class="steps-list"><h3>🖥 Hardware</h3><div class="step-card"><div class="out">${esc(res.hardware.summary)}</div></div></div>`;
+    html += `<div class="steps-list"><h3>🖥 Hardware</h3><div class="step-card"><div class="out">${linkify(res.hardware.summary)}</div></div></div>`;
   if (res.generated && res.generated.instructions)
-    html += `<div class="steps-list"><h3>🛠 Generated code &amp; instructions</h3><div class="step-card"><div class="out">${esc(res.generated.instructions.slice(0, 4000))}</div></div></div>`;
+    html += `<div class="steps-list"><h3>🛠 Generated code &amp; instructions</h3><div class="step-card"><div class="out">${linkify(res.generated.instructions.slice(0, 4000))}</div></div></div>`;
   if (res.accuracy && res.accuracy.report)
-    html += `<div class="steps-list"><h3>🎯 Accuracy</h3><div class="step-card"><div class="out">${esc(res.accuracy.report.slice(0, 2000))}</div></div></div>`;
+    html += `<div class="steps-list"><h3>🎯 Accuracy</h3><div class="step-card"><div class="out">${linkify(res.accuracy.report.slice(0, 2000))}</div></div></div>`;
 
   html += tokensBlock(r.tokens || res.tokens);
 
@@ -873,6 +1193,24 @@ function renderResearch(task, session, r) {
 }
 
 /* ── Bootstrap ─────────────────────────────────────────────────────────── */
+function syncComposerModeUi() {
+  const modeSel = $("#task-mode");
+  const input = $("#new-task-input");
+  const submit = $("#new-task-form button[type='submit']");
+  if (!modeSel || !input || !submit) return;
+  const mode = modeSel.value || "task";
+  if (mode === "download") {
+    input.placeholder = "Paste a YouTube, GitHub, Hugging Face, Kaggle, or file URL…";
+    submit.textContent = "⬇ Download";
+  } else if (mode === "research") {
+    input.placeholder = "Describe the model/dataset/paper you want researched…";
+    submit.textContent = "▶ Run";
+  } else {
+    input.placeholder = "Give the employee a goal…  (e.g. Research X and write a brief)";
+    submit.textContent = "▶ Run";
+  }
+}
+
 $("#new-task-form").addEventListener("submit", (e) => {
   e.preventDefault();
   const input = $("#new-task-input");
@@ -882,6 +1220,10 @@ $("#new-task-form").addEventListener("submit", (e) => {
   const mode = $("#task-mode") ? $("#task-mode").value : "task";
   newTask(goal, mode).catch(err => alert("Failed to start task: " + err.message));
 });
+if ($("#task-mode")) {
+  $("#task-mode").addEventListener("change", syncComposerModeUi);
+  syncComposerModeUi();
+}
 
 $("#refresh-sessions").addEventListener("click", loadSessionList);
 $("#delete-all-sessions").addEventListener("click", deleteAllSessions);

@@ -75,7 +75,13 @@ async def run_external_code_agent(
             "(and sign in), or switch the coding agent back to 'brain' in the UI."
         )
         log.warning("code_agent.cli_missing", backend=backend, cmd=base)
-        return {"ok": False, "output": msg, "error": "cli_not_found", "returncode": None, "backend": backend}
+        return {
+            "ok": False,
+            "output": msg,
+            "error": "cli_not_found",
+            "returncode": None,
+            "backend": backend,
+        }
 
     argv = [base, *shlex.split(extra or ""), prompt]
     ws = ensure_workspace(workspace or s.workspace_dir)

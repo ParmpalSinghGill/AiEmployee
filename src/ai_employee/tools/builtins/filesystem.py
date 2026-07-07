@@ -65,8 +65,11 @@ class ListDirTool(Tool):
     async def _run(self, args: ListDirTool.Args) -> ToolResult:
         p = resolve_in_workspace(self._ws, args.path, must_exist=True)
         entries = [
-            {"name": e.name, "type": "dir" if e.is_dir() else "file",
-             "size": e.stat().st_size if e.is_file() else None}
+            {
+                "name": e.name,
+                "type": "dir" if e.is_dir() else "file",
+                "size": e.stat().st_size if e.is_file() else None,
+            }
             for e in sorted(p.iterdir())
         ]
         return ToolResult(output=entries, metadata={"count": len(entries)})

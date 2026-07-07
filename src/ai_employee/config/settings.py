@@ -146,6 +146,7 @@ class Settings(BaseSettings):
     kaggle_username: str = ""
     kaggle_key: str = ""
     roboflow_api_key: str = ""
+    huggingface_token: str = ""  # HF_TOKEN — gated/private repos & faster downloads
     # GPU VRAM available locally (GB); 0 = unknown. Used by estimate_hardware to
     # decide whether a found model can run/train on this machine.
     local_gpu_vram_gb: float = 0.0
@@ -160,6 +161,10 @@ class Settings(BaseSettings):
     )
     enable_code_execution: bool = True
     workspace_dir: Path = Path("./data/workspace")
+    # YouTube downloads (yt-dlp). Age-restricted videos need logged-in cookies.
+    # Example: YTDLP_COOKIES_FROM_BROWSER=chrome  (or firefox, chromium, brave, edge)
+    ytdlp_cookies_from_browser: str = ""
+    ytdlp_cookies_file: Path | None = None
     # JSON store for UI-managed API keys (overlaid on env at startup).
     secrets_file: Path = Path("./data/secrets.json")
     # UI defaults (brain provider/model, coding backend) set from the web console.

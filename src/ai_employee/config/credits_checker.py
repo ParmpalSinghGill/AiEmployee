@@ -80,19 +80,17 @@ async def _deepseek_balance(base_url: str, key: str) -> dict[str, Any]:
         data = r.json()
     except Exception:  # noqa: BLE001 - non-JSON is a provider-side problem
         return _result(
-            ok=False, supported=True, message="Unexpected response from DeepSeek.",
+            ok=False,
+            supported=True,
+            message="Unexpected response from DeepSeek.",
             detail=r.text[:200],
         )
     infos = data.get("balance_infos") or []
-    parts = [
-        f"{i.get('total_balance', '?')} {i.get('currency', '')}".strip() for i in infos
-    ]
+    parts = [f"{i.get('total_balance', '?')} {i.get('currency', '')}".strip() for i in infos]
     balance = ", ".join(p for p in parts if p) or "unknown"
     available = bool(data.get("is_available"))
     if available:
-        return _result(
-            ok=True, supported=True, message=f"Balance: {balance}.", balance=balance
-        )
+        return _result(ok=True, supported=True, message=f"Balance: {balance}.", balance=balance)
     return _result(
         ok=False,
         supported=True,
@@ -149,7 +147,9 @@ async def check_credits(settings: Any, name: str, value: str | None = None) -> d
             )
         except Exception as exc:  # noqa: BLE001 - report, never raise
             return _result(
-                ok=False, supported=True, message=f"Check failed: {type(exc).__name__}",
+                ok=False,
+                supported=True,
+                message=f"Check failed: {type(exc).__name__}",
                 detail=str(exc),
             )
 
@@ -157,9 +157,7 @@ async def check_credits(settings: Any, name: str, value: str | None = None) -> d
         provider, dashboard = _DASHBOARDS[name]
         return _unsupported(provider, dashboard)
 
-    return _result(
-        ok=True, supported=False, message="Credit check isn't available for this key."
-    )
+    return _result(ok=True, supported=False, message="Credit check isn't available for this key.")
 
 
 async def check_brain_credits(

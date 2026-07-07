@@ -28,9 +28,7 @@ async def test_research_tools_registered(registry):
 
 
 async def test_estimate_hardware_from_params(registry):
-    res = await registry.execute(
-        "estimate_hardware", {"params_billions": 7.0, "dtype": "fp16"}
-    )
+    res = await registry.execute("estimate_hardware", {"params_billions": 7.0, "dtype": "fp16"})
     assert res.ok
     # 7B fp16 ≈ 14GB weights → ~16.8 with overhead; training ≈ 104GB.
     assert 14 < res.output["inference_vram_gb"] < 20
@@ -285,9 +283,21 @@ def test_usage_ledger_aggregates_by_provider_and_date(tmp_path):
 
     path = tmp_path / "usage.jsonl"
     sink = make_sink(path)
-    sink("deepseek", "deepseek-chat", Usage(prompt_tokens=100, completion_tokens=20, total_tokens=120), "agent:scout")
-    sink("deepseek", "deepseek-chat", Usage(prompt_tokens=50, completion_tokens=10, total_tokens=60), "agent:codesmith")
-    sink("openai", "gpt-4o", Usage(prompt_tokens=30, completion_tokens=5, total_tokens=35), "planner")
+    sink(
+        "deepseek",
+        "deepseek-chat",
+        Usage(prompt_tokens=100, completion_tokens=20, total_tokens=120),
+        "agent:scout",
+    )
+    sink(
+        "deepseek",
+        "deepseek-chat",
+        Usage(prompt_tokens=50, completion_tokens=10, total_tokens=60),
+        "agent:codesmith",
+    )
+    sink(
+        "openai", "gpt-4o", Usage(prompt_tokens=30, completion_tokens=5, total_tokens=35), "planner"
+    )
 
     agg = query(path)
     assert agg["total"]["total_tokens"] == 215 and agg["total"]["calls"] == 3

@@ -39,9 +39,7 @@ class MockBrain(Brain):
         model: str | None = None,
         reasoning: bool = False,
     ) -> ChatResult:
-        last_user = next(
-            (m.content for m in reversed(messages) if m.role == Role.user), ""
-        )
+        last_user = next((m.content for m in reversed(messages) if m.role == Role.user), "")
         # Concatenate ALL system messages: the schema instruction is often appended
         # as a second system message after a role-specific one.
         system = "\n".join(m.content for m in messages if m.role == Role.system)

@@ -52,8 +52,7 @@ class InMemoryVectorStore(VectorStore):
         items = [
             r
             for r in self._records.values()
-            if r.namespace == namespace
-            and (session_id is None or r.session_id == session_id)
+            if r.namespace == namespace and (session_id is None or r.session_id == session_id)
         ]
         items.sort(key=lambda r: r.created_at, reverse=True)
         return items[:limit]
@@ -66,9 +65,7 @@ class InMemoryVectorStore(VectorStore):
         if namespace is None:
             self._records.clear()
         else:
-            self._records = {
-                k: v for k, v in self._records.items() if v.namespace != namespace
-            }
+            self._records = {k: v for k, v in self._records.items() if v.namespace != namespace}
 
     async def clear_session(self, session_id: str) -> int:
         to_remove = [k for k, v in self._records.items() if v.session_id == session_id]

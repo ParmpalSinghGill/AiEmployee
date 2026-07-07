@@ -55,9 +55,7 @@ class MemoryManager:
         log.debug("memory.record", namespace=namespace.value, id=rec.id)
         return rec
 
-    async def record_message(
-        self, role: str, content: str, *, session_id: str
-    ) -> MemoryRecord:
+    async def record_message(self, role: str, content: str, *, session_id: str) -> MemoryRecord:
         """Append a message to conversation memory (short-term + durable)."""
         return await self.record(
             content,
@@ -70,9 +68,7 @@ class MemoryManager:
         self, name: str, description: str, steps: list[str], *, tags: list[str] | None = None
     ) -> MemoryRecord:
         """Store a reusable skill/workflow the employee learned."""
-        content = f"SKILL: {name}\n{description}\nSTEPS:\n" + "\n".join(
-            f"- {s}" for s in steps
-        )
+        content = f"SKILL: {name}\n{description}\nSTEPS:\n" + "\n".join(f"- {s}" for s in steps)
         return await self.record(
             content,
             namespace=MemoryNamespace.skill,
@@ -94,13 +90,9 @@ class MemoryManager:
         except Exception as exc:  # noqa: BLE001
             log.warning("memory.recall_embed_failed", error=str(exc))
             return await self._store.recent(namespace, limit=k, session_id=session_id)
-        return await self._store.search(
-            namespace, vec, k=k, session_id=session_id
-        )
+        return await self._store.search(namespace, vec, k=k, session_id=session_id)
 
-    async def conversation_window(
-        self, session_id: str, *, limit: int = 20
-    ) -> list[MemoryRecord]:
+    async def conversation_window(self, session_id: str, *, limit: int = 20) -> list[MemoryRecord]:
         """The most recent messages — the short-term working memory."""
         records = await self._store.recent(
             MemoryNamespace.conversation, limit=limit, session_id=session_id
@@ -134,9 +126,7 @@ class MemoryManager:
             self._store.import_records(records)
 
 
-def build_memory_manager(
-    embedder: Brain, settings: Settings | None = None
-) -> MemoryManager:
+def build_memory_manager(embedder: Brain, settings: Settings | None = None) -> MemoryManager:
     """Construct a MemoryManager with the appropriate backend.
 
     Uses pgvector when a database is configured and reachable; otherwise falls

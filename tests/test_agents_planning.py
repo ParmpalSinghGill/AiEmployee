@@ -13,6 +13,7 @@ def test_registry_has_all_agents():
     names = set(reg.names())
     for expected in ("planner", "ceo", "research", "coding", "security", "human_approval"):
         assert expected in names
+    assert "resource_downloader" in names
     assert len(names) >= 20
 
 
@@ -63,8 +64,13 @@ async def test_agent_skips_duplicate_tool_calls(settings):
             if self.turn <= 2:
                 return ChatResult(
                     content="",
-                    tool_calls=[ToolCall(id=str(self.turn), name="echo",
-                                         arguments={"query": "cigarette detection"})],
+                    tool_calls=[
+                        ToolCall(
+                            id=str(self.turn),
+                            name="echo",
+                            arguments={"query": "cigarette detection"},
+                        )
+                    ],
                     usage=Usage(),
                 )
             return ChatResult(content="final answer", tool_calls=[], usage=Usage())
@@ -78,9 +84,7 @@ async def test_agent_skips_duplicate_tool_calls(settings):
     reg.register(EchoTool())
     begin_task_tool_history()
     try:
-        result = await _DupAgent().run(
-            "find stuff", AgentContext(brain=_DupBrain(), tools=reg)
-        )
+        result = await _DupAgent().run("find stuff", AgentContext(brain=_DupBrain(), tools=reg))
     finally:
         clear_task_tool_history()
 
@@ -121,8 +125,9 @@ async def test_duplicate_abort_keeps_toolcalls_paired(settings):
                 return ChatResult(content="", tool_calls=[_call(1)], usage=Usage())
             if self.turn in (2, 3):
                 base = self.turn * 10
-                return ChatResult(content="",
-                                  tool_calls=[_call(base), _call(base + 1)], usage=Usage())
+                return ChatResult(
+                    content="", tool_calls=[_call(base), _call(base + 1)], usage=Usage()
+                )
             return ChatResult(content="done", tool_calls=[], usage=Usage())
 
     class _A(ToolUsingAgent):
@@ -147,3 +152,275 @@ async def test_duplicate_abort_keeps_toolcalls_paired(settings):
             elif m.role == Role.tool and m.tool_call_id in pending:
                 pending.remove(m.tool_call_id)
         assert pending == [], f"dangling tool_call ids (no response): {pending}"
+
+
+async def test_resource_acquirer_continues_after_fetch_page_failures(settings):
+    """fetch_page 403 must not abort the loop before download_resource is tried."""
+    from pydantic import BaseModel
+
+    from ai_employee.agents.base import AgentContext, ToolUsingAgent
+    from ai_employee.brains.schemas import ChatResult, ToolCall, Usage
+    from ai_employee.tools.base import Tool, ToolResult
+    from ai_employee.tools.invocation_history import (
+        begin_task_tool_history,
+        clear_task_tool_history,
+    )
+    from ai_employee.tools.registry import ToolRegistry
+
+    class FailPageTool(Tool):
+        name = "fetch_page"
+        description = "fail"
+        category = "research"
+
+        class Args(BaseModel):
+            url: str
+
+        async def _run(self, args: Args) -> ToolResult:
+            return ToolResult(ok=False, error="HTTP 403 Forbidden")
+
+    class DownloadTool(Tool):
+        name = "download_resource"
+        description = "ok"
+        category = "research"
+
+        class Args(BaseModel):
+            url: str
+            destination: str = "./x.mp4"
+
+        async def _run(self, args: Args) -> ToolResult:
+            return ToolResult(ok=True, output={"path": "./x.mp4"})
+
+    class _Brain:
+        def __init__(self):
+            self.turn = 0
+
+        async def chat(self, messages, **kwargs):
+            self.turn += 1
+            if self.turn == 1:
+                return ChatResult(
+                    content="",
+                    tool_calls=[
+                        ToolCall(id="1", name="fetch_page", arguments={"url": "https://x"}),
+                        ToolCall(id="2", name="fetch_page", arguments={"url": "https://y"}),
+                    ],
+                    usage=Usage(),
+                )
+            if self.turn == 2:
+                return ChatResult(
+                    content="",
+                    tool_calls=[
+                        ToolCall(
+                            id="3",
+                            name="download_resource",
+                            arguments={
+                                "url": "https://www.youtube.com/watch?v=abc",
+                                "destination": "./v.mp4",
+                            },
+                        )
+                    ],
+                    usage=Usage(),
+                )
+            return ChatResult(content="downloaded", tool_calls=[], usage=Usage())
+
+    class _Agent(ToolUsingAgent):
+        name = "resource_acquirer"
+        allowed_tools = ["fetch_page", "download_resource"]
+        max_iterations = 6
+
+    reg = ToolRegistry(settings)
+    reg.register(FailPageTool())
+    reg.register(DownloadTool())
+    begin_task_tool_history()
+    try:
+        result = await _Agent().run("get mall video", AgentContext(brain=_Brain(), tools=reg))
+    finally:
+        clear_task_tool_history()
+
+    assert result.success
+    assert any(t.get("tool") == "download_resource" and t.get("ok") for t in result.tool_trace)
+    assert "aborted after repeated tool failure" not in str(result.metadata.get("note", ""))
+
+
+async def test_research_agent_continues_after_fetch_page_failures(settings):
+    """Research agent should try downloads, not stop after fetch_page 403s."""
+    from pydantic import BaseModel
+
+    from ai_employee.agents.base import AgentContext, ToolUsingAgent
+    from ai_employee.brains.schemas import ChatResult, ToolCall, Usage
+    from ai_employee.tools.base import Tool, ToolResult
+    from ai_employee.tools.invocation_history import (
+        begin_task_tool_history,
+        clear_task_tool_history,
+    )
+    from ai_employee.tools.registry import ToolRegistry
+
+    class FailPageTool(Tool):
+        name = "fetch_page"
+        description = "fail"
+        category = "research"
+
+        class Args(BaseModel):
+            url: str
+
+        async def _run(self, args: Args) -> ToolResult:
+            return ToolResult(ok=False, error="HTTP 403 Forbidden")
+
+    class DownloadTool(Tool):
+        name = "download_resource"
+        description = "ok"
+        category = "research"
+
+        class Args(BaseModel):
+            url: str
+            destination: str = "./session/x.mp4"
+
+        async def _run(self, args: Args) -> ToolResult:
+            return ToolResult(ok=True, output={"path": "./sessions/s1/x.mp4"})
+
+    class _Brain:
+        def __init__(self):
+            self.turn = 0
+
+        async def chat(self, messages, **kwargs):
+            self.turn += 1
+            if self.turn == 1:
+                return ChatResult(
+                    content="",
+                    tool_calls=[
+                        ToolCall(id="1", name="fetch_page", arguments={"url": "https://x"}),
+                        ToolCall(id="2", name="fetch_page", arguments={"url": "https://y"}),
+                    ],
+                    usage=Usage(),
+                )
+            if self.turn == 2:
+                return ChatResult(
+                    content="",
+                    tool_calls=[
+                        ToolCall(
+                            id="3",
+                            name="download_resource",
+                            arguments={
+                                "url": "https://www.youtube.com/watch?v=abc",
+                                "destination": "./session/x.mp4",
+                            },
+                        )
+                    ],
+                    usage=Usage(),
+                )
+            return ChatResult(content="downloaded exactly one required clip", tool_calls=[], usage=Usage())
+
+    class _Agent(ToolUsingAgent):
+        name = "research"
+        allowed_tools = ["fetch_page", "download_resource"]
+        max_iterations = 6
+
+    reg = ToolRegistry(settings)
+    reg.register(FailPageTool())
+    reg.register(DownloadTool())
+    begin_task_tool_history()
+    try:
+        result = await _Agent().run(
+            "find one mall entrance clip and download it",
+            AgentContext(brain=_Brain(), tools=reg),
+        )
+    finally:
+        clear_task_tool_history()
+
+    assert result.success
+    assert any(t.get("tool") == "download_resource" and t.get("ok") for t in result.tool_trace)
+    assert "aborted after repeated tool failure" not in str(result.metadata.get("note", ""))
+
+
+async def test_resource_downloader_tries_next_url_after_failed_downloads(settings):
+    """Repeated failed download attempts must not stop the agent before later URLs."""
+    from pydantic import BaseModel
+
+    from ai_employee.agents.base import AgentContext, ToolUsingAgent
+    from ai_employee.brains.schemas import ChatResult, ToolCall, Usage
+    from ai_employee.tools.base import Tool, ToolResult
+    from ai_employee.tools.invocation_history import (
+        begin_task_tool_history,
+        clear_task_tool_history,
+    )
+    from ai_employee.tools.registry import ToolRegistry
+
+    class DownloadTool(Tool):
+        name = "download_resource"
+        description = "download"
+        category = "research"
+
+        class Args(BaseModel):
+            url: str
+            destination: str = "./x"
+
+        async def _run(self, args: Args) -> ToolResult:
+            if args.url.endswith("a"):
+                return ToolResult(ok=False, error="HTTP 403 Forbidden")
+            if args.url.endswith("b"):
+                return ToolResult(ok=False, error="HTTP 403 Forbidden")
+            return ToolResult(ok=True, output={"path": "./downloads/c.mp4"})
+
+    class _Brain:
+        def __init__(self):
+            self.turn = 0
+
+        async def chat(self, messages, **kwargs):
+            self.turn += 1
+            if self.turn == 1:
+                return ChatResult(
+                    content="",
+                    tool_calls=[
+                        ToolCall(
+                            id="1",
+                            name="download_resource",
+                            arguments={"url": "https://example.com/a", "destination": "./a.mp4"},
+                        )
+                    ],
+                    usage=Usage(),
+                )
+            if self.turn == 2:
+                return ChatResult(
+                    content="",
+                    tool_calls=[
+                        ToolCall(
+                            id="2",
+                            name="download_resource",
+                            arguments={"url": "https://example.com/b", "destination": "./b.mp4"},
+                        )
+                    ],
+                    usage=Usage(),
+                )
+            if self.turn == 3:
+                return ChatResult(
+                    content="",
+                    tool_calls=[
+                        ToolCall(
+                            id="3",
+                            name="download_resource",
+                            arguments={"url": "https://example.com/c", "destination": "./c.mp4"},
+                        )
+                    ],
+                    usage=Usage(),
+                )
+            return ChatResult(content="downloaded the third candidate", tool_calls=[], usage=Usage())
+
+    class _Agent(ToolUsingAgent):
+        name = "resource_downloader"
+        allowed_tools = ["download_resource"]
+        max_iterations = 6
+
+    reg = ToolRegistry(settings)
+    reg.register(DownloadTool())
+    begin_task_tool_history()
+    try:
+        result = await _Agent().run("download one of these URLs", AgentContext(brain=_Brain(), tools=reg))
+    finally:
+        clear_task_tool_history()
+
+    assert result.success
+    assert [t.get("ok") for t in result.tool_trace if t.get("tool") == "download_resource"] == [
+        False,
+        False,
+        True,
+    ]
+    assert "aborted after repeated tool failure" not in str(result.metadata.get("note", ""))

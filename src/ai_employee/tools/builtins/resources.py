@@ -9,17 +9,27 @@ from pydantic import BaseModel, Field
 
 from ai_employee.config import Settings
 from ai_employee.core.exceptions import ApprovalRequired
-from ai_employee.observability.resource_ctx import get_resource_decision
+from ai_employee.observability.resource_ctx import (
+    get_approved_ops,
+    get_resource_decision,
+    get_resource_session,
+)
 from ai_employee.tools.base import Tool, ToolResult
 from ai_employee.tools.builtins._sandbox import ensure_workspace
 from ai_employee.tools.builtins.resource_download import (
-    _safe_dest,
+    canonical_artifact_dest,
     detect_source,
     download_github,
     download_http,
     download_huggingface,
     download_kaggle,
     download_youtube,
+    prioritize_download_urls,
+    sanitize_url,
+)
+from ai_employee.verification.resources import (
+    format_waiting_for_user_message,
+    is_manual_download_error,
 )
 
 _HUB_TOOLS = (
@@ -152,12 +162,22 @@ class DownloadResourceTool(Tool):
 
     async def _run(self, args: DownloadResourceTool.Args) -> ToolResult:
         ws = ensure_workspace(self._ws)
+        url = sanitize_url(args.url)
+        if not url:
+            return ToolResult(ok=False, error="empty or invalid url")
+        session_id = get_resource_session()
         try:
-            dest = _safe_dest(ws, args.destination)
+            dest = canonical_artifact_dest(
+                ws,
+                session_id,
+                url=url,
+                source_hint=args.source_hint,
+                requested_dest=args.destination,
+            )
         except ValueError as exc:
             return ToolResult(ok=False, error=str(exc))
 
-        kind = args.source_hint if args.source_hint != "auto" else detect_source(args.url)
+        kind = args.source_hint if args.source_hint != "auto" else detect_source(url)
 
         async def run_shell(cmd: list[str]) -> tuple[int, str, str]:
             proc = await asyncio.create_subprocess_exec(
@@ -171,35 +191,65 @@ class DownloadResourceTool(Tool):
             except TimeoutError:
                 proc.kill()
                 return 124, "", "timed out after 300s"
-            return proc.returncode or 0, out_b.decode(errors="replace"), err_b.decode(errors="replace")
+            return (
+                proc.returncode or 0,
+                out_b.decode(errors="replace"),
+                err_b.decode(errors="replace"),
+            )
 
         try:
             if kind == "youtube":
                 await self._ensure_pkg("yt-dlp")
-                info = await download_youtube(args.url, dest, workspace=ws, run_shell=run_shell)
+                browser = (self._settings.ytdlp_cookies_from_browser or "").strip() or None
+                cookies_file = self._settings.ytdlp_cookies_file
+                info = await download_youtube(
+                    url,
+                    dest,
+                    workspace=ws,
+                    run_shell=run_shell,
+                    cookies_from_browser=browser,
+                    cookies_file=cookies_file,
+                )
             elif kind == "huggingface":
-                await self._ensure_pkg("huggingface_hub")
-                info = await download_huggingface(args.url, dest, run_shell=run_shell)
+                info = await download_huggingface(
+                    url,
+                    dest,
+                    workspace=ws,
+                    token=(self._settings.huggingface_token or "").strip() or None,
+                    run_shell=run_shell,
+                )
             elif kind == "kaggle":
                 has = bool(self._settings.kaggle_username and self._settings.kaggle_key)
-                info = await download_kaggle(
-                    args.url, dest, run_shell=run_shell, has_creds=has
-                )
+                info = await download_kaggle(url, dest, run_shell=run_shell, has_creds=has)
             elif kind == "github":
-                info = await download_github(args.url, dest, run_shell=run_shell)
+                info = await download_github(url, dest, run_shell=run_shell)
             else:
-                info = await download_http(args.url, dest)
+                info = await download_http(url, dest)
             return ToolResult(
                 ok=True,
                 output=info,
-                metadata={"source": kind, "local_path": info.get("path")},
+                metadata={
+                    "source": kind,
+                    "local_path": info.get("path"),
+                    "canonical_destination": str(dest),
+                    "session_id": session_id,
+                },
             )
         except Exception as exc:  # noqa: BLE001
-            hint = _credential_hint(kind, self._settings)
+            hint = _credential_hint(kind, self._settings, str(exc))
             msg = str(exc)
             if hint:
                 msg += f" | {hint}"
-            return ToolResult(ok=False, error=msg, metadata={"source": kind, "url": args.url})
+            manual = is_manual_download_error(msg)
+            return ToolResult(
+                ok=False,
+                error=msg,
+                metadata={
+                    "source": kind,
+                    "url": url,
+                    "manual_download_required": manual,
+                },
+            )
 
     async def _ensure_pkg(self, package: str) -> None:
         from ai_employee.tools.builtins.code import PipInstallTool
@@ -209,18 +259,18 @@ class DownloadResourceTool(Tool):
 
 
 class RequestResourceInputTool(Tool):
-    """Pause the task and ask the human how to proceed when download/search failed."""
+    """Pause the task when a resource was found but cannot be downloaded automatically."""
 
     name = "request_resource_input"
     description = (
-        "Pause and ask the human for help when a required resource could not be downloaded. "
-        "Provide candidate URLs, which hubs were searched, and any missing API keys. "
-        "The user can: supply a local workspace path, provide a new URL, add API keys (🔑 Keys) "
-        "and retry, proceed without the resource, or abort. Use when the task cannot continue "
-        "without data OR when automatic download failed everywhere."
+        "Pause and ask the human for help acquiring a resource. Use when a SUITABLE "
+        "resource URL was found but automatic download failed (403, login, CAPTCHA, etc.) "
+        "or when no hub returned a usable link. If candidates exist, the task enters "
+        "WAITING_FOR_USER (not failed). Provide candidate URLs, which hubs were searched, "
+        "and the download failure reason. The user can supply a local workspace path, "
+        "a new URL, proceed without the resource, or abort."
     )
     category = "research"
-    approval_key = "resource_acquisition"
 
     class Args(BaseModel):
         resource_description: str
@@ -232,9 +282,33 @@ class RequestResourceInputTool(Tool):
             description="If true, warn that proceeding without the resource may block the goal.",
         )
         message: str = ""
+        download_failure_reason: str = Field(
+            "",
+            description="Why automatic download failed (e.g. HTTP 403, login required).",
+        )
 
     async def _run(self, args: RequestResourceInputTool.Args) -> ToolResult:
         decision = get_resource_decision()
+        approved = get_approved_ops()
+        if decision:
+            return ToolResult(
+                ok=True,
+                output={
+                    "human_decision": decision,
+                    "note": "Resuming with user-provided resource decision.",
+                },
+                metadata={"resolved": True},
+            )
+        if approved & {"resource_acquisition", "waiting_for_user"}:
+            return ToolResult(
+                ok=True,
+                output={
+                    "human_decision": "proceed_without",
+                    "note": "Resource acquisition already approved for this run.",
+                },
+                metadata={"resolved": True, "preapproved": True},
+            )
+
         payload = {
             "tool": self.name,
             "args": args.model_dump(),
@@ -251,26 +325,44 @@ class RequestResourceInputTool(Tool):
                 "abort",
             ],
             "message": args.message,
+            "download_failure_reason": args.download_failure_reason,
         }
-        if decision:
-            return ToolResult(
-                ok=True,
-                output={
-                    "human_decision": decision,
-                    "note": "Resuming with user-provided resource decision.",
-                },
-                metadata={"resolved": True},
+        candidates = prioritize_download_urls(
+            [u for u in (sanitize_url(x) for x in args.candidate_urls) if u]
+        )
+        if candidates:
+            name = args.resource_description[:80] or candidates[0].split("/")[-1]
+            reason = (
+                args.download_failure_reason
+                or args.message
+                or "the host blocks automated downloads"
             )
+            payload["message"] = format_waiting_for_user_message(
+                name=name,
+                url=candidates[0],
+                reason=reason,
+            )
+            payload["download_failure_reason"] = reason
+            raise ApprovalRequired("waiting_for_user", payload=payload)
+
+        payload["message"] = args.message or (
+            "No suitable resource could be found automatically. "
+            "Provide a local path, a direct URL, or choose how to proceed."
+        )
         raise ApprovalRequired("resource_acquisition", payload=payload)
 
 
-def _credential_hint(kind: str, settings: Settings) -> str:
+def _credential_hint(kind: str, settings: Settings, error: str = "") -> str:
     if kind == "kaggle" and not (settings.kaggle_username and settings.kaggle_key):
         return "Set KAGGLE_USERNAME and KAGGLE_KEY in 🔑 Keys"
     if kind == "roboflow" and not settings.roboflow_api_key:
         return "Set ROBOFLOW_API_KEY in 🔑 Keys"
     if kind == "github" and not settings.github_token:
         return "GITHUB_TOKEN optional but improves rate limits"
+    if kind == "huggingface" and not settings.huggingface_token:
+        err = (error or "").lower()
+        if any(x in err for x in ("gated", "authorized", "401", "private", "authenticate")):
+            return "Set HF_TOKEN in 🔑 Keys for gated/private Hugging Face repos"
     return ""
 
 

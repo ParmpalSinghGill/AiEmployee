@@ -14,7 +14,7 @@ from typing import Any, ClassVar, get_type_hints
 from pydantic import BaseModel, ValidationError
 
 from ai_employee.brains.schemas import ToolSpec
-from ai_employee.core.exceptions import ToolError
+from ai_employee.core.exceptions import ApprovalRequired, ToolError
 from ai_employee.core.logging import get_logger
 
 log = get_logger("tool")
@@ -80,6 +80,8 @@ class Tool(abc.ABC):
             result = await self._run(args)
             if not isinstance(result, ToolResult):
                 result = ToolResult(output=result)
+        except ApprovalRequired:
+            raise
         except ToolError as exc:
             result = ToolResult(ok=False, error=str(exc))
         except Exception as exc:  # noqa: BLE001 - tools must not crash the loop

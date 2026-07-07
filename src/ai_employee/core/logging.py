@@ -87,9 +87,7 @@ def configure_logging(level: str = "INFO", *, json: bool = False) -> None:
     ]
 
     renderer = (
-        structlog.processors.JSONRenderer()
-        if json
-        else structlog.dev.ConsoleRenderer(colors=True)
+        structlog.processors.JSONRenderer() if json else structlog.dev.ConsoleRenderer(colors=True)
     )
 
     # Let INFO+ always flow through the processor chain so observers (the web UI's

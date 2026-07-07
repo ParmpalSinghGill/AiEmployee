@@ -122,7 +122,10 @@ class ToolRegistry:
                 )
 
         log.info("tool.execute", tool=name, args=clip_obj(arguments))
-        result = await tool.execute(**arguments)
+        try:
+            result = await tool.execute(**arguments)
+        except ApprovalRequired:
+            raise
         log.info(
             "tool.result",
             tool=name,

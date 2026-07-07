@@ -52,9 +52,7 @@ class ToolSpec(BaseModel):
 
     name: str
     description: str
-    parameters: dict[str, Any] = Field(
-        default_factory=lambda: {"type": "object", "properties": {}}
-    )
+    parameters: dict[str, Any] = Field(default_factory=lambda: {"type": "object", "properties": {}})
 
     def to_openai(self) -> dict[str, Any]:
         return {

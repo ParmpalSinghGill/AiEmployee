@@ -92,9 +92,7 @@ async def chat_stream(req: ChatRequest, emp: AIEmployee = Depends(get_employee))
 
 @router.post("/task", response_model=TaskResponse, tags=["tasks"])
 async def run_task(req: TaskRequest, emp: AIEmployee = Depends(get_employee)) -> TaskResponse:
-    result = await emp.run(
-        req.goal, session_id=req.session_id, approved_ops=set(req.approved_ops)
-    )
+    result = await emp.run(req.goal, session_id=req.session_id, approved_ops=set(req.approved_ops))
     return TaskResponse(
         task_id=uuid.uuid4().hex,
         goal=req.goal,
@@ -122,8 +120,12 @@ async def run_agent(req: AgentRunRequest, emp: AIEmployee = Depends(get_employee
 async def list_tools(emp: AIEmployee = Depends(get_employee)) -> dict:
     return {
         "tools": [
-            {"name": t.name, "category": t.category, "description": t.description,
-             "approval_key": t.approval_key}
+            {
+                "name": t.name,
+                "category": t.category,
+                "description": t.description,
+                "approval_key": t.approval_key,
+            }
             for t in emp.tools.all()
         ]
     }
@@ -132,9 +134,7 @@ async def list_tools(emp: AIEmployee = Depends(get_employee)) -> dict:
 @router.post("/knowledge/ingest", response_model=IngestResponse, tags=["knowledge"])
 async def ingest(req: IngestRequest, emp: AIEmployee = Depends(get_employee)) -> IngestResponse:
     report = await emp.knowledge.ingest(req.source)
-    return IngestResponse(
-        documents=report.documents, chunks=report.chunks, sources=report.sources
-    )
+    return IngestResponse(documents=report.documents, chunks=report.chunks, sources=report.sources)
 
 
 @router.post("/knowledge/query", response_model=QueryResponse, tags=["knowledge"])
@@ -144,9 +144,7 @@ async def query(req: QueryRequest, emp: AIEmployee = Depends(get_employee)) -> Q
 
 
 @router.post("/memory", tags=["memory"])
-async def record_memory(
-    req: MemoryRecordRequest, emp: AIEmployee = Depends(get_employee)
-) -> dict:
+async def record_memory(req: MemoryRecordRequest, emp: AIEmployee = Depends(get_employee)) -> dict:
     try:
         ns = MemoryNamespace(req.namespace)
     except ValueError as exc:
@@ -157,7 +155,9 @@ async def record_memory(
 
 @router.get("/memory/search", response_model=MemoryQueryResponse, tags=["memory"])
 async def search_memory(
-    q: str, namespace: str = "long_term", k: int = 5,
+    q: str,
+    namespace: str = "long_term",
+    k: int = 5,
     emp: AIEmployee = Depends(get_employee),
 ) -> MemoryQueryResponse:
     try:

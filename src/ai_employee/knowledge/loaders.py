@@ -137,7 +137,9 @@ def _load_url(url: str) -> LoadedDocument:
     from ai_employee.tools.builtins.web import _html_to_text
 
     try:
-        resp = httpx.get(url, follow_redirects=True, timeout=30, headers={"User-Agent": "AIEmployee/0.1"})
+        resp = httpx.get(
+            url, follow_redirects=True, timeout=30, headers={"User-Agent": "AIEmployee/0.1"}
+        )
         resp.raise_for_status()
         ct = resp.headers.get("content-type", "")
         text = _html_to_text(resp.text) if "html" in ct else resp.text
@@ -149,9 +151,29 @@ def _load_url(url: str) -> LoadedDocument:
 # ── Directory / codebase ─────────────────────────────────────────────────────
 _SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".mypy_cache"}
 _TEXT_EXTS = {
-    ".txt", ".md", ".markdown", ".py", ".js", ".ts", ".tsx", ".jsx", ".java",
-    ".go", ".rs", ".c", ".cpp", ".h", ".html", ".css", ".json", ".yaml", ".yml",
-    ".toml", ".csv", ".sql", ".sh",
+    ".txt",
+    ".md",
+    ".markdown",
+    ".py",
+    ".js",
+    ".ts",
+    ".tsx",
+    ".jsx",
+    ".java",
+    ".go",
+    ".rs",
+    ".c",
+    ".cpp",
+    ".h",
+    ".html",
+    ".css",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".csv",
+    ".sql",
+    ".sh",
 }
 
 
@@ -162,7 +184,12 @@ def _load_directory(root: Path, *, max_files: int = 500) -> list[LoadedDocument]
             break
         if p.is_dir() or any(part in _SKIP_DIRS for part in p.parts):
             continue
-        if p.suffix.lower() in _TEXT_EXTS or p.suffix.lower() in {".pdf", ".docx", ".pptx", ".xlsx"}:
+        if p.suffix.lower() in _TEXT_EXTS or p.suffix.lower() in {
+            ".pdf",
+            ".docx",
+            ".pptx",
+            ".xlsx",
+        }:
             doc = _load_file(p)
             if doc.text.strip():
                 docs.append(doc)

@@ -96,9 +96,7 @@ class OpenAICompatibleBrain(Brain):
         )
         kwargs: dict[str, Any] = {
             "model": chosen_model,
-            "messages": self._maybe_no_think(
-                [_to_openai_message(m) for m in messages], reasoning
-            ),
+            "messages": self._maybe_no_think([_to_openai_message(m) for m in messages], reasoning),
             "max_tokens": max_tokens or self._default_max_tokens,
         }
         # Reasoning models reject the temperature param on some providers.

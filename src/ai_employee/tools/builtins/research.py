@@ -162,8 +162,7 @@ class ArxivSearchTool(Tool):
                     "title": (entry.findtext(f"{_ATOM}title") or "").strip(),
                     "abstract": (entry.findtext(f"{_ATOM}summary") or "").strip()[:600],
                     "authors": [
-                        a.findtext(f"{_ATOM}name")
-                        for a in entry.findall(f"{_ATOM}author")
+                        a.findtext(f"{_ATOM}name") for a in entry.findall(f"{_ATOM}author")
                     ][:6],
                     "url": (entry.findtext(f"{_ATOM}id") or "").strip(),
                     "pdf_url": pdf,

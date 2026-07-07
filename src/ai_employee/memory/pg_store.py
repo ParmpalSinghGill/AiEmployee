@@ -66,9 +66,7 @@ class PgVectorStore(VectorStore):
             stmt = select(MemoryItem).where(MemoryItem.namespace == namespace.value)
             if session_id is not None:
                 stmt = stmt.where(MemoryItem.session_id == session_id)
-            stmt = stmt.order_by(
-                MemoryItem.embedding.cosine_distance(query_embedding)
-            ).limit(k)
+            stmt = stmt.order_by(MemoryItem.embedding.cosine_distance(query_embedding)).limit(k)
             rows = (await session.execute(stmt)).scalars().all()
             return [_to_record(r) for r in rows]
 

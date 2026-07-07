@@ -9,6 +9,7 @@ from configuration, and exposes a tiny high-level API:
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from ai_employee.agents import build_agent_registry
@@ -25,6 +26,21 @@ log = get_logger("employee")
 def _short_goal(goal: str) -> str:
     g = goal.strip().replace("\n", " ")
     return (g[:42] + "…") if len(g) > 42 else (g or "Untitled task")
+
+
+def _normalize_download_goal(goal: str) -> str:
+    g = goal.strip()
+    if not g:
+        return "Download the requested resource into the workspace."
+    if "http://" in g or "https://" in g:
+        if not re.search(r"\b(download|save|clone|pull|fetch|acquire)\b", g, re.I):
+            return (
+                "Download this resource URL into the workspace and report the saved path. "
+                "If it is YouTube, GitHub, Hugging Face, or Kaggle, use the automated "
+                "downloader.\n\n"
+                f"URL:\n{g}"
+            )
+    return g
 
 
 class AIEmployee:
@@ -84,6 +100,7 @@ class AIEmployee:
         approved_ops: set[str] | None = None,
         resource_decision: dict[str, Any] | None = None,
         workflow_checkpoint: dict[str, Any] | None = None,
+        session_context: str = "",
     ) -> dict[str, Any]:
         """Plan and execute a high-level goal end-to-end."""
         from ai_employee.core.usage import track_usage
@@ -95,6 +112,7 @@ class AIEmployee:
                 approved_ops=approved_ops,
                 resource_decision=resource_decision,
                 workflow_checkpoint=workflow_checkpoint,
+                session_context=session_context,
             )
         checkpoint = self.orchestrator.checkpoint_from_state(
             state, goal=goal, session_id=session_id
@@ -140,6 +158,53 @@ class AIEmployee:
             "trace": state.get("trace", []),
         }
 
+    async def download(
+        self,
+        goal: str,
+        *,
+        session_id: str = "default",
+        approved_ops: set[str] | None = None,
+        resource_decision: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Run the direct downloader agent for one or more resource URLs."""
+        from ai_employee.agents import AgentContext
+        from ai_employee.core.usage import track_usage
+        from ai_employee.observability.resource_ctx import (
+            bind_approved_ops,
+            bind_resource_decision,
+            bind_resource_session,
+            clear_resource_decision,
+        )
+
+        task = _normalize_download_goal(goal)
+        ctx = AgentContext(
+            brain=self.brain,
+            tools=self.tools,
+            memory=self.memory,
+            session_id=session_id,
+            approved_ops=set(approved_ops or ()),
+        )
+        ctx.scratch["agent_catalog"] = self.agents.catalog()
+
+        with track_usage() as meter:
+            bind_approved_ops(approved_ops or set())
+            bind_resource_decision(resource_decision)
+            bind_resource_session(session_id)
+            try:
+                result = await self.agents.get("resource_downloader").run(task, ctx)
+            finally:
+                clear_resource_decision()
+        return {
+            "goal": goal,
+            "answer": result.output,
+            "confidence": result.confidence,
+            "steps": [],
+            "tokens": meter.snapshot(),
+            "needs_approval": result.needs_approval,
+            "trace": [],
+            "agent": result.agent,
+        }
+
     async def chat(self, message: str, *, session_id: str = "default") -> str:
         """Lightweight single-turn chat with conversation memory (no full pipeline)."""
         from ai_employee.brains.schemas import Message
@@ -152,7 +217,10 @@ class AIEmployee:
             window = []
         messages = [Message.system("You are a helpful, capable AI employee.")]
         messages += [
-            Message(role="assistant" if r.metadata.get("role") == "assistant" else "user", content=r.content)
+            Message(
+                role="assistant" if r.metadata.get("role") == "assistant" else "user",
+                content=r.content,
+            )
             for r in window
         ]
         messages.append(Message.user(message))

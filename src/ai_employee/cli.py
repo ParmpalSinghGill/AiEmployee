@@ -62,7 +62,9 @@ async def _run_async(args) -> int:
     try:
         if args.command == "run":
             result = await emp.run(args.goal, session_id=args.session)
-            console.print(Panel(result["answer"], title=f"Result (confidence={result['confidence']})"))
+            console.print(
+                Panel(result["answer"], title=f"Result (confidence={result['confidence']})")
+            )
         elif args.command == "chat":
             reply = await emp.chat(args.message, session_id=args.session)
             console.print(Panel(reply, title="Reply"))
@@ -75,7 +77,9 @@ async def _run_async(args) -> int:
             console.print(json.dumps(res.citations, indent=2))
         elif args.command == "ask":
             out = await emp.ask_agent(args.agent, args.task)
-            console.print(Panel(out["output"], title=f"{args.agent} (confidence={out['confidence']})"))
+            console.print(
+                Panel(out["output"], title=f"{args.agent} (confidence={out['confidence']})")
+            )
         elif args.command == "agents":
             for a in emp.agents.catalog():
                 console.print(f"[cyan]{a['name']:18}[/] {a['role']} — {a['description']}")
@@ -86,17 +90,22 @@ async def _run_async(args) -> int:
             s = emp.settings
             warn = emp.brain.name == "mock"
             color = "yellow" if warn else "green"
-            console.print(Panel(
-                f"[bold]Brain (LLM):[/]    [{color}]{emp.brain.name}[/]  ·  model: {emp.brain.model_name}\n"
-                f"[bold]Reasoning:[/]      {emp.brain.supports_reasoning}\n"
-                f"[bold]Embeddings:[/]     {s.embedding_provider.value}  ·  dim {s.embedding_dim}\n"
-                f"[bold]Memory backend:[/] {s.memory_backend}\n"
-                f"[bold]Sessions dir:[/]   {s.sessions_dir}\n"
-                + ("\n[yellow]⚠ Running the OFFLINE MOCK — answers are placeholders.\n"
-                   "  Set LLM_PROVIDER in .env (e.g. local, deepseek) for real output.[/]"
-                   if warn else ""),
-                title="Active configuration",
-            ))
+            console.print(
+                Panel(
+                    f"[bold]Brain (LLM):[/]    [{color}]{emp.brain.name}[/]  ·  model: {emp.brain.model_name}\n"
+                    f"[bold]Reasoning:[/]      {emp.brain.supports_reasoning}\n"
+                    f"[bold]Embeddings:[/]     {s.embedding_provider.value}  ·  dim {s.embedding_dim}\n"
+                    f"[bold]Memory backend:[/] {s.memory_backend}\n"
+                    f"[bold]Sessions dir:[/]   {s.sessions_dir}\n"
+                    + (
+                        "\n[yellow]⚠ Running the OFFLINE MOCK — answers are placeholders.\n"
+                        "  Set LLM_PROVIDER in .env (e.g. local, deepseek) for real output.[/]"
+                        if warn
+                        else ""
+                    ),
+                    title="Active configuration",
+                )
+            )
             console.print("[dim]Change the brain: edit LLM_PROVIDER in .env, then restart.[/]")
         return 0
     finally:

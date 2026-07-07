@@ -42,16 +42,25 @@ class Verifier:
             "complete. Return your verdict as the required JSON."
         )
         if resource_audit and resource_audit.get("applies"):
+            outcome = resource_audit.get("outcome", "")
             system += (
                 "\n\nThis step involves finding/obtaining a resource (video, dataset, file, "
-                "URL). Do NOT pass if the output claims a resource was found, downloaded, or "
-                "saved without a concrete web URL and/or an existing local file path that "
-                "was actually verified. Search-result snippets alone are NOT proof. If nothing "
-                "was obtained, the output must say NOT FOUND / NOT DOWNLOADED clearly."
+                "URL). Distinguish three outcomes:\n"
+                "- COMPLETED: a concrete web URL AND/OR an existing local file was verified.\n"
+                "- WAITING_FOR_USER: a suitable resource URL was found and automatic download "
+                "was attempted or is impossible (403, login, CAPTCHA, etc.) — manual download "
+                "is acceptable; do NOT fail for missing local file alone.\n"
+                "- FAILED / NOT_FOUND: no suitable resource exists, only broken URLs, or the "
+                "output falsely claims success without URLs.\n"
+                "Search snippets alone are NOT proof. Never treat 'resource not found' as true "
+                "when concrete candidate URLs are listed."
             )
-        user = (
-            f"TASK:\n{task}\n\nSUCCESS CRITERIA:\n{criteria}\n\nOUTPUT TO REVIEW:\n{output}"
-        )
+            if outcome == "waiting_for_user":
+                system += (
+                    "\n\nThe programmatic audit marks this as WAITING_FOR_USER: pass if a "
+                    "suitable URL is documented even when the file is not in the workspace yet."
+                )
+        user = f"TASK:\n{task}\n\nSUCCESS CRITERIA:\n{criteria}\n\nOUTPUT TO REVIEW:\n{output}"
         if resource_audit and resource_audit.get("issues"):
             user += "\n\nPROGRAMMATIC RESOURCE AUDIT ISSUES:\n" + "\n".join(
                 f"- {issue}" for issue in resource_audit["issues"]
@@ -74,16 +83,26 @@ class Verifier:
             log.warning("verifier.failed", error=str(exc))
             verdict = Verdict(passed=True, confidence=0.5, issues=["verifier unavailable"])
         if resource_audit and resource_audit.get("issues"):
-            verdict = Verdict(
-                passed=False,
-                confidence=min(verdict.confidence, 0.25),
-                issues=[*verdict.issues, *resource_audit["issues"]],
-                suggestion=verdict.suggestion
-                or (
-                    "Only report resources you verified. For each resource include: "
-                    "Web URL, Local path (or NOT DOWNLOADED), and the model used."
-                ),
-            )
+            outcome = resource_audit.get("outcome", "")
+            if outcome == "waiting_for_user":
+                verdict = Verdict(
+                    passed=True,
+                    confidence=max(verdict.confidence, 0.75),
+                    issues=verdict.issues,
+                    suggestion=verdict.suggestion
+                    or "Resource found; waiting for the user to supply a local file path.",
+                )
+            else:
+                verdict = Verdict(
+                    passed=False,
+                    confidence=min(verdict.confidence, 0.25),
+                    issues=[*verdict.issues, *resource_audit["issues"]],
+                    suggestion=verdict.suggestion
+                    or (
+                        "Only report resources you verified. For each resource include: "
+                        "Web URL, Local path (or NOT DOWNLOADED), and the model used."
+                    ),
+                )
         # The verifier's *output*: verdict plus the concrete reasoning behind it.
         log.info(
             "verifier.verdict",

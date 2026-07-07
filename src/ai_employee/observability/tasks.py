@@ -49,6 +49,7 @@ class TaskStatus(str, Enum):
     pending = "pending"
     running = "running"
     awaiting_approval = "awaiting_approval"
+    waiting_for_user = "waiting_for_user"
     completed = "completed"
     failed = "failed"
     cancelled = "cancelled"
@@ -129,6 +130,7 @@ class TaskRecord:
             "error": self.error,
             "approved_ops": sorted(self.approved_ops),
             "resource_decision": self.resource_decision,
+            "resumable": self.resumable,
         }
 
     @classmethod
@@ -149,9 +151,23 @@ class TaskRecord:
         rec.approved_ops = set(d.get("approved_ops", []))
         rd = d.get("resource_decision")
         rec.resource_decision = rd if isinstance(rd, dict) else None
+        rec.resumable = bool(d.get("resumable", False))
         status = d.get("status", "completed")
+        pending_approval = _pending_approval(rec.result)
+        resume_checkpoint = _resume_checkpoint(rec.result)
         if status in {"running", "pending"}:
-            if rec.result:
+            if pending_approval:
+                op = pending_approval.get("operation")
+                status = "waiting_for_user" if op == "waiting_for_user" else "awaiting_approval"
+            elif resume_checkpoint:
+                # Interrupted after a checkpoint was saved (for example, the server
+                # was closed right after approval). Surface it as resumable rather
+                # than pretending it completed.
+                status = "failed"
+                rec.resumable = True
+                if not rec.error:
+                    rec.error = "interrupted (resume available)"
+            elif rec.result:
                 status = "completed"
             elif not rec.events:
                 # Queued but never actually ran (process died before it started).
@@ -165,6 +181,10 @@ class TaskRecord:
                     rec.error = "interrupted (process restarted)"
         rec.status = TaskStatus(status)
         return rec
+
+    def can_resume(self) -> bool:
+        """True when a saved checkpoint can continue this run in place."""
+        return self.resumable and _resume_checkpoint(self.result) is not None
 
 
 class _Session:
@@ -214,8 +234,20 @@ class TaskManager:
             event = str(event_dict.get("event", ""))
             # Keep flow milestones + warnings/errors; drop low-signal debug chatter.
             level = str(event_dict.get("level", "info"))
-            if event in _FLOW_EVENTS or level in {"warning", "error", "critical"} or event.startswith(
-                ("workflow", "agent", "tool", "planner", "verifier", "brain.request", "brain.response")
+            if (
+                event in _FLOW_EVENTS
+                or level in {"warning", "error", "critical"}
+                or event.startswith(
+                    (
+                        "workflow",
+                        "agent",
+                        "tool",
+                        "planner",
+                        "verifier",
+                        "brain.request",
+                        "brain.response",
+                    )
+                )
             ):
                 self._tasks[tid].add_log(event_dict)
 
@@ -231,7 +263,8 @@ class TaskManager:
     ) -> TaskRecord:
         """Create a task (new session unless ``session_id`` given) and run it in
         the background. Returns immediately. ``mode`` selects the pipeline:
-        ``task`` (general) or ``research`` (model/dataset discovery)."""
+        ``task`` (general), ``research`` (model/dataset discovery), or
+        ``download`` (direct URL downloader)."""
         if session_id and session_id in self._sessions:
             session = self._sessions[session_id]
             parent_id = session.task_ids[-1] if session.task_ids else None
@@ -250,9 +283,16 @@ class TaskManager:
         self._launch(employee, task)
         return task
 
-    def _launch(self, employee: Any, task: TaskRecord, *, approval: dict | None = None) -> None:
+    def _launch(
+        self,
+        employee: Any,
+        task: TaskRecord,
+        *,
+        approval: dict | None = None,
+        resume: bool = False,
+    ) -> None:
         """(Re)start a task's execution in the background, tracking its handle."""
-        handle = asyncio.create_task(self._execute(employee, task, approval=approval))
+        handle = asyncio.create_task(self._execute(employee, task, approval=approval, resume=resume))
         self._handles[task.id] = handle
         handle.add_done_callback(lambda _h, tid=task.id: self._handles.pop(tid, None))
 
@@ -262,24 +302,51 @@ class TaskManager:
         task_id: str,
         *,
         resource_decision: dict[str, Any] | None = None,
+        approve_all_similar: bool = True,
     ) -> TaskRecord | None:
-        """Approve a paused task and resume it *in place* (same run/tab), rather
-        than spawning a new run. Returns None if the task isn't awaiting approval."""
+        """Approve or respond to a paused task and resume it *in place*."""
         task = self._tasks.get(task_id)
-        if task is None or task.status != TaskStatus.awaiting_approval:
+        if task is None or task.status not in {
+            TaskStatus.awaiting_approval,
+            TaskStatus.waiting_for_user,
+        }:
             return None
         approval = (task.result or {}).get("needs_approval") or {}
         op = approval.get("operation")
-        if op:
-            task.approved_ops = set(task.approved_ops) | {op}
+        task.approved_ops = set(task.approved_ops) | _expand_approved_ops(
+            op,
+            approval,
+            approve_all_similar=approve_all_similar,
+        )
         if resource_decision:
             task.resource_decision = resource_decision
+        if task.result:
+            cleared = dict(task.result)
+            cleared["needs_approval"] = None
+            task.result = cleared
         self._persist_task(task)
-        # Flip to running synchronously so a poll racing the background task
-        # doesn't see the (terminal) awaiting_approval status and stop polling.
         task.status = TaskStatus.running
+        task.resumable = False
+        task.error = None
+        task.finished_at = None
         self._persist_task(task)
-        self._launch(employee, task, approval=approval)
+        self._launch(employee, task, approval=approval, resume=True)
+        return task
+
+    def resume(self, employee: Any, task_id: str) -> TaskRecord | None:
+        """Resume an interrupted run from its saved workflow checkpoint."""
+        task = self._tasks.get(task_id)
+        if task is None or not task.can_resume():
+            return None
+        handle = self._handles.get(task_id)
+        if handle is not None and not handle.done():
+            return None
+        task.status = TaskStatus.running
+        task.resumable = False
+        task.error = None
+        task.finished_at = None
+        self._persist_task(task)
+        self._launch(employee, task, resume=True)
         return task
 
     def resume_interrupted(self, employee: Any) -> list[str]:
@@ -313,13 +380,19 @@ class TaskManager:
         return True
 
     async def _execute(
-        self, employee: Any, task: TaskRecord, *, approval: dict | None = None
+        self,
+        employee: Any,
+        task: TaskRecord,
+        *,
+        approval: dict | None = None,
+        resume: bool = False,
     ) -> None:
         # Bind task_id so every nested log event is attributed to this task. This
         # runs in its own asyncio Task context, so concurrent runs stay isolated.
         structlog.contextvars.bind_contextvars(task_id=task.id)
         approved_ops = set(task.approved_ops)
         task.status = TaskStatus.running
+        task.resumable = False
         log.info("task.started", goal=task.goal[:120])
         # Record what the user just approved, inline in the flow/logs/explain, so
         # it's clear which sensitive op was granted and when.
@@ -335,7 +408,15 @@ class TaskManager:
             self._spawn_name(employee, task)
         try:
             checkpoint = (task.result or {}).get("workflow_checkpoint")
-            resume = bool(checkpoint and (approval or task.approved_ops))
+            should_resume = bool(checkpoint and resume)
+            session_context = "" if should_resume else self._build_session_context(task)
+            if session_context:
+                prior = self._sessions.get(task.session_id)
+                log.info(
+                    "task.session_context",
+                    prior_runs=len(prior.task_ids) - 1 if prior else 0,
+                    chars=len(session_context),
+                )
             if task.mode == "research":
                 result = await employee.research(
                     task.goal,
@@ -343,17 +424,29 @@ class TaskManager:
                     approved_ops=approved_ops,
                     auto_run="run_research_code" in approved_ops,
                 )
+            elif task.mode == "download":
+                result = await employee.download(
+                    task.goal,
+                    session_id=task.session_id,
+                    approved_ops=approved_ops,
+                    resource_decision=task.resource_decision,
+                )
             else:
                 result = await employee.run(
                     task.goal,
                     session_id=task.session_id,
                     approved_ops=approved_ops,
                     resource_decision=task.resource_decision,
-                    workflow_checkpoint=checkpoint if resume else None,
+                    workflow_checkpoint=checkpoint if should_resume else None,
+                    session_context=session_context,
                 )
             task.result = result
             if result.get("needs_approval"):
-                task.status = TaskStatus.awaiting_approval
+                op = (result["needs_approval"] or {}).get("operation")
+                if op == "waiting_for_user":
+                    task.status = TaskStatus.waiting_for_user
+                else:
+                    task.status = TaskStatus.awaiting_approval
             else:
                 task.status = TaskStatus.completed
             log.info("task.completed", confidence=result.get("confidence"))
@@ -422,6 +515,23 @@ class TaskManager:
             with contextlib.suppress(Exception):
                 self._store.delete_session(session_id)
 
+    def delete_run(self, session_id: str, task_id: str) -> bool:
+        """Remove one follow-up run from a session. The initial task cannot be deleted."""
+        session = self._sessions.get(session_id)
+        if session is None or task_id not in session.task_ids:
+            return False
+        if session.task_ids[0] == task_id:
+            return False
+        self.cancel(task_id)
+        session.task_ids = [tid for tid in session.task_ids if tid != task_id]
+        self._tasks.pop(task_id, None)
+        self._handles.pop(task_id, None)
+        if self._store is not None:
+            with contextlib.suppress(Exception):
+                self._store.delete_task(session_id, task_id)
+        self._persist_session(session)
+        return True
+
     def delete_all_sessions(self) -> list[str]:
         """Remove every saved session/task from memory and disk."""
         ids = list(self._sessions.keys())
@@ -447,6 +557,7 @@ class TaskManager:
                             "id": r.id,
                             "goal": r.goal,
                             "status": r.status.value,
+                            "resumable": r.resumable,
                             "created_at": r.created_at.isoformat(),
                         }
                         for r in runs
@@ -465,6 +576,20 @@ class TaskManager:
             return []
         return [self._tasks[t] for t in s.task_ids if t in self._tasks]
 
+    def _build_session_context(self, task: TaskRecord) -> str:
+        """Context from earlier runs in this session (loaded from disk after restart)."""
+        from ai_employee.observability.session_context import build_prior_session_context
+
+        session = self._sessions.get(task.session_id)
+        if not session:
+            return ""
+        prior = [
+            self._tasks[tid]
+            for tid in session.task_ids
+            if tid != task.id and tid in self._tasks
+        ]
+        return build_prior_session_context(prior)
+
     def session_detail(self, session_id: str) -> dict[str, Any] | None:
         """Full session payload (meta + every run's snapshot) for opening/resuming."""
         s = self._sessions.get(session_id)
@@ -482,6 +607,86 @@ class TaskManager:
 def _title(goal: str) -> str:
     g = goal.strip().replace("\n", " ")
     return (g[:42] + "…") if len(g) > 42 else g or "Untitled task"
+
+
+def _pending_approval(result: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(result, dict):
+        return None
+    pending = result.get("needs_approval")
+    return pending if isinstance(pending, dict) else None
+
+
+def _resume_checkpoint(result: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return the saved checkpoint when it can safely resume in execute()."""
+    if not isinstance(result, dict):
+        return None
+    checkpoint = result.get("workflow_checkpoint")
+    if not isinstance(checkpoint, dict):
+        return None
+    plan = checkpoint.get("plan") or {}
+    steps = plan.get("steps") or []
+    if not steps:
+        return None
+    try:
+        cursor = int(checkpoint.get("cursor", 0))
+    except (TypeError, ValueError):
+        return None
+    # Resume currently restarts from execute(); only offer it while there are
+    # still planned steps left to run.
+    if 0 <= cursor < len(steps):
+        return checkpoint
+    return None
+
+
+# Tool name → approval key (for batch "allow all similar" in one click).
+_TOOL_APPROVAL_KEYS: dict[str, str] = {
+    "download_resource": "resource_download",
+    "make_dir": "shell_write",
+    "write_file": "shell_write",
+    "shell": "shell_write",
+    "request_resource_input": "resource_acquisition",
+}
+
+# Approvals commonly needed together during resource download workflows.
+_RESOURCE_WORKFLOW_OPS = frozenset({"resource_download", "shell_write", "resource_acquisition"})
+
+
+def _expand_approved_ops(
+    op: str | None,
+    approval: dict[str, Any],
+    *,
+    approve_all_similar: bool,
+) -> set[str]:
+    """Ops to grant for this approval click."""
+    ops: set[str] = set()
+    if op == "waiting_for_user":
+        ops.add("resource_acquisition")
+        ops.add("waiting_for_user")
+    elif op:
+        ops.add(op)
+
+    if not approve_all_similar:
+        # mkdir / writes are almost always paired with downloads in one step.
+        if op == "resource_download":
+            ops.add("shell_write")
+        return ops
+
+    batched = approval.get("batched_calls") or []
+    for call in batched:
+        key = _TOOL_APPROVAL_KEYS.get(str(call.get("tool") or ""))
+        if key:
+            ops.add(key)
+
+    tool_key = _TOOL_APPROVAL_KEYS.get(str(approval.get("tool") or ""))
+    if tool_key:
+        ops.add(tool_key)
+
+    if ops & _RESOURCE_WORKFLOW_OPS or any(
+        call.get("tool") == "download_resource" for call in batched
+    ):
+        ops |= set(_RESOURCE_WORKFLOW_OPS)
+
+    return ops
 
 
 def _jsonable(d: dict[str, Any]) -> dict[str, Any]:
