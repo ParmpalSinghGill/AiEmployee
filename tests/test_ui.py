@@ -520,6 +520,36 @@ async def test_approve_resumes_in_place_same_run():
     assert emp.last_checkpoint.get("plan")
 
 
+async def test_auto_approve_never_pauses_for_gated_ops():
+    """Auto Approve pre-grants every approval key so the run never waits."""
+    from ai_employee.observability.tasks import TaskManager, TaskStatus
+
+    tm = TaskManager(None)
+    emp = _ApprovalEmployee()
+    task = tm.start(emp, "do a gated thing", auto_approve=True)
+    assert task.auto_approve is True
+    assert "shell_write" in task.approved_ops
+    assert "resource_download" in task.approved_ops
+
+    await _wait_status(tm, task.id, "completed")
+    rec = tm.get_task(task.id)
+    assert rec.status == TaskStatus.completed
+    assert rec.result.get("needs_approval") is None
+    assert emp.calls == 1
+
+
+async def test_ui_create_task_accepts_auto_approve(client):
+    r = await client.post(
+        "/ui/api/tasks",
+        json={"goal": "auto approve smoke", "auto_approve": True},
+    )
+    assert r.status_code == 200
+    task_id = r.json()["task_id"]
+    snap = await _wait_done(client, task_id)
+    assert snap["auto_approve"] is True
+    assert "shell_write" in snap["approved_ops"]
+
+
 async def test_approve_after_restart_uses_saved_checkpoint(tmp_path):
     """Approve & Continue must resume from disk checkpoint after a process restart."""
     from ai_employee.observability.store import SessionStore

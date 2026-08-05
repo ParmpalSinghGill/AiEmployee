@@ -17,8 +17,13 @@
       <select id="task-mode" title="Pipeline">
         <option value="task">Task</option>
         <option value="research">🔬 Research</option>
+        <option value="plan">📋 Plan</option>
         <option value="download">⬇ Download URL</option>
       </select>
+      <label class="auto-approve" title="Never pause for approval — grant every gated operation automatically">
+        <input type="checkbox" id="auto-approve" />
+        <span>Auto Approve</span>
+      </label>
       <button type="submit" class="btn primary">▶ Run</button>
     </form>
     <div id="brain-badge" class="brain-badge" title="Active LLM provider & model">

@@ -86,7 +86,21 @@ async def run_external_code_agent(
     argv = [base, *shlex.split(extra or ""), prompt]
     ws = ensure_workspace(workspace or s.workspace_dir)
     log.info("code_agent.exec", backend=backend, cmd=base, cwd=str(ws))
-    code, out, err = await _run_subprocess(argv, ws, s.external_agent_timeout)
+    try:
+        code, out, err = await _run_subprocess(argv, ws, s.external_agent_timeout)
+    except ProcessLookupError as exc:
+        # External CLIs sometimes exit/reap before we can kill/wait them.
+        log.warning("code_agent.process_gone", backend=backend, error=str(exc) or repr(exc))
+        return {
+            "ok": False,
+            "output": (
+                f"The '{backend}' CLI process disappeared unexpectedly "
+                f"(ProcessLookupError). Try again, or switch coding backend to 'brain'."
+            ),
+            "error": "process_lookup",
+            "returncode": None,
+            "backend": backend,
+        }
     combined = (out or "").strip()
     if err and err.strip():
         combined += "\n\n[stderr]\n" + err.strip()

@@ -28,7 +28,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("serve", help="Run the API server")
     sp.add_argument("--host", default=None)
-    sp.add_argument("--port", type=int, default=None)
+    sp.add_argument("--port", type=int, default=8010)
     sp.add_argument("--reload", action="store_true")
 
     rp = sub.add_parser("run", help="Plan and execute a high-level goal")

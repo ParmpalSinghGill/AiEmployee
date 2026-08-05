@@ -18,7 +18,7 @@ from ai_employee.config import Settings, get_settings
 from ai_employee.core.logging import configure_logging, get_logger
 from ai_employee.memory import build_memory_manager
 from ai_employee.tools import default_registry
-from ai_employee.workflows import Orchestrator, ResearchOrchestrator
+from ai_employee.workflows import Orchestrator, PlanOrchestrator, ResearchOrchestrator
 
 log = get_logger("employee")
 
@@ -79,6 +79,12 @@ class AIEmployee:
             memory=self.memory,
         )
         self.research_orchestrator = ResearchOrchestrator(
+            brain=self.brain,
+            agents=self.agents,
+            tools=self.tools,
+            memory=self.memory,
+        )
+        self.plan_orchestrator = PlanOrchestrator(
             brain=self.brain,
             agents=self.agents,
             tools=self.tools,
@@ -155,6 +161,25 @@ class AIEmployee:
             "result": state.get("result", {}),
             "tokens": state.get("tokens"),
             "needs_approval": state.get("needs_approval"),
+            "trace": state.get("trace", []),
+        }
+
+    async def plan(
+        self,
+        goal: str,
+        *,
+        session_id: str = "default",
+    ) -> dict[str, Any]:
+        """Research the goal and produce a step-by-step how-to guide with tools.
+
+        Does not execute code or download resources. The result lists ordered
+        steps and marks each recommended tool as open-source or proprietary.
+        """
+        state = await self.plan_orchestrator.run(goal, session_id=session_id)
+        return {
+            "goal": goal,
+            "result": state.get("result", {}),
+            "tokens": state.get("tokens"),
             "trace": state.get("trace", []),
         }
 

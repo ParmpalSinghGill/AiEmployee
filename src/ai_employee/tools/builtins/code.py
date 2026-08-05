@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 import sys
 from pathlib import Path
@@ -26,8 +27,18 @@ async def _run_subprocess(cmd: list[str], cwd: Path, timeout: int, stdin: str | 
             proc.communicate(stdin.encode() if stdin else None), timeout=timeout
         )
     except TimeoutError:
-        proc.kill()
+        with contextlib.suppress(ProcessLookupError, OSError):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            await proc.wait()
         return 124, "", f"timed out after {timeout}s"
+    except ProcessLookupError:
+        # Child already exited/reaped (common with flaky external CLIs).
+        return (
+            proc.returncode if proc.returncode is not None else 1,
+            "",
+            "subprocess exited unexpectedly (ProcessLookupError)",
+        )
     return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
 
 

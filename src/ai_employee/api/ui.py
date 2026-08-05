@@ -9,11 +9,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
 from ai_employee.api.deps import get_employee, rebuild_employee
+from ai_employee.api.workspace_files import (
+    guess_media_type,
+    resolve_workspace_path,
+    sample_media,
+)
 from ai_employee.config import LLMProvider, get_settings
 from ai_employee.core.employee import AIEmployee
 from ai_employee.observability import get_task_manager
@@ -52,7 +57,8 @@ _SUGGESTED = {
 class NewTaskRequest(BaseModel):
     goal: str = Field(min_length=1)
     approved_ops: list[str] = Field(default_factory=list)
-    mode: str = "task"  # "task", "research", or "download" (direct URL downloader)
+    mode: str = "task"  # "task", "research", "plan", or "download"
+    auto_approve: bool = False  # never pause for gated ops; approve everything
 
 
 class BrainChangeRequest(BaseModel):
@@ -113,7 +119,13 @@ async def ui_index() -> HTMLResponse:
 async def create_task(req: NewTaskRequest, emp: AIEmployee = Depends(get_employee)) -> dict:
     """Start a brand-new task (creates a new session/tab)."""
     tm = get_task_manager()
-    task = tm.start(emp, req.goal, approved_ops=set(req.approved_ops), mode=req.mode)
+    task = tm.start(
+        emp,
+        req.goal,
+        approved_ops=set(req.approved_ops),
+        mode=req.mode,
+        auto_approve=req.auto_approve,
+    )
     return {"task_id": task.id, "session_id": task.session_id}
 
 
@@ -126,7 +138,12 @@ async def followup(
     if not tm.session_runs(session_id):
         raise HTTPException(404, "unknown session")
     task = tm.start(
-        emp, req.goal, session_id=session_id, approved_ops=set(req.approved_ops), mode=req.mode
+        emp,
+        req.goal,
+        session_id=session_id,
+        approved_ops=set(req.approved_ops),
+        mode=req.mode,
+        auto_approve=req.auto_approve,
     )
     return {"task_id": task.id, "session_id": session_id}
 
@@ -504,3 +521,37 @@ async def get_task(task_id: str, since: int = 0) -> dict:
     snap = task.snapshot(since=since)
     snap["session_title"] = tm.session_title(task.session_id)
     return snap
+
+
+@router.get("/ui/api/workspace/file", tags=["ui"])
+async def workspace_file(path: str = Query(..., min_length=1)) -> FileResponse:
+    """Serve a file from the workspace for inline preview (video/image)."""
+    ws = get_settings().workspace_dir
+    try:
+        target = resolve_workspace_path(ws, path)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    if not target.is_file():
+        raise HTTPException(404, "file not found")
+    return FileResponse(
+        target,
+        media_type=guess_media_type(target),
+        filename=target.name,
+        content_disposition_type="inline",
+    )
+
+
+@router.get("/ui/api/workspace/media", tags=["ui"])
+async def workspace_media(
+    paths: list[str] = Query(default_factory=list),
+) -> dict:
+    """List video/image previews under workspace paths (samples when >5)."""
+    flat: list[str] = []
+    for p in paths:
+        for part in str(p).split(","):
+            part = part.strip()
+            if part:
+                flat.append(part)
+    if not flat:
+        return {"videos": [], "images": [], "total": 0, "shown": 0, "sampled": False}
+    return sample_media(get_settings().workspace_dir, flat)

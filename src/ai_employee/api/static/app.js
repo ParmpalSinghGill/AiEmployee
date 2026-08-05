@@ -23,9 +23,10 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const el = (html) => { const t = document.createElement("template"); t.innerHTML = html.trim(); return t.content.firstChild; };
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 // Escape then turn http(s) URLs into clickable links (Explain + Result prose).
+// Also link local workspace media paths to the inline file viewer.
 function linkify(s) {
   const safe = esc(s);
-  return safe.replace(
+  const withHttp = safe.replace(
     /(https?:\/\/[^\s<>&"]+)/g,
     (url) => {
       let href = url;
@@ -38,6 +39,105 @@ function linkify(s) {
       return `<a href="${href}" target="_blank" rel="noopener noreferrer" class="x-link">${href}</a>${tail}`;
     }
   );
+  return withHttp.replace(
+    /(?:\.\/)?(?:data\/)?(?:workspace\/)?(?:sessions|models|data)\/[\w./+-]+\.(?:mp4|webm|mov|mkv|m4v|avi|ogv|jpg|jpeg|png|gif|webp|bmp|svg)/gi,
+    (path) => {
+      // Skip if already inside an href attribute we just wrote
+      return `<a href="${workspaceFileUrl(path)}" target="_blank" rel="noopener noreferrer" class="x-link media-local">${path}</a>`;
+    }
+  );
+}
+
+const _MEDIA_EXT_RE = /\.(mp4|webm|mov|mkv|m4v|avi|ogv|jpg|jpeg|png|gif|webp|bmp|svg)$/i;
+const _LOCAL_PATH_RE = /(?:(?:\.\/)?(?:data\/)?(?:workspace\/)?(?:sessions|models|data)\/[\w./+-]+|\/[\w./+-]*workspace\/[\w./+-]+)(?:\.\w+)?/gi;
+
+function workspaceFileUrl(path) {
+  return `/ui/api/workspace/file?path=${encodeURIComponent(String(path || "").replace(/\\/g, "/"))}`;
+}
+
+/** Collect local workspace paths from result prose, audits, and tool events. */
+function collectLocalMediaPaths(task) {
+  const out = [];
+  const seen = new Set();
+  const add = (p) => {
+    const s = String(p || "").trim().replace(/^["'`]+|["'`]+$/g, "");
+    if (!s || /^(NOT DOWNLOADED|N\/A|NONE)$/i.test(s)) return;
+    if (seen.has(s)) return;
+    seen.add(s);
+    out.push(s);
+  };
+
+  const r = task?.result || {};
+  for (const st of r.steps || []) {
+    const resources = st.resource_audit?.resources || [];
+    for (const res of resources) add(res.local_path);
+  }
+
+  const textBlobs = [r.answer || ""];
+  for (const st of r.steps || []) textBlobs.push(st.output || "");
+  for (const e of task.events || []) {
+    if (e.event === "tool.result" && e.tool === "download_resource") {
+      textBlobs.push(typeof e.output === "string" ? e.output : JSON.stringify(e.output || ""));
+      try {
+        const obj = typeof e.output === "string" ? JSON.parse(e.output) : e.output;
+        if (obj && typeof obj === "object") add(obj.path || obj.local_path);
+      } catch { /* not JSON */ }
+    }
+  }
+  for (const blob of textBlobs) {
+    const localLine = /(?:\*\*)?Local path(?:\*\*)?\s*:\s*(.+)$/gim;
+    let m;
+    while ((m = localLine.exec(blob))) add(m[1].trim());
+    const pathHits = blob.match(_LOCAL_PATH_RE) || [];
+    for (const p of pathHits) {
+      if (_MEDIA_EXT_RE.test(p) || /\/(sessions|models|data)\//.test(p)) add(p);
+    }
+  }
+  return out;
+}
+
+function mediaCard(item, kind) {
+  const src = esc(item.url || workspaceFileUrl(item.path));
+  const name = esc(item.name || item.path || "file");
+  const open = `<a class="media-open" href="${src}" target="_blank" rel="noopener noreferrer">Open</a>`;
+  if (kind === "video") {
+    return `<div class="media-card">
+      <video controls preload="metadata" src="${src}"></video>
+      <div class="media-cap"><span class="media-name" title="${name}">${name}</span>${open}</div>
+    </div>`;
+  }
+  return `<div class="media-card">
+    <a href="${src}" target="_blank" rel="noopener noreferrer"><img src="${src}" alt="${name}" loading="lazy" /></a>
+    <div class="media-cap"><span class="media-name" title="${name}">${name}</span>${open}</div>
+  </div>`;
+}
+
+function mediaSectionHtml(title, items, kind) {
+  if (!items || !items.length) return "";
+  return `<div class="steps-list media-section"><h3>${title} <span class="x-muted">(${items.length})</span></h3>
+    <div class="media-grid">${items.map(it => mediaCard(it, kind)).join("")}</div></div>`;
+}
+
+async function loadMediaGallery(taskId) {
+  const mount = document.getElementById(`media-gallery-${taskId}`);
+  if (!mount) return;
+  const task = state.cache.get(taskId);
+  if (!task) { mount.innerHTML = ""; return; }
+  const paths = collectLocalMediaPaths(task);
+  if (!paths.length) { mount.innerHTML = ""; return; }
+  try {
+    const qs = paths.map(p => `paths=${encodeURIComponent(p)}`).join("&");
+    const data = await api("GET", `/ui/api/workspace/media?${qs}`);
+    if (!data.total) { mount.innerHTML = ""; return; }
+    const note = data.sampled
+      ? `<div class="media-sample-note x-muted">Showing ${data.shown} of ${data.total} media files (sample)</div>`
+      : "";
+    mount.innerHTML = note
+      + mediaSectionHtml("Video", data.videos, "video")
+      + mediaSectionHtml("Image", data.images, "image");
+  } catch (err) {
+    mount.innerHTML = `<div class="x-muted">Could not load local media previews: ${esc(err.message || err)}</div>`;
+  }
 }
 
 async function api(method, path, body) {
@@ -170,8 +270,57 @@ async function openSession(sid) {
 }
 
 /* ── Task creation ─────────────────────────────────────────────────────── */
+const AUTO_APPROVE_KEY = "aiemployee.autoApprove";
+
+function isAutoApprove() {
+  const el = $("#auto-approve");
+  if (el) return !!el.checked;
+  try { return localStorage.getItem(AUTO_APPROVE_KEY) === "1"; } catch { return false; }
+}
+
+function syncAutoApproveUi() {
+  const el = $("#auto-approve");
+  if (!el) return;
+  try { el.checked = localStorage.getItem(AUTO_APPROVE_KEY) === "1"; } catch { /* ignore */ }
+  el.title = el.checked
+    ? "Auto Approve ON — gated ops run without asking"
+    : "Auto Approve OFF — pause for shell/download/etc. approvals";
+}
+
+function setAutoApprove(on) {
+  const el = $("#auto-approve");
+  if (el) el.checked = !!on;
+  try { localStorage.setItem(AUTO_APPROVE_KEY, on ? "1" : "0"); } catch { /* ignore */ }
+  syncAutoApproveUi();
+  if (on) autoApprovePausedTasks();
+}
+
+/** If Auto Approve is toggled on mid-pause, resume every waiting run. */
+function autoApprovePausedTasks() {
+  if (!isAutoApprove()) return;
+  for (const s of state.sessions.values()) {
+    for (const run of s.runs || []) {
+      const snap = state.cache.get(run.id);
+      const status = snap?.status || run.status;
+      if (status === "awaiting_approval") {
+        approveTask(s.id, run.id, { approve_all_similar: true }).catch(() => {});
+      } else if (status === "waiting_for_user") {
+        approveTask(s.id, run.id, {
+          decision: "proceed_without",
+          approve_all_similar: true,
+        }).catch(() => {});
+      }
+    }
+  }
+}
+
 async function newTask(goal, mode) {
-  const { task_id, session_id } = await api("POST", "/ui/api/tasks", { goal, mode: mode || "task" });
+  const body = {
+    goal,
+    mode: mode || "task",
+    auto_approve: isAutoApprove(),
+  };
+  const { task_id, session_id } = await api("POST", "/ui/api/tasks", body);
   const session = {
     id: session_id, title: goal.slice(0, 42), runs: [{ id: task_id, goal, status: "pending", mode: mode || "task" }],
     activeRun: task_id, view: "flow", explainOrder: "grouped",
@@ -186,7 +335,13 @@ async function newTask(goal, mode) {
 }
 
 async function followUp(sid, goal, approvedOps, mode) {
-  const { task_id } = await api("POST", `/ui/api/sessions/${sid}/followup`, { goal, approved_ops: approvedOps || [], mode: mode || "task" });
+  const body = {
+    goal,
+    approved_ops: approvedOps || [],
+    mode: mode || "task",
+    auto_approve: isAutoApprove(),
+  };
+  const { task_id } = await api("POST", `/ui/api/sessions/${sid}/followup`, body);
   const s = state.sessions.get(sid);
   s.runs.push({ id: task_id, goal, status: "pending", mode: mode || "task" });
   s.activeRun = task_id;
@@ -335,6 +490,21 @@ function poll(taskId, sid) {
     }
     if (state.active === sid && s && s.activeRun === taskId) renderActiveView(s);
     renderTabs();
+    // Safety net: if Auto Approve is on and a pause still surfaces, approve immediately.
+    if (isAutoApprove() && !snap._autoApproving) {
+      if (snap.status === "awaiting_approval") {
+        snap._autoApproving = true;
+        state.cache.set(taskId, snap);
+        approveTask(sid, taskId, { approve_all_similar: true }).catch(() => {});
+      } else if (snap.status === "waiting_for_user") {
+        snap._autoApproving = true;
+        state.cache.set(taskId, snap);
+        approveTask(sid, taskId, {
+          decision: "proceed_without",
+          approve_all_similar: true,
+        }).catch(() => {});
+      }
+    }
     if (TERMINAL.has(snap.status)) {
       clearInterval(state.pollers.get(taskId));
       state.pollers.delete(taskId);
@@ -415,7 +585,10 @@ function buildSection(session) {
     if (!goal) return;
     input.value = "";
     const active = state.cache.get(session.activeRun);
-    followUp(session.id, goal, undefined, active?.mode === "download" ? "download" : "task");
+    const keepMode = active?.mode === "download" || active?.mode === "plan" || active?.mode === "research"
+      ? active.mode
+      : "task";
+    followUp(session.id, goal, undefined, keepMode);
   });
   $(".sess-clear-memory", node).addEventListener("click", () => clearSessionMemory(session.id, session.title));
   $(".sess-delete", node).addEventListener("click", () => deleteSession(session.id));
@@ -545,6 +718,8 @@ function problemHeader(task) {
   if (!goal) return "";
   const tag = task.mode === "research"
     ? `<span class="pb-tag">🔬 Research</span>`
+    : task.mode === "plan"
+    ? `<span class="pb-tag">📋 Plan</span>`
     : (task.mode === "download" ? `<span class="pb-tag">⬇ Download</span>` : "");
   return `<div class="problem-banner"><div class="pb-head"><span class="pb-label">Problem</span>${tag}${modelBadges()}</div>
     <div class="pb-goal">${linkify(goal)}</div></div>`;
@@ -1067,6 +1242,7 @@ function renderResult(task, session) {
   if (!r) return `<div class="placeholder"><span class="spin">◌</span> Working… the result will appear here.</div>`;
 
   if (task.mode === "research" && r.result) return renderResearch(task, session, r);
+  if (task.mode === "plan" && r.result) return renderPlan(task, session, r);
 
   let html = "";
   if (r.needs_approval && taskAwaitingApproval(task)) {
@@ -1095,6 +1271,8 @@ function renderResult(task, session) {
       <span>${(conf * 100).toFixed(0)}%</span>
     </div>`;
 
+  html += `<div id="media-gallery-${esc(task.id)}" class="media-gallery"></div>`;
+
   const steps = r.steps || [];
   if (steps.length) {
     html += `<div class="steps-list"><h3>Step outputs</h3>` + steps.map(st =>
@@ -1114,6 +1292,7 @@ function renderResult(task, session) {
       approveTask(session.id, task.id, body);
     });
     wireResourceApproval(task, session);
+    loadMediaGallery(task.id);
   }, 0);
   return html;
 }
@@ -1192,6 +1371,70 @@ function renderResearch(task, session, r) {
   return html;
 }
 
+/* ── Plan result (step-by-step guide + OSS / proprietary tools) ─────────── */
+function _toolKindBadge(kind) {
+  const k = String(kind || "unknown").toLowerCase();
+  const label = {
+    open_source: "Open source",
+    proprietary: "Proprietary",
+    freemium: "Freemium",
+    saas: "SaaS",
+    unknown: "Unknown",
+  }[k] || k;
+  return `<span class="tool-kind tool-kind-${esc(k)}">${esc(label)}</span>`;
+}
+
+function _fmtTool(t) {
+  const lic = t.license ? `<span class="x-muted">· ${esc(t.license)}</span>` : "";
+  const purpose = t.purpose ? `<div class="x-muted">${esc(t.purpose)}</div>` : "";
+  const notes = t.notes ? `<div class="x-muted">${linkify(t.notes)}</div>` : "";
+  return `<div class="tool-row"><b>${esc(t.name || "")}</b> ${_link(t.url)} ${_toolKindBadge(t.kind)} ${lic}${purpose}${notes}</div>`;
+}
+
+function renderPlan(task, session, r) {
+  const res = r.result || {};
+  let html = "";
+  html += `<div class="result-answer"><b>How-to plan.</b> ${linkify(res.summary || "")}</div>`;
+  if (res.approach)
+    html += `<div class="steps-list"><h3>Approach</h3><div class="step-card"><div class="out">${linkify(res.approach)}</div></div></div>`;
+
+  const steps = res.steps || [];
+  if (steps.length) {
+    html += `<div class="steps-list plan-steps"><h3>Step-by-step guide <span class="x-muted">(${steps.length})</span></h3>` +
+      steps.map((st, i) => {
+        const tools = (st.tools || []).map(n => `<code>${esc(n)}</code>`).join(" ");
+        const deps = (st.depends_on || []).length
+          ? `<div class="x-muted">After step ${(st.depends_on || []).join(", ")}</div>` : "";
+        const ok = st.success_criteria
+          ? `<div class="plan-ok">✓ ${esc(st.success_criteria)}</div>` : "";
+        const tips = st.tips ? `<div class="x-muted">Tip: ${linkify(st.tips)}</div>` : "";
+        return `<div class="step-card plan-step">
+          <h4><span class="plan-num">${esc(String(st.id || i + 1))}</span> ${esc(st.title || "Step")}</h4>
+          <div class="out">${linkify(st.instruction || "")}</div>
+          ${tools ? `<div class="plan-tools">Tools: ${tools}</div>` : ""}
+          ${deps}${ok}${tips}
+        </div>`;
+      }).join("") + `</div>`;
+  } else {
+    html += `<div class="steps-list"><h3>Step-by-step guide</h3><div class="step-card x-muted">no steps produced</div></div>`;
+  }
+
+  html += findingsBlock("🛠 Open-source tools", res.tools_open_source, _fmtTool);
+  html += findingsBlock("🏢 Proprietary / SaaS tools", res.tools_proprietary, _fmtTool);
+  if ((res.tools_other || []).length)
+    html += findingsBlock("🧰 Other tools", res.tools_other, _fmtTool);
+  if (!(res.tools_open_source || []).length && !(res.tools_proprietary || []).length && (res.tools || []).length)
+    html += findingsBlock("🧰 Tools", res.tools, _fmtTool);
+
+  if (res.alternatives)
+    html += `<div class="steps-list"><h3>Alternatives</h3><div class="step-card"><div class="out">${linkify(res.alternatives)}</div></div></div>`;
+  if (res.risks)
+    html += `<div class="steps-list"><h3>Risks &amp; blockers</h3><div class="step-card"><div class="out">${linkify(res.risks)}</div></div></div>`;
+
+  html += tokensBlock(r.tokens || res.tokens);
+  return html;
+}
+
 /* ── Bootstrap ─────────────────────────────────────────────────────────── */
 function syncComposerModeUi() {
   const modeSel = $("#task-mode");
@@ -1205,6 +1448,9 @@ function syncComposerModeUi() {
   } else if (mode === "research") {
     input.placeholder = "Describe the model/dataset/paper you want researched…";
     submit.textContent = "▶ Run";
+  } else if (mode === "plan") {
+    input.placeholder = "What do you want a step-by-step plan for? (tools + how-to)…";
+    submit.textContent = "📋 Plan";
   } else {
     input.placeholder = "Give the employee a goal…  (e.g. Research X and write a brief)";
     submit.textContent = "▶ Run";
@@ -1223,6 +1469,10 @@ $("#new-task-form").addEventListener("submit", (e) => {
 if ($("#task-mode")) {
   $("#task-mode").addEventListener("change", syncComposerModeUi);
   syncComposerModeUi();
+}
+if ($("#auto-approve")) {
+  syncAutoApproveUi();
+  $("#auto-approve").addEventListener("change", (e) => setAutoApprove(e.target.checked));
 }
 
 $("#refresh-sessions").addEventListener("click", loadSessionList);

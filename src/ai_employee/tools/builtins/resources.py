@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -189,7 +190,10 @@ class DownloadResourceTool(Tool):
             try:
                 out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=300)
             except TimeoutError:
-                proc.kill()
+                with contextlib.suppress(ProcessLookupError, OSError):
+                    proc.kill()
+                with contextlib.suppress(Exception):
+                    await proc.wait()
                 return 124, "", "timed out after 300s"
             return (
                 proc.returncode or 0,

@@ -14,6 +14,7 @@ os.environ.setdefault("WORKSPACE_DIR", "./data/test_workspace")
 os.environ.setdefault("SESSIONS_DIR", "./data/test_sessions")
 os.environ.setdefault("SECRETS_FILE", "./data/test_secrets.json")
 os.environ.setdefault("USAGE_LEDGER_FILE", "./data/test_usage.jsonl")
+os.environ.setdefault("UI_PREFERENCES_FILE", "./data/test_ui_preferences.json")
 os.environ.setdefault("LOG_LEVEL", "ERROR")
 
 

@@ -326,6 +326,31 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
     ),
     # ── Research assistant team ──────────────────────────────────────────────
     AgentSpec(
+        name="plan_researcher",
+        role="Plan Researcher",
+        description=(
+            "Researches approaches and tools (open-source vs proprietary) to produce "
+            "a how-to plan — no downloads or code execution."
+        ),
+        category="research",
+        tools=_DISCOVER,
+        max_iterations=10,
+        system_prompt=(
+            "You research how to accomplish a goal and which tools to use. "
+            "Search the web and hubs (GitHub, Hugging Face, docs, product pages).\n\n"
+            "For each tool/product report:\n"
+            "- Name + official URL\n"
+            "- open source / proprietary / freemium / SaaS\n"
+            "- License if known\n"
+            "- What step of the workflow it covers\n\n"
+            "Prefer open-source tools when they are good enough; still list proprietary "
+            "options when they are clearly better or industry-standard.\n\n"
+            "Outline a practical sequence: first do X, then Y. "
+            "Do NOT download files, do NOT write code, do NOT call download_resource. "
+            "Investigation and comparison only."
+        ),
+    ),
+    AgentSpec(
         name="resource_downloader",
         role="Resource Downloader",
         description="Downloads direct YouTube, GitHub, Hugging Face, Kaggle, or file URLs.",

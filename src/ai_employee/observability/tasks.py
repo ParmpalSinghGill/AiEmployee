@@ -99,6 +99,8 @@ class TaskRecord:
         self.approved_ops: set[str] = set()
         self.resource_decision: dict[str, Any] | None = None
         self.resumable = False
+        # When True, never pause for approval — grant every gated op automatically.
+        self.auto_approve: bool = False
 
     def add_log(self, event_dict: dict[str, Any]) -> None:
         self._seq += 1
@@ -131,6 +133,7 @@ class TaskRecord:
             "approved_ops": sorted(self.approved_ops),
             "resource_decision": self.resource_decision,
             "resumable": self.resumable,
+            "auto_approve": self.auto_approve,
         }
 
     @classmethod
@@ -152,6 +155,7 @@ class TaskRecord:
         rd = d.get("resource_decision")
         rec.resource_decision = rd if isinstance(rd, dict) else None
         rec.resumable = bool(d.get("resumable", False))
+        rec.auto_approve = bool(d.get("auto_approve", False))
         status = d.get("status", "completed")
         pending_approval = _pending_approval(rec.result)
         resume_checkpoint = _resume_checkpoint(rec.result)
@@ -260,11 +264,12 @@ class TaskManager:
         session_id: str | None = None,
         approved_ops: set[str] | None = None,
         mode: str = "task",
+        auto_approve: bool = False,
     ) -> TaskRecord:
         """Create a task (new session unless ``session_id`` given) and run it in
         the background. Returns immediately. ``mode`` selects the pipeline:
-        ``task`` (general), ``research`` (model/dataset discovery), or
-        ``download`` (direct URL downloader)."""
+        ``task`` (general), ``research`` (model/dataset discovery), ``plan``
+        (how-to guide with tools), or ``download`` (direct URL downloader)."""
         if session_id and session_id in self._sessions:
             session = self._sessions[session_id]
             parent_id = session.task_ids[-1] if session.task_ids else None
@@ -274,7 +279,11 @@ class TaskManager:
             parent_id = None
 
         task = TaskRecord(goal=goal, session_id=session.id, parent_id=parent_id, mode=mode)
-        task.approved_ops = set(approved_ops or set())
+        task.auto_approve = bool(auto_approve)
+        ops = set(approved_ops or set())
+        if task.auto_approve:
+            ops |= _auto_approve_ops()
+        task.approved_ops = ops
         self._tasks[task.id] = task
         session.task_ids.append(task.id)
         self._persist_session(session)
@@ -390,7 +399,6 @@ class TaskManager:
         # Bind task_id so every nested log event is attributed to this task. This
         # runs in its own asyncio Task context, so concurrent runs stay isolated.
         structlog.contextvars.bind_contextvars(task_id=task.id)
-        approved_ops = set(task.approved_ops)
         task.status = TaskStatus.running
         task.resumable = False
         log.info("task.started", goal=task.goal[:120])
@@ -407,49 +415,81 @@ class TaskManager:
         if task.parent_id is None:
             self._spawn_name(employee, task)
         try:
-            checkpoint = (task.result or {}).get("workflow_checkpoint")
-            should_resume = bool(checkpoint and resume)
-            session_context = "" if should_resume else self._build_session_context(task)
-            if session_context:
-                prior = self._sessions.get(task.session_id)
-                log.info(
-                    "task.session_context",
-                    prior_runs=len(prior.task_ids) - 1 if prior else 0,
-                    chars=len(session_context),
-                )
-            if task.mode == "research":
-                result = await employee.research(
-                    task.goal,
-                    session_id=task.session_id,
-                    approved_ops=approved_ops,
-                    auto_run="run_research_code" in approved_ops,
-                )
-            elif task.mode == "download":
-                result = await employee.download(
-                    task.goal,
-                    session_id=task.session_id,
-                    approved_ops=approved_ops,
-                    resource_decision=task.resource_decision,
-                )
-            else:
-                result = await employee.run(
-                    task.goal,
-                    session_id=task.session_id,
-                    approved_ops=approved_ops,
-                    resource_decision=task.resource_decision,
-                    workflow_checkpoint=checkpoint if should_resume else None,
-                    session_context=session_context,
-                )
-            task.result = result
-            if result.get("needs_approval"):
-                op = (result["needs_approval"] or {}).get("operation")
-                if op == "waiting_for_user":
-                    task.status = TaskStatus.waiting_for_user
+            # Auto-approve can grant mid-run and need another pipeline pass.
+            for auto_round in range(24):
+                checkpoint = (task.result or {}).get("workflow_checkpoint")
+                should_resume = bool(checkpoint and (resume or auto_round > 0))
+                session_context = "" if should_resume else self._build_session_context(task)
+                if session_context and auto_round == 0:
+                    prior = self._sessions.get(task.session_id)
+                    log.info(
+                        "task.session_context",
+                        prior_runs=len(prior.task_ids) - 1 if prior else 0,
+                        chars=len(session_context),
+                    )
+                approved_ops = set(task.approved_ops)
+                if task.mode == "research":
+                    result = await employee.research(
+                        task.goal,
+                        session_id=task.session_id,
+                        approved_ops=approved_ops,
+                        auto_run="run_research_code" in approved_ops,
+                    )
+                elif task.mode == "plan":
+                    result = await employee.plan(
+                        task.goal,
+                        session_id=task.session_id,
+                    )
+                elif task.mode == "download":
+                    result = await employee.download(
+                        task.goal,
+                        session_id=task.session_id,
+                        approved_ops=approved_ops,
+                        resource_decision=task.resource_decision,
+                    )
                 else:
-                    task.status = TaskStatus.awaiting_approval
+                    result = await employee.run(
+                        task.goal,
+                        session_id=task.session_id,
+                        approved_ops=approved_ops,
+                        resource_decision=task.resource_decision,
+                        workflow_checkpoint=checkpoint if should_resume else None,
+                        session_context=session_context,
+                    )
+                task.result = result
+                pending = result.get("needs_approval")
+                if not pending:
+                    task.status = TaskStatus.completed
+                    break
+                if not task.auto_approve:
+                    op = (pending or {}).get("operation")
+                    if op == "waiting_for_user":
+                        task.status = TaskStatus.waiting_for_user
+                    else:
+                        task.status = TaskStatus.awaiting_approval
+                    break
+                # Grant every related op and continue without pausing the UI.
+                op = (pending or {}).get("operation")
+                task.approved_ops = set(task.approved_ops) | _expand_approved_ops(
+                    op, pending, approve_all_similar=True
+                ) | _auto_approve_ops()
+                if op == "waiting_for_user" and not task.resource_decision:
+                    task.resource_decision = {"decision": "proceed_without"}
+                cleared = dict(result)
+                cleared["needs_approval"] = None
+                task.result = cleared
+                log.info("task.auto_approved", op=op, round=auto_round + 1)
+                resume = True
             else:
-                task.status = TaskStatus.completed
-            log.info("task.completed", confidence=result.get("confidence"))
+                # Safety: too many auto-approve rounds — surface the last pause.
+                pending = (task.result or {}).get("needs_approval") or {}
+                op = pending.get("operation")
+                task.status = (
+                    TaskStatus.waiting_for_user
+                    if op == "waiting_for_user"
+                    else TaskStatus.awaiting_approval
+                )
+            log.info("task.completed", confidence=(task.result or {}).get("confidence"))
         except asyncio.CancelledError:
             # User-requested stop (handle.cancel()). Record it as a terminal
             # state and let the cancellation propagate so the asyncio task ends.
@@ -649,6 +689,18 @@ _TOOL_APPROVAL_KEYS: dict[str, str] = {
 
 # Approvals commonly needed together during resource download workflows.
 _RESOURCE_WORKFLOW_OPS = frozenset({"resource_download", "shell_write", "resource_acquisition"})
+
+# Extra keys not always listed in settings but still used as approval gates.
+_AUTO_APPROVE_EXTRA = frozenset({"waiting_for_user", "run_research_code", "resource_acquisition"})
+
+
+def _auto_approve_ops() -> set[str]:
+    """Every known approval key — used when Auto Approve is enabled."""
+    from ai_employee.config import get_settings
+
+    return set(get_settings().approval_required) | set(_AUTO_APPROVE_EXTRA) | set(
+        _TOOL_APPROVAL_KEYS.values()
+    ) | set(_RESOURCE_WORKFLOW_OPS)
 
 
 def _expand_approved_ops(
