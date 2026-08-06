@@ -25,7 +25,56 @@ class AgentSpec:
 _FS = ("read_file", "write_file", "list_dir", "make_dir")
 _WEB = ("web_search", "fetch_page", "http_request")
 _CODE = ("python_exec", "shell", "pip_install", *_FS)
-_DATA = ("csv_preview", "json_query", "python_exec", "pip_install", "read_file")
+_DATA = ("csv_preview", "json_query", "python_exec", "pip_install", "read_file", "list_dir")
+
+# Shared plotting contract. The dashboard scans answers for image filenames and
+# renders them inline, so the saved path MUST appear in the final answer — a chart
+# nobody references is a chart nobody sees. Agg backend keeps matplotlib headless.
+_PLOTTING = (
+    "CHARTS: when a result is quantitative and would read better as a picture "
+    "(comparisons, distributions, trends over time, category breakdowns, "
+    "correlations), plot it. Use matplotlib (pip_install matplotlib if the import "
+    "fails) with a non-interactive backend:\n"
+    "    import matplotlib\n"
+    "    matplotlib.use('Agg')\n"
+    "    import matplotlib.pyplot as plt\n"
+    "Save each figure as a PNG in the workspace with a short descriptive "
+    "snake_case name (e.g. revenue_by_region.png) via "
+    "plt.savefig(name, dpi=150, bbox_inches='tight'), then plt.close(). Always "
+    "label the axes and give the figure a title. Never call plt.show().\n"
+    "Then, in your final written answer, reference every saved chart on its own "
+    "line exactly like:\n"
+    "    Chart: revenue_by_region.png — one-line description of what it shows\n"
+    "The numbers and the written explanation still matter — a chart supplements "
+    "the analysis, it never replaces it. Skip plotting when the data is a single "
+    "value, purely qualitative, or fewer than three data points.\n"
+)
+
+# Shared data-acquisition contract. When a task names public data that a Python
+# client can fetch (tickers, weather, public APIs), writing the fetch code is far
+# more reliable than searching for a pre-made CSV — and it keeps the run
+# self-contained. Never ask the user to supply data you can fetch yourself.
+_FETCHING = (
+    "FETCHING DATA: if the task needs public data you don't already have in the "
+    "workspace, WRITE CODE TO FETCH IT rather than asking the user for a file or "
+    "hunting for a download link. pip_install the client library, then fetch with "
+    "python_exec. Common sources:\n"
+    "- Stock / ETF / index / FX / crypto history → yfinance:\n"
+    "      import yfinance as yf\n"
+    "      df = yf.download('AAPL', period='5y', interval='1d', "
+    "auto_adjust=True, progress=False)\n"
+    "  With one ticker the columns come back as a MultiIndex ('Close','AAPL'); "
+    "flatten it first with df.columns = df.columns.get_level_values(0), or pass "
+    "group_by='column'. Use yf.Ticker(sym).info / .financials for fundamentals.\n"
+    "- Any documented public REST API → requests / http_request.\n"
+    "- Files at a known URL (CSV/JSON/XLSX) → pandas.read_csv(url) or requests.\n"
+    "ALWAYS save what you fetch to the workspace as CSV (e.g. aapl_5y.csv) so the "
+    "run is reproducible and later steps can reuse it, and state the saved filename "
+    "and the row count in your answer.\n"
+    "If a fetch fails, report the exact error and what you tried — do not invent, "
+    "estimate, or hand-type numbers you could not retrieve. Fabricated market data "
+    "is worse than an honest failure.\n"
+)
 _DISCOVER = (
     "hf_search",
     "paperswithcode_search",
@@ -75,10 +124,13 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
             "synthesize accurate, cited findings. Prefer primary sources. Clearly "
             "separate facts from inference, and note uncertainty.\n\n"
             "When the task involves finding data, videos, datasets, models, or files, "
-            "search ALL relevant hubs: web_search, YouTube (youtube_search), Kaggle "
-            "(kaggle_search), Roboflow (roboflow_search), GitHub (github_search), "
-            "Hugging Face (hf_search), and Papers With Code (paperswithcode_search). "
-            "Use hub_search_all for a broad first pass.\n\n"
+            "search the hubs that match the modality. Tabular/CSV/Kaggle: kaggle_search, "
+            "hf_search kind=datasets, hub_search_all kind=tabular (no YouTube/Roboflow). "
+            "Video/footage: youtube_search, roboflow_search, hub_search_all kind=video. "
+            "Image/CV stills: roboflow_search, hf_search kind=datasets, hub_search_all "
+            "kind=image (no YouTube). Speech/audio/ASR: hf_search kind=datasets, "
+            "kaggle_search, hub_search_all kind=speech (no YouTube/Roboflow). "
+            "Mixed/unknown: hub_search_all kind=all plus web_search.\n\n"
             "RESOURCE ACQUISITION WORKFLOW (strict stop condition):\n"
             "1. Search for candidate resources.\n"
             "2. Verify a candidate satisfies the user's requirements.\n"
@@ -136,7 +188,11 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
         system_prompt=(
             "You are an expert software engineer. Read the relevant files first, make "
             "minimal correct changes that match existing style, and verify by running "
-            "code/tests. Never leave the workspace in a broken state."
+            "code/tests. Never leave the workspace in a broken state.\n"
+            # The planner often routes data-fetching and charting here rather than to
+            # data_analysis, so this agent carries the same contracts.
+            + _FETCHING
+            + _PLOTTING
         ),
     ),
     AgentSpec(
@@ -153,12 +209,36 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
     AgentSpec(
         name="data_analysis",
         role="Data Analyst",
-        description="Analyzes datasets and reports insights.",
+        description=(
+            "Profiles and analyzes datasets: tabular CSV/Excel (pandas EDA/KPIs), "
+            "plus image/speech/video dataset inventories and label/metadata tables."
+        ),
         category="data",
         tools=_DATA,
+        max_iterations=14,
         system_prompt=(
-            "You are a data analyst. Inspect data, compute with Python, and report "
-            "concrete, quantified insights. Show the numbers behind every claim."
+            "You analyze datasets. Match the modality:\n"
+            "- Tabular (CSV/Excel/SQL): pandas profiling, cleaning, EDA, KPIs, charts, "
+            "simple models.\n"
+            "- Image dataset: inventory files, read label/metadata CSVs, report class "
+            "counts and image sizes via Python (PIL/cv2 after pip_install if needed).\n"
+            "- Speech/audio dataset: inventory wav/mp3/flac, report duration/sample-rate/"
+            "channel stats (librosa/soundfile after pip_install if needed), and any "
+            "transcript/label tables.\n"
+            "- Video dataset: inventory clips, durations, and any annotation files — "
+            "leave heavy CV training/tracking scripts to the coding agent.\n"
+            "Inspect data, compute with Python, and report concrete, quantified insights. "
+            "Show the numbers behind every claim.\n"
+            "CSV loading: call csv_preview first and pass its `encoding` into "
+            "pd.read_csv(path, encoding=...). On UnicodeDecodeError retry immediately "
+            "with encoding='latin-1' or encoding='cp1252'. Do not import chardet unless "
+            "you pip_install it; latin-1 is enough for Windows/nbsp bytes (0xA0).\n"
+            + _FETCHING
+            + _PLOTTING
+            + "Always finish with a written summary (issues found, actions taken, output "
+            "paths). If cleaning is incomplete, still say which source file downstream "
+            "steps should use. Save cleaned data via Python (df.to_csv). An empty "
+            "answer is a failure."
         ),
     ),
     AgentSpec(
@@ -363,8 +443,10 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
             "1. Extract every direct URL from the task.\n"
             "2. Call download_resource immediately for each URL. Do NOT do web research unless "
             "the user asked you to find URLs.\n"
-            "   Prefer this order when multiple candidates are available: YouTube, Hugging Face, "
-            "GitHub, Kaggle, then other HTTP links.\n"
+            "   Prefer order by modality: tabular/CSV/Kaggle → Kaggle/HTTP/GitHub/HF "
+            "(never YouTube). Image → HF/Roboflow/Kaggle/HTTP. Speech/audio → HF/Kaggle/"
+            "HTTP. Video URL → YouTube, then HF/GitHub. Mixed → YouTube only if the URL "
+            "is actually a video, else HTTP/Kaggle/HF/GitHub.\n"
             "   If the first candidate fails, continue with the next distinct URL. Do NOT stop "
             "after the first few failures when more candidate links remain.\n"
             "3. Choose only a SIMPLE destination name before each download. The tool will "
@@ -401,22 +483,33 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
         name="resource_acquirer",
         role="Resource Acquirer",
         description=(
-            "Searches public hubs, downloads datasets/videos/files into the workspace, "
-            "and asks the human when automatic acquisition fails."
+            "Searches public hubs and downloads the matching modality into the workspace "
+            "(tabular CSV, images, speech/audio, video, repos, weights). Asks the human "
+            "when automatic acquisition fails."
         ),
         category="research",
         tools=_RESOURCE,
         max_iterations=12,
         system_prompt=(
-            "You acquire external resources (videos, datasets, code repos, model weights, "
-            "any file) for downstream steps.\n\n"
+            "You acquire external resources (tabular, image, speech/audio, video datasets, "
+            "code repos, model weights) for downstream steps.\n\n"
+            "MATCH THE MODALITY — do not cross-wire hubs:\n"
+            "- Tabular/CSV/xlsx/Kaggle tables: kaggle_search + given URL; "
+            "hub_search_all kind=tabular. No YouTube/Roboflow.\n"
+            "- Image/CV stills (png/jpg, COCO, Roboflow): hub_search_all kind=image. "
+            "No YouTube.\n"
+            "- Speech/audio/ASR/TTS (wav/mp3/flac): hub_search_all kind=speech. "
+            "No YouTube/Roboflow.\n"
+            "- Video/CCTV/mp4/YouTube: hub_search_all kind=video.\n\n"
             "WORKFLOW (finding and downloading are SEPARATE stages):\n"
-            "1. Search: hub_search_all plus web_search as needed.\n"
+            "1. Search: use the hubs that match the modality (see above).\n"
             "2. Validate: pick the best direct URL(s). fetch_page is optional — a 403 from "
             "stock sites (Pixabay, Pexels, Videezy) does NOT block YouTube/HF downloads.\n"
             "3. REQUIRED: call download_resource for each candidate before finishing. "
-            "Try YouTube URLs FIRST (yt-dlp), then Hugging Face (huggingface_hub), then "
-            "GitHub, then Kaggle, else HTTP. Never claim waiting_for_user or call "
+            "Download order depends on modality: tabular → given URL / Kaggle / HTTP / "
+            "GitHub / HF; image → HF / Roboflow / Kaggle / HTTP; speech → HF / Kaggle / "
+            "HTTP; video → YouTube first, then HF/GitHub. Never claim "
+            "waiting_for_user or call "
             "request_resource_input until download_resource has been attempted for every "
             "suitable URL. If the first few candidate URLs fail, continue with the next "
             "distinct candidates instead of stopping early.\n"
@@ -470,9 +563,11 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
         system_prompt=(
             "You are an ML resource scout. Given a problem, find (1) ready-to-use "
             "pretrained MODELS and (2) DATASETS for it. Search Hugging Face first "
-            "(hf_search kind='both'), then Papers With Code, Kaggle, arXiv, GitHub, "
-            "YouTube (youtube_search), and Roboflow. Use hub_search_all for a quick "
-            "survey. For computer-vision problems also search Roboflow Universe. "
+            "(hf_search kind='both'), then Papers With Code, Kaggle, arXiv, and GitHub. "
+            "Use hub_search_all kind=tabular for spreadsheet/CSV (no YouTube). "
+            "kind=image for still-image/CV datasets (Roboflow/HF). "
+            "kind=speech for audio/ASR corpora (HF/Kaggle). "
+            "kind=video plus youtube_search/Roboflow for footage. "
             "Prefer resources linked to each other. If no ready model exists, find the "
             "method PAPER and official code. Report structured lists only from tool "
             "output — never invent ids. Note URLs for resource_acquirer to download."
