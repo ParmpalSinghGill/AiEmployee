@@ -12,6 +12,20 @@ def test_is_resource_task_detects_video_goal() -> None:
     assert not is_resource_task("Summarize async Python")
 
 
+def test_is_resource_task_ignores_data_cleaning() -> None:
+    assert not is_resource_task(
+        "Load the dataset, perform thorough data quality checks, clean the data, "
+        "and save a cleaned version to the workspace."
+    )
+    assert not is_resource_task(
+        "Clean the dataset: handle missing values and save a cleaned version.",
+        "A cleaned dataset file is saved and cleaning steps are documented.",
+    )
+    assert is_resource_task(
+        "Acquire the Superstore Sales Dataset from https://kaggle.com/x and download it."
+    )
+
+
 def test_audit_flags_claim_without_url_or_file(tmp_path: Path) -> None:
     audit = audit_resources(
         task="Find and download a mall entrance video",

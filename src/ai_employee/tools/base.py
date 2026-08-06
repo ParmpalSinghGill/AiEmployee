@@ -8,6 +8,7 @@ to end.
 from __future__ import annotations
 
 import abc
+import json
 import time
 from typing import Any, ClassVar, get_type_hints
 
@@ -72,10 +73,19 @@ class Tool(abc.ABC):
         failures — those come back as ``ToolResult(ok=False)`` so the agent loop
         can decide how to react."""
         started = time.perf_counter()
+        kwargs = _unwrap_raw_args(kwargs)
         try:
             args = self.Args(**kwargs)
         except ValidationError as exc:
-            return ToolResult(ok=False, error=f"invalid arguments: {exc}")
+            if "_raw" in kwargs:
+                return ToolResult(
+                    ok=False,
+                    error=(
+                        "InvalidToolArgs: tool call JSON was truncated or malformed. "
+                        "Retry with a shorter script (under 40 lines)."
+                    ),
+                )
+            return ToolResult(ok=False, error=f"InvalidToolArgs: {exc}")
         try:
             result = await self._run(args)
             if not isinstance(result, ToolResult):
@@ -112,6 +122,22 @@ class Tool(abc.ABC):
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"<Tool {self.name}>"
+
+
+def _unwrap_raw_args(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Recover args when the model emitted truncated JSON as ``_raw``."""
+    raw = kwargs.get("_raw")
+    if not isinstance(raw, str) or not raw.strip():
+        return kwargs
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return kwargs
+    if not isinstance(parsed, dict):
+        return kwargs
+    merged = {k: v for k, v in kwargs.items() if k != "_raw"}
+    merged.update(parsed)
+    return merged
 
 
 def _check_signature(tool: type[Tool]) -> None:  # pragma: no cover - dev aid

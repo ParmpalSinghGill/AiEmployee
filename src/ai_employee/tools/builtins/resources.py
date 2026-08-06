@@ -74,14 +74,27 @@ class YoutubeSearchTool(Tool):
         )
 
 
+def hubs_for_kind(kind: str) -> tuple[str, ...]:
+    """Which hubs ``hub_search_all`` should query for a resource modality."""
+    if kind == "tabular":
+        return ("kaggle", "huggingface", "github", "paperswithcode")
+    if kind == "video":
+        return ("youtube", "huggingface", "roboflow", "github")
+    if kind == "image":
+        return ("roboflow", "huggingface", "kaggle", "github", "paperswithcode")
+    if kind == "speech":
+        return ("huggingface", "kaggle", "github", "paperswithcode")
+    return ("huggingface", "paperswithcode", "github", "kaggle", "roboflow", "youtube")
+
+
 class HubSearchAllTool(Tool):
     """Run the standard ML/public-data hubs with one call (reduces LLM round-trips)."""
 
     name = "hub_search_all"
     description = (
-        "Search ALL major public resource hubs for a query: Hugging Face, Papers With Code, "
-        "GitHub, Kaggle, Roboflow, and YouTube (via web). Returns a dict of hits per hub. "
-        "Use when no dataset was found yet or the task needs code + data from public sources."
+        "Search public resource hubs for a query. kind selects modality: tabular (CSV/Kaggle), "
+        "video (YouTube/Roboflow), image (Roboflow/HF/Kaggle), speech (HF/Kaggle audio/ASR), "
+        "or all. Returns a dict of hits per hub."
     )
     category = "research"
 
@@ -91,6 +104,11 @@ class HubSearchAllTool(Tool):
     class Args(BaseModel):
         query: str
         limit: int = Field(5, ge=1, le=10)
+        kind: str = Field(
+            "all",
+            pattern="^(all|tabular|video|image|speech)$",
+            description="all | tabular | video | image | speech (audio/ASR).",
+        )
 
     async def _run(self, args: HubSearchAllTool.Args) -> ToolResult:
         from ai_employee.tools.builtins.research import (
@@ -101,20 +119,28 @@ class HubSearchAllTool(Tool):
             RoboflowSearchTool,
         )
 
+        catalog: dict[str, Tool] = {
+            "huggingface": HfSearchTool(),
+            "paperswithcode": PapersWithCodeSearchTool(),
+            "github": GithubSearchTool(self._settings),
+            "kaggle": KaggleSearchTool(self._settings),
+            "roboflow": RoboflowSearchTool(self._settings),
+            "youtube": YoutubeSearchTool(self._settings),
+        }
         tools: list[tuple[str, Tool]] = [
-            ("huggingface", HfSearchTool()),
-            ("paperswithcode", PapersWithCodeSearchTool()),
-            ("github", GithubSearchTool(self._settings)),
-            ("kaggle", KaggleSearchTool(self._settings)),
-            ("roboflow", RoboflowSearchTool(self._settings)),
-            ("youtube", YoutubeSearchTool(self._settings)),
+            (hub, catalog[hub]) for hub in hubs_for_kind(args.kind) if hub in catalog
         ]
         out: dict[str, Any] = {}
         notes: list[str] = []
         for hub, tool in tools:
             try:
                 if tool.name == "hf_search":
-                    r = await tool.execute(query=args.query, kind="both", limit=args.limit)
+                    hf_kind = (
+                        "datasets"
+                        if args.kind in {"tabular", "image", "speech"}
+                        else "both"
+                    )
+                    r = await tool.execute(query=args.query, kind=hf_kind, limit=args.limit)
                 elif tool.name == "youtube_search":
                     r = await tool.execute(query=args.query, max_results=args.limit)
                 else:

@@ -18,7 +18,6 @@ from pathlib import Path
 from typing import Any
 
 from ai_employee.tools.builtins.resource_download import (
-    detect_source,
     prioritize_download_urls,
     sanitize_url,
 )
@@ -29,8 +28,14 @@ _PATH_RE = re.compile(
     re.I,
 )
 _RESOURCE_TASK_RE = re.compile(
-    r"\b(video|footage|dataset|download|obtain|find|search for|source|url|file|"
-    r"resource|clip|save|saved)\b",
+    r"\b(download|obtain|acquire|fetch)\b|"
+    r"\b(find|search for|locate|source)\b.{0,80}\b(video|footage|dataset|url|resource|clip)\b|"
+    r"\b(video|footage|dataset|resource|clip)\b.{0,80}\b(find|search|download|obtain|acquire|source)\b",
+    re.I,
+)
+_ANALYSIS_TASK_RE = re.compile(
+    r"\b(analy[sz]e|clean(?:e[ds]|ing)?|data quality|eda\b|kpi|visuali[sz]|predictive|"
+    r"exploratory|insight|regression|forecast)\b",
     re.I,
 )
 _FOUND_CLAIM_RE = re.compile(
@@ -81,7 +86,14 @@ _MANUAL_DOWNLOAD_MARKERS = (
 
 
 def is_resource_task(task: str, success_criteria: str = "") -> bool:
-    return bool(_RESOURCE_TASK_RE.search(f"{task} {success_criteria}"))
+    blob = f"{task} {success_criteria}"
+    # Data-cleaning / EDA steps often mention "dataset" and "save a file" but
+    # they are not resource-acquisition steps — don't audit them as downloads.
+    if _ANALYSIS_TASK_RE.search(blob) and not re.search(
+        r"\b(download|obtain|acquire|fetch)\b", blob, re.I
+    ):
+        return False
+    return bool(_RESOURCE_TASK_RE.search(blob))
 
 
 def is_manual_download_error(error: str) -> bool:

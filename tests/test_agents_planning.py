@@ -8,6 +8,20 @@ from ai_employee.tools import default_registry
 from ai_employee.verification import Verifier
 
 
+def test_planner_prompt_separates_tabular_from_video():
+    import inspect
+
+    from ai_employee.planning.planner import Planner
+
+    src = inspect.getsource(Planner.make_plan)
+    assert "TABULAR" in src
+    assert "IMAGE" in src
+    assert "SPEECH" in src
+    assert "kind=tabular" in src
+    assert "kind=image" in src
+    assert "kind=speech" in src
+
+
 def test_registry_has_all_agents():
     reg = build_agent_registry()
     names = set(reg.names())
@@ -424,3 +438,166 @@ async def test_resource_downloader_tries_next_url_after_failed_downloads(setting
         True,
     ]
     assert "aborted after repeated tool failure" not in str(result.metadata.get("note", ""))
+
+
+def test_data_analysis_spec_handles_encoding_and_budget():
+    from ai_employee.agents.specs import spec_by_name
+
+    spec = spec_by_name()["data_analysis"]
+    assert spec.max_iterations >= 12
+    prompt = spec.system_prompt.lower()
+    assert "encoding" in prompt
+    assert "latin-1" in prompt
+    assert "tabular" in prompt
+    assert "image dataset" in prompt
+    assert "speech/audio" in prompt
+    assert "list_dir" in (spec.tools or ())
+    acquirer = spec_by_name()["resource_acquirer"]
+    assert "kind=tabular" in acquirer.system_prompt
+    assert "kind=image" in acquirer.system_prompt
+    assert "kind=speech" in acquirer.system_prompt
+
+
+async def test_agent_empty_answer_falls_back_to_tool_trace(settings):
+    from pydantic import BaseModel
+
+    from ai_employee.agents.base import AgentContext, ToolUsingAgent
+    from ai_employee.brains.schemas import ChatResult, ToolCall, Usage
+    from ai_employee.tools.base import Tool, ToolResult
+    from ai_employee.tools.invocation_history import (
+        begin_task_tool_history,
+        clear_task_tool_history,
+    )
+    from ai_employee.tools.registry import ToolRegistry
+
+    class ProbeTool(Tool):
+        name = "python_exec"
+        description = "run"
+        category = "code"
+
+        class Args(BaseModel):
+            code: str = ""
+
+        async def _run(self, args: Args) -> ToolResult:
+            return ToolResult(ok=True, output={"stdout": "shape=(9994, 21)\nmissing=11\n"})
+
+    class _Brain:
+        def __init__(self):
+            self.turn = 0
+
+        async def chat(self, messages, **kwargs):
+            self.turn += 1
+            if self.turn == 1:
+                return ChatResult(
+                    content="",
+                    tool_calls=[
+                        ToolCall(id="1", name="python_exec", arguments={"code": "print(1)"})
+                    ],
+                    usage=Usage(),
+                )
+            return ChatResult(content="", tool_calls=[], finish_reason="length", usage=Usage())
+
+    class _Agent(ToolUsingAgent):
+        name = "data_analysis"
+        allowed_tools = ["python_exec"]
+        max_iterations = 1
+
+    reg = ToolRegistry(settings)
+    reg.register(ProbeTool())
+    begin_task_tool_history()
+    try:
+        result = await _Agent().run("clean the csv", AgentContext(brain=_Brain(), tools=reg))
+    finally:
+        clear_task_tool_history()
+
+    assert result.output
+    assert "shape=(9994, 21)" in result.output
+    assert "python_exec" in result.output
+
+
+async def test_unicodedecode_hint_does_not_abort(settings):
+    from pydantic import BaseModel
+
+    from ai_employee.agents.base import AgentContext, ToolUsingAgent
+    from ai_employee.brains.schemas import ChatResult, Role, ToolCall, Usage
+    from ai_employee.tools.base import Tool, ToolResult
+    from ai_employee.tools.invocation_history import (
+        begin_task_tool_history,
+        clear_task_tool_history,
+    )
+    from ai_employee.tools.registry import ToolRegistry
+
+    seen_tool_msgs: list[str] = []
+
+    class BoomTool(Tool):
+        name = "python_exec"
+        description = "run"
+        category = "code"
+
+        class Args(BaseModel):
+            code: str = ""
+
+        async def _run(self, args: Args) -> ToolResult:
+            return ToolResult(
+                ok=False,
+                error="UnicodeDecodeError: 'utf-8' codec can't decode byte 0xa0 in position 12",
+            )
+
+    class _Brain:
+        def __init__(self):
+            self.turn = 0
+
+        async def chat(self, messages, **kwargs):
+            self.turn += 1
+            for m in messages:
+                if m.role == Role.tool:
+                    seen_tool_msgs.append(m.content)
+            if self.turn <= 2:
+                return ChatResult(
+                    content="",
+                    tool_calls=[
+                        ToolCall(
+                            id=str(self.turn),
+                            name="python_exec",
+                            arguments={
+                                "code": f"import pandas as pd; pd.read_csv('x{self.turn}.csv')"
+                            },
+                        )
+                    ],
+                    usage=Usage(),
+                )
+            return ChatResult(
+                content="Loaded with encoding=latin-1. Cleaned file: data/clean.csv",
+                tool_calls=[],
+                usage=Usage(),
+            )
+
+    class _Agent(ToolUsingAgent):
+        name = "data_analysis"
+        allowed_tools = ["python_exec"]
+        max_iterations = 4
+
+    reg = ToolRegistry(settings)
+    reg.register(BoomTool())
+    begin_task_tool_history()
+    try:
+        result = await _Agent().run("load csv", AgentContext(brain=_Brain(), tools=reg))
+    finally:
+        clear_task_tool_history()
+
+    assert any("latin-1" in msg for msg in seen_tool_msgs)
+    assert "aborted after repeated tool failure" not in str(result.metadata.get("note", ""))
+    assert "latin-1" in result.output
+
+
+def test_error_class_normalizes_truncated_tool_json():
+    from ai_employee.agents.base import ToolUsingAgent
+
+    err = (
+        "invalid arguments: 1 validation error for Args\n"
+        "code\n"
+        "  Field required [type=missing, input_value={'_raw': '{\"code\": \"impor'}, "
+        "input_type=dict]\n"
+        "    For further information visit https://errors.pydantic.dev/2.13/v/missing"
+    )
+    assert ToolUsingAgent._error_class(err) == "InvalidToolArgs"

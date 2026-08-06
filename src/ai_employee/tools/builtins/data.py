@@ -10,10 +10,32 @@ from pydantic import BaseModel, Field
 from ai_employee.tools.base import Tool, ToolResult
 from ai_employee.tools.builtins._sandbox import resolve_in_workspace
 
+# utf-8-sig covers BOM and plain UTF-8. cp1252/latin-1 cover Superstore-style
+# files that embed 0xA0 (nbsp) and other Windows bytes pandas rejects as UTF-8.
+_TEXT_ENCODINGS = ("utf-8-sig", "cp1252", "latin-1")
+
+
+def detect_text_encoding(path: Path, sample_bytes: int = 65_536) -> str:
+    """Return an encoding that can decode ``path`` (latin-1 always can)."""
+    raw = path.read_bytes()[:sample_bytes]
+    if not raw:
+        return "utf-8"
+    for enc in _TEXT_ENCODINGS:
+        try:
+            raw.decode(enc)
+            return enc
+        except UnicodeDecodeError:
+            continue
+    return "latin-1"
+
 
 class CsvPreviewTool(Tool):
     name = "csv_preview"
-    description = "Preview a CSV file: column names, row count, and the first N rows."
+    description = (
+        "Preview a CSV file: column names, row count, first N rows, and the file "
+        "`encoding` to pass to pandas (`pd.read_csv(path, encoding=...)`). "
+        "Never assume UTF-8 — many public CSVs are cp1252/latin-1."
+    )
     category = "data"
 
     class Args(BaseModel):
@@ -27,17 +49,21 @@ class CsvPreviewTool(Tool):
         import csv
 
         p = resolve_in_workspace(self._ws, args.path, must_exist=True)
-        with p.open(newline="", encoding="utf-8", errors="replace") as fh:
+        encoding = detect_text_encoding(p)
+        with p.open(newline="", encoding=encoding) as fh:
             reader = csv.reader(fh)
             all_rows = list(reader)
         if not all_rows:
-            return ToolResult(output={"columns": [], "row_count": 0, "rows": []})
+            return ToolResult(
+                output={"columns": [], "row_count": 0, "rows": [], "encoding": encoding}
+            )
         header, *body = all_rows
         return ToolResult(
             output={
                 "columns": header,
                 "row_count": len(body),
                 "rows": [dict(zip(header, r, strict=False)) for r in body[: args.rows]],
+                "encoding": encoding,
             }
         )
 

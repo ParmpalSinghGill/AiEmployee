@@ -50,6 +50,55 @@ async def test_json_query(registry):
     assert res.output == 3
 
 
+async def test_csv_preview_reports_non_utf8_encoding(registry, settings):
+    ws = settings.workspace_dir
+    ws.mkdir(parents=True, exist_ok=True)
+    path = ws / "nbsp.csv"
+    path.write_bytes(b"name,product\nA,Conference\xa0phone\n")
+    res = await registry.execute("csv_preview", {"path": "nbsp.csv", "rows": 2})
+    assert res.ok
+    assert res.output["encoding"] in {"cp1252", "latin-1"}
+    assert res.output["row_count"] == 1
+    assert "phone" in res.output["rows"][0]["product"]
+
+
+async def test_csv_preview_reports_utf8_encoding(registry, settings):
+    ws = settings.workspace_dir
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "plain.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+    res = await registry.execute("csv_preview", {"path": "plain.csv"})
+    assert res.ok
+    assert res.output["encoding"] in {"utf-8", "utf-8-sig"}
+
+
+async def test_python_exec_multiline_and_same_interpreter(registry):
+    res = await registry.execute(
+        "python_exec",
+        {"code": "import sys\nx = 1\nprint(sys.executable)\nprint(x + 41)"},
+    )
+    assert res.ok
+    lines = [ln for ln in res.output["stdout"].splitlines() if ln.strip()]
+    assert lines[-1] == "42"
+
+
+async def test_python_exec_recovers_complete_raw_json(registry):
+    res = await registry.execute(
+        "python_exec",
+        {"_raw": '{"code": "print(6*7)"}'},
+    )
+    assert res.ok
+    assert res.output["stdout"].strip() == "42"
+
+
+async def test_python_exec_truncated_raw_is_invalid_tool_args(registry):
+    res = await registry.execute(
+        "python_exec",
+        {"_raw": '{"code": "import pandas as pd\\ndf = pd.read_csv(\'x.csv\''},
+    )
+    assert not res.ok
+    assert "InvalidToolArgs" in (res.error or "")
+
+
 def test_tool_spec_shape(registry):
     spec = registry.get("read_file").to_spec()
     assert spec.name == "read_file"

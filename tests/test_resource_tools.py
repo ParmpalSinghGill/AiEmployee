@@ -369,3 +369,17 @@ def test_download_resource_tool_registered() -> None:
     assert "download_resource" in reg.names()
     assert "hub_search_all" in reg.names()
     assert "youtube_search" in reg.names()
+
+
+def test_hub_search_all_tabular_skips_video_hubs() -> None:
+    from ai_employee.tools.builtins.resources import hubs_for_kind
+
+    tabular = hubs_for_kind("tabular")
+    assert "kaggle" in tabular and "huggingface" in tabular
+    assert "youtube" not in tabular and "roboflow" not in tabular
+    video = hubs_for_kind("video")
+    assert "youtube" in video and "kaggle" not in video
+    image = hubs_for_kind("image")
+    assert "roboflow" in image and "youtube" not in image
+    speech = hubs_for_kind("speech")
+    assert "huggingface" in speech and "youtube" not in speech and "roboflow" not in speech

@@ -46,7 +46,10 @@ class PythonExecTool(Tool):
     name = "python_exec"
     description = (
         "Execute a short Python 3 script in a subprocess inside the workspace and "
-        "return its stdout/stderr. Use for calculations, data wrangling, quick checks."
+        "return its stdout/stderr. Use for calculations, data wrangling, quick checks. "
+        "When reading CSVs, pass the encoding from csv_preview "
+        "(or encoding='latin-1' after UnicodeDecodeError). Do not assume UTF-8. "
+        "Keep scripts under ~40 lines so the tool call is not truncated."
     )
     category = "code"
 
@@ -59,7 +62,10 @@ class PythonExecTool(Tool):
 
     async def _run(self, args: PythonExecTool.Args) -> ToolResult:
         ws = ensure_workspace(self._ws)
-        code, out, err = await _run_subprocess(["python", "-c", args.code], ws, args.timeout)
+        # Same interpreter as pip_install / the running API process.
+        code, out, err = await _run_subprocess(
+            [sys.executable, "-c", args.code], ws, args.timeout
+        )
         return ToolResult(
             ok=(code == 0),
             output={"stdout": out, "stderr": err, "returncode": code},

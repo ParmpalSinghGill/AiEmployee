@@ -100,19 +100,26 @@ class ToolUsingAgent(BaseAgent):
                 temperature=0.2,
             )
             if not result.has_tool_calls:
-                # Final answer.
-                await self._remember(task, result.content, ctx)
+                output = (result.content or "").strip()
+                if len(output) < 20:
+                    output = await self._final_answer(
+                        messages,
+                        trace,
+                        ctx,
+                        stop_reason="empty_or_truncated_answer",
+                    )
+                await self._remember(task, output, ctx)
                 log.info(
                     "agent.answer",
                     agent=self.name,
-                    output=clip(result.content, 4000),
+                    output=clip(output, 4000),
                     steps=steps_done,
                 )
                 return AgentResult(
                     agent=self.name,
                     success=True,
-                    output=result.content,
-                    confidence=self._estimate_confidence(result.content, trace),
+                    output=output,
+                    confidence=self._estimate_confidence(output, trace),
                     steps_taken=steps_done,
                     tool_trace=trace,
                     metadata={"usage": result.usage.model_dump()},
@@ -173,6 +180,26 @@ class ToolUsingAgent(BaseAgent):
                         ecls = self._error_class(tool_result.error)
                         sig = f"{call.name}:{ecls}"
                         fail_counts[sig] = fail_counts.get(sig, 0) + 1
+                        err_text = tool_result.error or ""
+                        if ecls == "UnicodeDecodeError":
+                            observation += (
+                                "\n\n[SYSTEM] UnicodeDecodeError: this file is not UTF-8 "
+                                "(byte 0xA0 is often a cp1252/latin-1 non-breaking space). "
+                                "Retry with pd.read_csv(path, encoding='latin-1') or "
+                                "encoding='cp1252'. csv_preview reports the encoding to use. "
+                                "Do not import chardet."
+                            )
+                        elif ecls == "InvalidToolArgs":
+                            observation += (
+                                "\n\n[SYSTEM] Tool call JSON was truncated or invalid. "
+                                "Retry python_exec with a SHORTER script (under 40 lines). "
+                                "Do not wrap arguments in _raw."
+                            )
+                        elif ecls == "ModuleNotFoundError" and "chardet" in err_text:
+                            observation += (
+                                "\n\n[SYSTEM] chardet is not installed. Skip detection — "
+                                "use encoding='latin-1' instead of importing chardet."
+                            )
                         if fail_counts[sig] >= settings.agent_repeat_failure_limit:
                             log.info(
                                 "agent.repeated_failure",
@@ -205,6 +232,9 @@ class ToolUsingAgent(BaseAgent):
                                     "continue trying the next distinct resource URL before asking "
                                     "the user for manual help."
                                 )
+                            elif ecls in {"UnicodeDecodeError", "InvalidToolArgs", "ValidationError"}:
+                                # Recoverable: encoding mismatch or truncated tool JSON.
+                                pass
                             else:
                                 observation += (
                                     f"\n\n[SYSTEM] '{call.name}' has now failed {fail_counts[sig]}× with the same "
@@ -301,36 +331,18 @@ class ToolUsingAgent(BaseAgent):
 
         # Loop ended (iterations exhausted, or aborted on a repeated failure).
         stop_reason = stop_reason or "max_iterations reached"
-        if self.name in _RESOURCE_DOWNLOAD_AGENTS and not self._downloads_attempted(trace):
-            final_prompt = (
-                "Stop using search/fetch tools. You MUST call download_resource on every "
-                "YouTube and Hugging Face URL you found (yt-dlp and huggingface_hub are "
-                "automated). Try YouTube URLs first. Only after download_resource succeeds "
-                "or fails for each URL, give your final answer with real local paths or "
-                "call request_resource_input with the actual download errors."
-            )
-        else:
-            final_prompt = (
-                "Stop using tools now. Give your best final answer, and clearly "
-                "state any blocker you could not get past."
-            )
-        final = await ctx.brain.chat(
-            [
-                *self._compact_history(messages, settings.agent_history_window),
-                Message.user(final_prompt),
-            ]
-        )
+        output = await self._final_answer(messages, trace, ctx, stop_reason)
         log.info(
             "agent.answer",
             agent=self.name,
-            output=clip(final.content, 4000),
+            output=clip(output, 4000),
             steps=steps_done,
             note=stop_reason,
         )
         return AgentResult(
             agent=self.name,
             success=True,
-            output=final.content,
+            output=output,
             confidence=0.35 if "failure" in stop_reason else 0.4,
             steps_taken=steps_done,
             tool_trace=trace,
@@ -338,6 +350,66 @@ class ToolUsingAgent(BaseAgent):
         )
 
     # ── Helpers ──────────────────────────────────────────────────────────────
+    async def _final_answer(
+        self,
+        messages: list[Message],
+        trace: list[dict[str, Any]],
+        ctx: AgentContext,
+        stop_reason: str | None,
+    ) -> str:
+        """Force a non-empty step output so dependents are not skipped."""
+        settings = get_settings()
+        history = self._compact_history(messages, settings.agent_history_window)
+        if self.name in _RESOURCE_DOWNLOAD_AGENTS and not self._downloads_attempted(trace):
+            prompt = (
+                "Stop using search/fetch tools. You MUST call download_resource on every "
+                "YouTube and Hugging Face URL you found (yt-dlp and huggingface_hub are "
+                "automated). Try YouTube URLs first. Only after download_resource succeeds "
+                "or fails for each URL, give your final answer with real local paths or "
+                "call request_resource_input with the actual download errors."
+            )
+        else:
+            prompt = (
+                "Stop using tools now. Write a concise final answer (under 400 words). "
+                "Lead with results and file paths. Clearly state any blocker. "
+                "Do not narrate your reasoning."
+            )
+        first = await ctx.brain.chat([*history, Message.user(prompt)], temperature=0.2)
+        text = (first.content or "").strip()
+        if len(text) >= 20:
+            return text
+        retry = await ctx.brain.chat(
+            [
+                *history,
+                Message.user(prompt),
+                Message.assistant(first.content or ""),
+                Message.user(
+                    "That reply was empty or truncated. Output the final answer only, "
+                    "under 300 words. No preamble."
+                ),
+            ],
+            temperature=0.2,
+        )
+        text = (retry.content or "").strip()
+        if len(text) >= 20:
+            return text
+        if trace:
+            return self._fallback_from_trace(trace, stop_reason or "empty_model_answer")
+        return text or "(No answer was produced.)"
+
+    @staticmethod
+    def _fallback_from_trace(trace: list[dict[str, Any]], stop_reason: str) -> str:
+        lines = [
+            f"(Agent stopped without a written answer: {stop_reason}.)",
+            "Tool evidence for downstream steps:",
+        ]
+        for entry in trace[-8:]:
+            status = "ok" if entry.get("ok") else "failed"
+            payload = entry.get("output") if entry.get("ok") else entry.get("error")
+            snippet = re.sub(r"\s+", " ", str(payload or ""))[:700]
+            lines.append(f"- {entry.get('tool')} [{status}]: {snippet}")
+        return "\n".join(lines)
+
     @staticmethod
     def _downloads_attempted(trace: list[dict[str, Any]]) -> bool:
         return any(t.get("tool") == "download_resource" for t in trace)
@@ -377,10 +449,19 @@ class ToolUsingAgent(BaseAgent):
         """
         if not error:
             return "unknown"
-        line = str(error).strip().splitlines()[-1].strip()
-        m = re.match(r"([A-Za-z_][A-Za-z0-9_]*(?:Error|Exception|Warning))\b", line)
-        if m:
-            return m.group(1)
+        text = str(error).strip()
+        if (
+            text.startswith("InvalidToolArgs")
+            or "_raw" in text
+            or "Field required" in text
+            or "validation error for Args" in text
+        ):
+            return "InvalidToolArgs"
+        for line in text.splitlines():
+            m = re.match(r"([A-Za-z_][A-Za-z0-9_]*(?:Error|Exception|Warning))\b", line.strip())
+            if m:
+                return m.group(1)
+        line = text.splitlines()[-1].strip()
         return re.sub(r"\d+|'[^']*'|\"[^\"]*\"", "", line)[:60].strip() or "error"
 
     def _compact_history(self, messages: list[Message], window: int) -> list[Message]:

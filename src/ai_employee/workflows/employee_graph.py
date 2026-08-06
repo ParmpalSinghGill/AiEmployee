@@ -55,10 +55,19 @@ def _looks_like_refusal(text: str) -> bool:
     return any(m in t for m in _REFUSAL_MARKERS)
 
 
+# Analysis/report agents failing a writeup must not cancel the rest of the
+# pipeline — downstream can still use earlier artifacts (e.g. the source CSV).
+_SOFT_DEPENDENCY_AGENTS = frozenset(
+    {"data_analysis", "documentation", "database", "rag", "knowledge_manager"}
+)
+
+
 def _looks_unusable(record: dict[str, Any]) -> bool:
     """True if a completed step produced nothing a dependent step could build on."""
     if record.get("skipped"):
         return True
+    if (record.get("agent") or "") in _SOFT_DEPENDENCY_AGENTS:
+        return False
     audit = record.get("resource_audit") or {}
     outcome = audit.get("outcome", "")
     if outcome in ("completed", "waiting_for_user", "partial"):
@@ -76,6 +85,19 @@ def _looks_unusable(record: dict[str, Any]) -> bool:
     if len(out) < 20:
         return True
     return _looks_like_refusal(out)
+
+
+def _output_from_tool_trace(trace: list[dict[str, Any]], reason: str) -> str:
+    lines = [
+        f"(Step finished without a written answer: {reason}.)",
+        "Tool evidence for downstream steps:",
+    ]
+    for entry in (trace or [])[-8:]:
+        status = "ok" if entry.get("ok") else "failed"
+        payload = entry.get("output") if entry.get("ok") else entry.get("error")
+        snippet = re.sub(r"\s+", " ", str(payload or ""))[:700]
+        lines.append(f"- {entry.get('tool')} [{status}]: {snippet}")
+    return "\n".join(lines)
 
 
 def _normalize(text: str) -> str:
@@ -242,6 +264,14 @@ class Orchestrator:
 
         ctx = self._context(state, {"step_results": results})
         result = await agent.run(task, ctx)
+        if (
+            not result.needs_approval
+            and len((result.output or "").strip()) < 20
+            and result.tool_trace
+        ):
+            result = result.model_copy(
+                update={"output": _output_from_tool_trace(result.tool_trace, "empty_agent_output")}
+            )
 
         # Approval gate: stop the whole run and surface the request.
         if result.needs_approval:
@@ -455,7 +485,7 @@ class Orchestrator:
 
     @staticmethod
     def _format_prior(results: list[dict[str, Any]]) -> str:
-        return "\n".join(f"[step {r['id']}] {r['output'][:500]}" for r in results[-3:])
+        return "\n".join(f"[step {r['id']}] {r['output'][:2000]}" for r in results[-3:])
 
     @staticmethod
     def _unmet_dependencies(step: dict[str, Any], results: list[dict[str, Any]]) -> list[int]:
