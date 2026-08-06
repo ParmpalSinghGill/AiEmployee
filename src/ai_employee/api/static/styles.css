@@ -216,6 +216,28 @@ body {
 .node.result { border-left: 3px solid var(--green); }
 .node-icon { width: 22px; height: 22px; border-radius: 6px; display: grid; place-items: center;
   background: var(--bg-3); font-size: 12px; }
+
+/* Flow → Explain drill-down. A jumpable node reads as clickable and reveals a
+   hint on hover; the target card flashes once you land on it. */
+.node.jumpable { cursor: pointer; transition: border-color .12s, transform .12s, box-shadow .12s; }
+.node.jumpable:hover { border-color: var(--accent); transform: translateY(-1px); }
+.node.jumpable:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.node-jump { margin-top: 8px; font-size: 11px; color: var(--accent); opacity: 0; transition: opacity .12s; }
+.node.jumpable:hover .node-jump,
+.node.jumpable:focus-visible .node-jump { opacity: 1; }
+@media (prefers-reduced-motion: reduce) {
+  .node.jumpable, .node-jump { transition: none; }
+  .node.jumpable:hover { transform: none; }
+}
+
+.x-comp.x-flash { animation: xflash 1.6s ease-out 1; }
+@keyframes xflash {
+  0%   { box-shadow: 0 0 0 2px var(--accent); }
+  100% { box-shadow: 0 0 0 2px transparent; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .x-comp.x-flash { animation: none; box-shadow: 0 0 0 2px var(--accent); }
+}
 .connector { align-self: center; width: 34px; height: 2px; background: var(--line);
   position: relative; flex: none; }
 .connector::after { content: "▸"; position: absolute; right: -4px; top: -9px; color: var(--line);
@@ -290,6 +312,58 @@ body {
 .conf-bar { width: 160px; height: 8px; background: var(--bg); border-radius: 999px; overflow: hidden;
   border: 1px solid var(--line); }
 .conf-fill { height: 100%; background: linear-gradient(90deg, var(--amber), var(--green)); }
+/* Rendered Markdown from agent answers. Scoped to .md so raw-text views
+   (Explain, Logs) keep showing exactly what the model returned. */
+/* Beats the pre-wrap on .result-answer / .step-card .out — the renderer has
+   already turned newlines into real block elements. */
+.result-answer.md, .step-card .out.md, .md { white-space: normal; }
+.step-card .out.md { color: var(--text); }
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p { margin: 0 0 10px; line-height: 1.6; }
+.md .md-h { margin: 18px 0 8px; line-height: 1.3; font-weight: 650; color: var(--fg); }
+.md .md-h1 { font-size: 17px; }
+.md .md-h2 { font-size: 15px; }
+.md .md-h3 { font-size: 14px; }
+.md .md-h4, .md .md-h5, .md .md-h6 { font-size: 13px; color: var(--muted); }
+.md .md-list { margin: 0 0 10px; padding-left: 22px; }
+.md .md-list li { margin: 3px 0; line-height: 1.55; }
+.md .md-hr { border: 0; border-top: 1px solid var(--line); margin: 16px 0; }
+.md .md-quote { margin: 0 0 10px; padding: 6px 12px; border-left: 3px solid var(--line);
+  color: var(--muted); }
+.md code { background: var(--bg); border: 1px solid var(--line); border-radius: 4px;
+  padding: 1px 5px; font-size: 12px; font-family: var(--mono, ui-monospace, monospace); }
+.md .md-pre { background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 10px 12px; overflow-x: auto; margin: 0 0 10px; }
+.md .md-pre code { background: none; border: 0; padding: 0; font-size: 12px; line-height: 1.5; }
+.md strong { color: var(--fg); font-weight: 650; }
+.md .md-table-wrap { overflow-x: auto; margin: 0 0 12px; }
+.md .md-table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+.md .md-table th, .md .md-table td { border: 1px solid var(--line); padding: 6px 10px;
+  text-align: left; vertical-align: top; }
+.md .md-table th { background: var(--bg); font-weight: 600; color: var(--fg); }
+
+/* Live progress shown in Result while the run is still in flight. */
+.partial-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+.partial-title { font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.partial-bar { flex: 1; min-width: 120px; max-width: 260px; }
+.partial-plan { margin-bottom: 16px; }
+.partial-plan h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .5px;
+  color: var(--muted); margin: 0 0 8px; }
+.partial-step { display: grid; grid-template-columns: 18px auto 1fr; gap: 8px; align-items: baseline;
+  padding: 5px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+.partial-step:last-child { border-bottom: 0; }
+.partial-step .pm { text-align: center; color: var(--muted); }
+.partial-step .pa { font-size: 11px; color: var(--muted); font-family: var(--mono, monospace); }
+.partial-step .pd { color: var(--muted); }
+.partial-step.done .pm { color: var(--green); }
+.partial-step.done .pd { color: var(--fg); }
+.partial-step.running .pm { color: var(--accent); animation: spin 1s linear infinite; display: inline-block; }
+.partial-step.running .pd { color: var(--fg); }
+.partial-note { margin-top: 14px; font-size: 13px; color: var(--muted);
+  display: flex; align-items: center; gap: 8px; }
+@media (prefers-reduced-motion: reduce) { .partial-step.running .pm { animation: none; } }
+
 .steps-list { margin-top: 14px; }
 .step-card { background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--radius);
   padding: 12px 14px; margin-bottom: 10px; }
@@ -301,13 +375,35 @@ body {
 .media-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
 .media-card { background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--radius);
   overflow: hidden; display: flex; flex-direction: column; }
-.media-card video, .media-card img { width: 100%; max-height: 220px; object-fit: contain;
-  background: #0a0a0c; display: block; }
+/* Fixed thumbnail height keeps grid rows aligned — charts have wildly different
+   aspect ratios, so max-height alone leaves the rows ragged. `cover` crops rather
+   than letterboxing, so wide charts don't sit in a band of dead space; the full
+   image is one click away. */
+.media-card video, .media-card img { width: 100%; height: 170px; object-fit: cover;
+  object-position: top center; background: #0a0a0c; display: block; }
+.media-card video { object-fit: contain; }
 .media-cap { display: flex; align-items: center; justify-content: space-between; gap: 8px;
-  padding: 8px 10px; font-size: 12px; border-top: 1px solid var(--line); }
+  padding: 8px 10px; font-size: 12px; border-top: 1px solid var(--line); margin-top: auto; }
 .media-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
 .media-open { color: var(--blue); text-decoration: none; flex-shrink: 0; }
 .media-open:hover { text-decoration: underline; }
+
+/* Files produced — non-image deliverables (reports, spreadsheets, dashboards). */
+.dl-list { display: flex; flex-direction: column; border: 1px solid var(--line);
+  border-radius: var(--radius); overflow: hidden; }
+.dl-row { display: grid; grid-template-columns: 24px 1fr auto auto; gap: 10px;
+  align-items: center; padding: 8px 12px; font-size: 13px; text-decoration: none;
+  color: var(--text); border-bottom: 1px solid var(--line); background: var(--bg-2); }
+.dl-row:last-child { border-bottom: 0; }
+.dl-row:hover { background: var(--bg-3); }
+.dl-row:focus-visible { outline: 2px solid var(--blue); outline-offset: -2px; }
+.dl-icon { text-align: center; }
+.dl-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dl-dir { color: var(--muted); }
+.dl-kind { color: var(--muted); font-size: 11px; text-transform: uppercase;
+  letter-spacing: .4px; }
+.dl-size { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums;
+  min-width: 62px; text-align: right; }
 
 .plan-steps .plan-step h4 { display: flex; align-items: center; gap: 8px; }
 .plan-num {

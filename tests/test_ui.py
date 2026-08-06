@@ -309,7 +309,7 @@ async def test_delete_followup_run(client):
 class _SlowEmployee:
     """Fake employee whose run() blocks long enough to be cancelled mid-flight."""
 
-    async def run(self, goal, *, session_id=None, approved_ops=None, resource_decision=None):
+    async def run(self, goal, *, session_id=None, approved_ops=None, resource_decision=None, **_):
         await asyncio.sleep(30)
         return {"answer": "done"}
 

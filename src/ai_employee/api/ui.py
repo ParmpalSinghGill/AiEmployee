@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 
 from ai_employee.api.deps import get_employee, rebuild_employee
 from ai_employee.api.workspace_files import (
+    collect_deliverables,
     guess_media_type,
     resolve_workspace_path,
     sample_media,
@@ -541,17 +542,47 @@ async def workspace_file(path: str = Query(..., min_length=1)) -> FileResponse:
     )
 
 
+@router.get("/ui/api/workspace/deliverables", tags=["ui"])
+async def workspace_deliverables(since: float | None = Query(None)) -> dict:
+    """List non-image artifacts a run produced (reports, spreadsheets, dashboards).
+
+    ``since`` scopes the listing to files written by the current run; the
+    workspace persists across runs, so an unscoped call returns everything.
+    """
+    return collect_deliverables(get_settings().workspace_dir, modified_since=since)
+
+
 @router.get("/ui/api/workspace/media", tags=["ui"])
 async def workspace_media(
     paths: list[str] = Query(default_factory=list),
+    all_images: bool = Query(False),
+    since: float | None = Query(None),
 ) -> dict:
-    """List video/image previews under workspace paths (samples when >5)."""
+    """List video/image previews under workspace paths.
+
+    ``all_images=true`` returns every image in the workspace without sampling —
+    used for charts, which agents generate freely but don't always name in the
+    final answer. Otherwise only the given paths are inspected (sampled when >5).
+    """
     flat: list[str] = []
     for p in paths:
         for part in str(p).split(","):
             part = part.strip()
             if part:
                 flat.append(part)
+    if all_images:
+        # "." is the workspace root. The cap is high enough that every chart from a
+        # normal analysis run is listed, but still bounded so a run that downloaded
+        # a large image dataset degrades to a sample instead of flooding the page.
+        # ``since`` scopes results to files this run created — the workspace is
+        # shared, so without it older runs' charts appear in every gallery.
+        return sample_media(
+            get_settings().workspace_dir,
+            [*flat, "."],
+            sample_when_over=60,
+            sample_size=60,
+            modified_since=since,
+        )
     if not flat:
         return {"videos": [], "images": [], "total": 0, "shown": 0, "sampled": False}
     return sample_media(get_settings().workspace_dir, flat)

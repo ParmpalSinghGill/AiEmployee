@@ -48,8 +48,144 @@ function linkify(s) {
   );
 }
 
+/* ── Markdown ──────────────────────────────────────────────────────────────
+ * Agents answer in Markdown, so rendering it as literal '#'/'**' text reads as
+ * broken output. This is a deliberately small subset — headings, emphasis, code,
+ * lists, tables, rules, links/images — with no external dependency, keeping the
+ * console dependency-free and offline-capable.
+ *
+ * Everything is escaped FIRST (via linkify, which also handles URLs and local
+ * media paths), then inline markers are replaced on the already-safe string, so
+ * model output can never inject HTML. */
+function mdInline(s) {
+  let t = linkify(s);
+  // Code spans first — their contents must not be re-processed for emphasis.
+  const code = [];
+  t = t.replace(/`([^`]+)`/g, (_m, c) => `\u0000${code.push(c) - 1}\u0000`);
+  // [label](url) — the url is already escaped; only allow http(s) and our own paths.
+  t = t.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, label, href) => {
+    if (/^(https?:|\/)/.test(href)) {
+      return `<a href="${href}" target="_blank" rel="noopener noreferrer" class="x-link">${label}</a>`;
+    }
+    return m;
+  });
+  t = t.replace(/\*\*\*([^*]+)\*\*\*/g, "<strong><em>$1</em></strong>");
+  t = t.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  t = t.replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s.,;:!?)]|$)/g, "$1<em>$2</em>");
+  t = t.replace(/(^|[\s(])_([^_\n]+)_(?=[\s.,;:!?)]|$)/g, "$1<em>$2</em>");
+  t = t.replace(/~~([^~]+)~~/g, "<del>$1</del>");
+  return t.replace(/\u0000(\d+)\u0000/g, (_m, i) => `<code>${code[+i]}</code>`);
+}
+
+/* Some providers (notably DeepSeek) sometimes emit a tool call as literal text
+ * instead of a structured call, dumping provider markup into the answer. It is
+ * noise to a reader, so strip it at display time — the real call is still visible
+ * in Explain and Logs, which show raw output deliberately. */
+function stripToolCallMarkup(s) {
+  let t = String(s == null ? "" : s);
+  // U+FF5C (fullwidth vertical bar) is what DeepSeek emits, not an ASCII pipe.
+  if (!/DSML|｜|invoke name=/.test(t)) return t;
+  // Whole sentinel tags: <｜｜DSML｜｜tool_calls>, <｜｜DSML｜｜invoke name="x">, closers.
+  t = t.replace(/<\/?[｜|\s]*DSML[｜|][^>]*>/g, "");
+  t = t.replace(/<\/?[｜|][^>]*>/g, "");
+  t = t.replace(/<\/?(?:tool_calls|invoke|parameter)\b[^>]*>/gi, "");
+  t = t.replace(/\bstring="true"\s*/gi, "");
+  return t.replace(/\n{3,}/g, "\n\n").trim();
+}
+
+/* Block-level Markdown → HTML. Falls back to linkify() for plain text. */
+function renderMarkdown(src) {
+  const lines = stripToolCallMarkup(src).split("\n");
+  const out = [];
+  let i = 0, para = [];
+
+  const flushPara = () => {
+    if (para.length) { out.push(`<p>${mdInline(para.join("\n"))}</p>`); para = []; }
+  };
+
+  while (i < lines.length) {
+    const ln = lines[i];
+
+    // Fenced code — emitted verbatim (escaped), never inline-processed.
+    const fence = ln.match(/^\s*```+\s*([\w+-]*)\s*$/);
+    if (fence) {
+      flushPara();
+      const lang = fence[1] || "";
+      const buf = [];
+      i++;
+      while (i < lines.length && !/^\s*```+\s*$/.test(lines[i])) buf.push(lines[i++]);
+      i++;  // closing fence
+      out.push(`<pre class="md-pre"><code${lang ? ` class="lang-${esc(lang)}"` : ""}>${esc(buf.join("\n"))}</code></pre>`);
+      continue;
+    }
+
+    if (/^\s*(?:---+|\*\*\*+|___+)\s*$/.test(ln)) { flushPara(); out.push(`<hr class="md-hr">`); i++; continue; }
+
+    const h = ln.match(/^(#{1,6})\s+(.*)$/);
+    if (h) {
+      flushPara();
+      const lvl = Math.min(h[1].length + 2, 6);   // '#' → h3, so it sits under the page's own h1/h2
+      out.push(`<h${lvl} class="md-h md-h${h[1].length}">${mdInline(h[2].trim())}</h${lvl}>`);
+      i++; continue;
+    }
+
+    if (/^\s*>\s?/.test(ln)) {
+      flushPara();
+      const buf = [];
+      while (i < lines.length && /^\s*>\s?/.test(lines[i])) buf.push(lines[i++].replace(/^\s*>\s?/, ""));
+      out.push(`<blockquote class="md-quote">${mdInline(buf.join("\n"))}</blockquote>`);
+      continue;
+    }
+
+    // Table: a header row followed by a |---|---| separator.
+    if (/^\s*\|.*\|\s*$/.test(ln) && i + 1 < lines.length && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1])) {
+      flushPara();
+      const cells = (row) => row.trim().replace(/^\||\|$/g, "").split("|").map(c => c.trim());
+      const head = cells(lines[i]);
+      i += 2;
+      const body = [];
+      while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) body.push(cells(lines[i++]));
+      out.push(`<div class="md-table-wrap"><table class="md-table"><thead><tr>` +
+        head.map(c => `<th>${mdInline(c)}</th>`).join("") + `</tr></thead><tbody>` +
+        body.map(r => `<tr>${r.map(c => `<td>${mdInline(c)}</td>`).join("")}</tr>`).join("") +
+        `</tbody></table></div>`);
+      continue;
+    }
+
+    const li = ln.match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
+    if (li) {
+      flushPara();
+      const ordered = /\d/.test(li[2]);
+      const items = [];
+      while (i < lines.length) {
+        const m = lines[i].match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
+        if (!m || /\d/.test(m[2]) !== ordered) break;
+        const buf = [m[3]];
+        i++;
+        // Continuation lines belonging to this bullet.
+        while (i < lines.length && /^\s+\S/.test(lines[i]) &&
+               !/^(\s*)([-*+]|\d+[.)])\s+/.test(lines[i])) buf.push(lines[i++].trim());
+        items.push(buf.join(" "));
+      }
+      const tag = ordered ? "ol" : "ul";
+      out.push(`<${tag} class="md-list">` + items.map(t => `<li>${mdInline(t)}</li>`).join("") + `</${tag}>`);
+      continue;
+    }
+
+    if (!ln.trim()) { flushPara(); i++; continue; }
+    para.push(ln);
+    i++;
+  }
+  flushPara();
+  return out.join("");
+}
+
 const _MEDIA_EXT_RE = /\.(mp4|webm|mov|mkv|m4v|avi|ogv|jpg|jpeg|png|gif|webp|bmp|svg)$/i;
 const _LOCAL_PATH_RE = /(?:(?:\.\/)?(?:data\/)?(?:workspace\/)?(?:sessions|models|data)\/[\w./+-]+|\/[\w./+-]*workspace\/[\w./+-]+)(?:\.\w+)?/gi;
+/* Charts and figures are written straight to the workspace root (e.g.
+   ``revenue_by_region.png``), so a bare image filename must be picked up too —
+   the path-prefixed regex above would miss them entirely. */
+const _BARE_IMAGE_RE = /(?:^|[\s"'`(<[])((?:\.\/)?(?:[\w+-]+\/)*[\w+-]+\.(?:png|jpg|jpeg|gif|webp|bmp|svg))(?=$|[\s"'`)>\].,;:!?])/gim;
 
 function workspaceFileUrl(path) {
   return `/ui/api/workspace/file?path=${encodeURIComponent(String(path || "").replace(/\\/g, "/"))}`;
@@ -92,6 +228,13 @@ function collectLocalMediaPaths(task) {
     for (const p of pathHits) {
       if (_MEDIA_EXT_RE.test(p) || /\/(sessions|models|data)\//.test(p)) add(p);
     }
+    // Bare image filenames written to the workspace root (charts, figures).
+    let bm;
+    _BARE_IMAGE_RE.lastIndex = 0;
+    while ((bm = _BARE_IMAGE_RE.exec(blob))) {
+      const p = bm[1];
+      if (!/^https?:/i.test(p)) add(p.replace(/^\.\//, ""));
+    }
   }
   return out;
 }
@@ -118,16 +261,86 @@ function mediaSectionHtml(title, items, kind) {
     <div class="media-grid">${items.map(it => mediaCard(it, kind)).join("")}</div></div>`;
 }
 
+/* Unix seconds for when a run started, with a grace window for clock skew between
+ * the task record and the filesystem. Used to scope workspace listings to one run. */
+function runStartedSince(task) {
+  const started = Date.parse(task?.created_at || "");
+  return Number.isNaN(started) ? null : (started - 60_000) / 1000;
+}
+
+const _KIND_ICON = {
+  report: "📄", spreadsheet: "📊", page: "🌐",
+  data: "🗂", notebook: "📓", code: "⌨", archive: "🗜",
+};
+
+function fmtBytes(n) {
+  if (!n && n !== 0) return "";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1048576).toFixed(1)} MB`;
+  return `${(n / 1073741824).toFixed(1)} GB`;
+}
+
+/* Files the run produced that aren't images — spreadsheets, reports, dashboards.
+ * Previously these were written to the workspace and never surfaced anywhere. */
+function deliverablesHtml(data) {
+  const files = (data && data.files) || [];
+  if (!files.length) return "";
+  const note = data.truncated
+    ? `<span class="x-muted">(showing ${data.shown} of ${data.total})</span>`
+    : `<span class="x-muted">(${files.length})</span>`;
+  const rows = files.map(f => {
+    const href = esc(f.url || workspaceFileUrl(f.path));
+    const dir = String(f.path || "").includes("/")
+      ? `<span class="dl-dir">${esc(f.path.slice(0, f.path.lastIndexOf("/")))}/</span>`
+      : "";
+    return `<a class="dl-row" href="${href}" target="_blank" rel="noopener noreferrer"
+        title="${esc(f.path)}">
+      <span class="dl-icon">${_KIND_ICON[f.kind] || "📎"}</span>
+      <span class="dl-name">${dir}${esc(f.name)}</span>
+      <span class="dl-kind">${esc(f.kind || "")}</span>
+      <span class="dl-size">${fmtBytes(f.size)}</span>
+    </a>`;
+  }).join("");
+  return `<div class="steps-list deliverables"><h3>Files produced ${note}</h3>
+    <div class="dl-list">${rows}</div></div>`;
+}
+
+async function loadDeliverables(taskId) {
+  const mount = document.getElementById(`deliverables-${taskId}`);
+  if (!mount) return;
+  const task = state.cache.get(taskId);
+  if (!task || task.status !== "completed") { mount.innerHTML = ""; return; }
+  try {
+    const since = runStartedSince(task);
+    const data = await api("GET",
+      `/ui/api/workspace/deliverables${since != null ? `?since=${since}` : ""}`);
+    mount.innerHTML = deliverablesHtml(data);
+  } catch (err) {
+    mount.innerHTML = `<div class="x-muted">Could not list produced files: ${esc(err.message || err)}</div>`;
+  }
+}
+
 async function loadMediaGallery(taskId) {
   const mount = document.getElementById(`media-gallery-${taskId}`);
   if (!mount) return;
   const task = state.cache.get(taskId);
   if (!task) { mount.innerHTML = ""; return; }
   const paths = collectLocalMediaPaths(task);
-  if (!paths.length) { mount.innerHTML = ""; return; }
+  // Charts are generated freely but only sometimes named in the answer, so once a
+  // run is finished ask for every workspace image rather than just the named ones.
+  const wantAll = task.status === "completed";
+  if (!paths.length && !wantAll) { mount.innerHTML = ""; return; }
   try {
-    const qs = paths.map(p => `paths=${encodeURIComponent(p)}`).join("&");
-    const data = await api("GET", `/ui/api/workspace/media?${qs}`);
+    const parts = paths.map(p => `paths=${encodeURIComponent(p)}`);
+    if (wantAll) {
+      parts.push("all_images=true");
+      // Scope to files this run wrote — the workspace persists across runs, so an
+      // unscoped listing shows every chart every earlier task produced.
+      const since = runStartedSince(task);
+      if (since != null) parts.push(`since=${since}`);
+    }
+    const data = await api("GET", `/ui/api/workspace/media?${parts.join("&")}`);
     if (!data.total) { mount.innerHTML = ""; return; }
     const note = data.sampled
       ? `<div class="media-sample-note x-muted">Showing ${data.shown} of ${data.total} media files (sample)</div>`
@@ -578,6 +791,7 @@ function buildSection(session) {
       renderSession(session);
     });
   });
+  wireFlowJumps($(".flow-view", node), session);
   $(".followup", node).addEventListener("submit", (e) => {
     e.preventDefault();
     const input = $(".followup-input", node);
@@ -592,6 +806,52 @@ function buildSection(session) {
   });
   $(".sess-clear-memory", node).addEventListener("click", () => clearSessionMemory(session.id, session.title));
   $(".sess-delete", node).addEventListener("click", () => deleteSession(session.id));
+}
+
+/* Clicking a flow node opens the Explain tab at that node's card. Delegated from
+ * the container so it keeps working across the poller's re-renders of .flow-view. */
+function wireFlowJumps(flow, session) {
+  if (!flow || flow._jumpWired) return;
+  flow._jumpWired = true;
+  const go = (e) => {
+    const node = e.target.closest(".node[data-jump]");
+    if (!node || !flow.contains(node)) return;
+    jumpToExplain(session, node.getAttribute("data-jump"));
+  };
+  flow.addEventListener("click", go);
+  flow.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(e); }
+  });
+}
+
+/* Switch to Explain, expand the matching component, scroll it into view and
+ * flash it so it's obvious which card the click landed on. */
+function jumpToExplain(session, key) {
+  if (!key) return;
+  session.view = "explain";
+  // Force this card open even if the user had collapsed it previously.
+  let open = state.explainOpen.get(session.activeRun);
+  if (!open) { open = new Map(); state.explainOpen.set(session.activeRun, open); }
+  open.set(key, true);
+  renderSession(session);
+  // Wait for the re-render, then locate and highlight the target.
+  requestAnimationFrame(() => {
+    const explain = $(".explain-view", session._el);
+    if (!explain) return;
+    const card = explain.querySelector(`details[data-xk="${cssEscape(key)}"]`);
+    if (!card) return;
+    card.open = true;
+    card.scrollIntoView({ behavior: "smooth", block: "start" });
+    card.classList.remove("x-flash");
+    void card.offsetWidth;  // restart the animation if the same card is re-picked
+    card.classList.add("x-flash");
+    setTimeout(() => card.classList.remove("x-flash"), 1600);
+  });
+}
+
+/* Attribute selectors need escaping — our keys contain ':' (e.g. comp:step:1). */
+function cssEscape(s) {
+  return window.CSS && CSS.escape ? CSS.escape(s) : String(s).replace(/["\\]/g, "\\$&");
 }
 
 function captureExplainOpen(explain, taskId) {
@@ -766,13 +1026,25 @@ function deriveFlow(task) {
       case "agent.needs_approval": approval = { ...(approval || {}), operation: f.op, tool: f.tool ?? approval?.tool, args: f.args ?? approval?.args }; break;
     }
   }
+  // Backfill agent names the event stream didn't carry (see buildTrace).
+  for (const r of (task.result?.steps || [])) {
+    const s = steps.get(r.id);
+    if (s && (!s.agent || s.agent === "?") && r.agent) s.agent = r.agent;
+  }
   return { plan, steps: [...steps.values()].sort((a, b) => a.step - b.step), synth, reflect, approval };
 }
 
-function nodeHtml(cls, type, icon, title, bodyHtml = "") {
-  return `<div class="node ${cls}">
+/* ``jumpKey`` links a flow node to its Explain card (matching ``data-xk``), so
+ * clicking the node opens the trace for exactly that part of the run. Nodes with
+ * no explainable trace (e.g. Result) simply omit it and stay non-interactive. */
+function nodeHtml(cls, type, icon, title, bodyHtml = "", jumpKey = "") {
+  const jump = jumpKey
+    ? ` data-jump="${esc(jumpKey)}" role="button" tabindex="0" title="See what happened here"`
+    : "";
+  return `<div class="node ${cls}${jumpKey ? " jumpable" : ""}"${jump}>
     <div class="node-head"><span class="node-icon">${icon}</span>${esc(title)}</div>
-    <div class="node-type">${esc(type)}</div>${bodyHtml}</div>`;
+    <div class="node-type">${esc(type)}</div>${bodyHtml}
+    ${jumpKey ? `<div class="node-jump">Explain →</div>` : ""}</div>`;
 }
 const conn = () => `<div class="connector"></div>`;
 
@@ -888,7 +1160,8 @@ function renderFlow(task, session) {
 
   const nodes = [];
   nodes.push(nodeHtml("plan", "Planner", "◇",
-    "Plan", `<div class="node-sub">${fl.plan ? fl.plan.steps + " step(s) decomposed" : "planning…"}</div>`));
+    "Plan", `<div class="node-sub">${fl.plan ? fl.plan.steps + " step(s) decomposed" : "planning…"}</div>`,
+    "comp:planner"));
 
   for (const s of fl.steps) {
     let chips = "";
@@ -900,13 +1173,15 @@ function renderFlow(task, session) {
     if (s.verified === true) badge = `<div class="badge ok">✓ verified${s.confidence != null ? " · " + s.confidence : ""}</div>`;
     else if (s.verified === false) badge = `<div class="badge fail">✗ needs work</div>`;
     const retry = s.retries ? `<div class="node-sub">retried ×${s.retries}</div>` : "";
-    nodes.push(nodeHtml("step", `Step ${s.step} · agent`, "▣", s.agent, chips + badge + retry));
+    nodes.push(nodeHtml("step", `Step ${s.step} · agent`, "▣", s.agent, chips + badge + retry,
+      "comp:step:" + s.step));
   }
   if (fl.approval && (task.status === "awaiting_approval" || task.status === "waiting_for_user"))
     nodes.push(approvalNode(fl.approval, task));
-  if (fl.synth) nodes.push(nodeHtml("synthesize", "CEO", "★", "Synthesize", `<div class="node-sub">integrate step outputs</div>`));
-  if (fl.reflect) nodes.push(nodeHtml("reflect", "Memory", "↻", "Reflect", `<div class="node-sub">store outcome + learn skill</div>`));
-  if (task.status === "completed") nodes.push(nodeHtml("result", "Output", "✓", "Result", `<div class="node-sub">final deliverable ready</div>`));
+  if (fl.synth) nodes.push(nodeHtml("synthesize", "CEO", "★", "Synthesize", `<div class="node-sub">integrate step outputs</div>`, "comp:synthesize"));
+  if (fl.reflect) nodes.push(nodeHtml("reflect", "Memory", "↻", "Reflect", `<div class="node-sub">store outcome + learn skill</div>`, "comp:reflect"));
+  // The deliverable itself is produced by synthesis, so Result jumps there.
+  if (task.status === "completed") nodes.push(nodeHtml("result", "Output", "✓", "Result", `<div class="node-sub">final deliverable ready</div>`, fl.synth ? "comp:synthesize" : ""));
 
   // Wire the in-flow approve button once it's in the DOM (mirrors the Result tab).
   if (fl.approval && (task.status === "awaiting_approval" || task.status === "waiting_for_user") && session) {
@@ -997,6 +1272,13 @@ function buildTrace(task) {
       case "workflow.node": if (f.node === "synthesize") mkSynth(); if (f.node === "reflect") mkReflect(); break;
       case "approval.granted": comps.push({ kind: "approval", idx: comps.length, title: "Approved", icon: "✅", op: f.op, tool: f.tool, args: f.args }); break;
     }
+  }
+  // Some steps never emit an event carrying the agent name (it comes from the
+  // bound log context). The finished result records it per step, so backfill
+  // rather than leaving the card labelled "?".
+  for (const r of (task.result?.steps || [])) {
+    const c = steps.get(r.id);
+    if (c && (!c.agent || c.agent === "?") && r.agent) c.agent = r.agent;
   }
   return comps;
 }
@@ -1220,11 +1502,68 @@ function renderLogs(task) {
 }
 
 /* ── Result ────────────────────────────────────────────────────────────── */
+/* Live progress for a run that hasn't produced its final answer yet. Reads the
+ * plan and each finished step's output straight from the event stream so the
+ * Result tab fills in as work completes rather than sitting empty. */
+function renderPartialResult(task) {
+  const fl = deriveFlow(task);
+  const answers = new Map();     // step id -> agent's answer
+  let planSteps = [], synthesizing = false;
+  for (const e of (task.events || [])) {
+    const f = e.fields || {};
+    if (e.event === "planner.plan_ready" && (f.plan || []).length) planSteps = f.plan;
+    else if (e.event === "agent.answer" && f.step != null) answers.set(f.step, f.output || "");
+    else if (e.event === "agent.context" && f.node === "synthesize") synthesizing = true;
+  }
+
+  if (!planSteps.length && !answers.size) {
+    const what = fl.plan ? "Planning the work…" : "Starting up…";
+    return `<div class="placeholder"><span class="spin">◌</span> ${what}</div>`;
+  }
+
+  const done = answers.size;
+  const total = planSteps.length || fl.steps.length || done;
+  const pct = total ? Math.round((done / total) * 100) : 0;
+
+  let html = `<div class="partial-head">
+    <div class="partial-title"><span class="spin">◌</span> Working — ${done} of ${total} step(s) done</div>
+    <div class="conf-bar partial-bar"><div class="conf-fill" style="width:${pct}%"></div></div>
+  </div>`;
+
+  // The plan as a live checklist: done / running / queued.
+  if (planSteps.length) {
+    html += `<div class="partial-plan"><h3>Plan</h3>` + planSteps.map(p => {
+      const isDone = answers.has(p.id);
+      const running = !isDone && fl.steps.some(s => s.step === p.id);
+      const mark = isDone ? "✓" : (running ? "◌" : "·");
+      const cls = isDone ? "done" : (running ? "running" : "queued");
+      return `<div class="partial-step ${cls}"><span class="pm">${mark}</span>
+        <span class="pa">${esc(p.agent || "")}</span>
+        <span class="pd">${linkify(p.description || "")}</span></div>`;
+    }).join("") + `</div>`;
+  }
+
+  // Outputs already produced, newest last — the actual "results so far".
+  const ids = [...answers.keys()].sort((a, b) => a - b);
+  if (ids.length) {
+    html += `<div class="steps-list"><h3>Results so far</h3>` + ids.map(id => {
+      const st = fl.steps.find(s => s.step === id);
+      const agent = st?.agent && st.agent !== "?" ? st.agent : (planSteps.find(p => p.id === id)?.agent || "");
+      const ok = st?.verified === true ? " ✓" : "";
+      return `<div class="step-card"><h4>Step ${esc(id)}${agent ? " · " + esc(agent) : ""}${ok}</h4>
+        <div class="out md">${renderMarkdown((answers.get(id) || "").slice(0, 1200))}</div></div>`;
+    }).join("") + `</div>`;
+  }
+
+  if (synthesizing) html += `<div class="partial-note"><span class="spin">◌</span> Integrating the step outputs into the final answer…</div>`;
+  return html;
+}
+
 function renderResult(task, session) {
   if (task.resumable) {
     const reason = task.error || "This run was interrupted before it finished.";
     const partial = task.result && task.result.answer
-      ? `<div class="result-answer">${linkify(task.result.answer)}</div>`
+      ? `<div class="result-answer md">${renderMarkdown(task.result.answer)}</div>`
       : `<div class="x-muted" style="margin-top:10px">No final answer was produced yet. Resume to continue from the last saved step.</div>`;
     setTimeout(() => {
       const btn = document.getElementById(`resume-${task.id}`);
@@ -1239,7 +1578,10 @@ function renderResult(task, session) {
   if (task.status === "failed") return `<div class="approval-banner" style="border-color:var(--red);color:var(--red);background:rgba(239,94,107,.12)">Task failed: ${linkify(task.error || "unknown error")}</div>`;
   if (task.status === "cancelled") return `<div class="approval-banner" style="border-color:var(--muted);color:var(--muted);background:rgba(140,140,150,.10)">Task stopped: ${linkify(task.error || "cancelled by user")}</div>`;
   const r = task.result;
-  if (!r) return `<div class="placeholder"><span class="spin">◌</span> Working… the result will appear here.</div>`;
+  // ``task.result`` only lands when the whole pipeline finishes, but finished
+  // steps are already in the event stream — show them as they arrive instead of
+  // a spinner that looks like nothing is happening.
+  if (!r) return renderPartialResult(task);
 
   if (task.mode === "research" && r.result) return renderResearch(task, session, r);
   if (task.mode === "plan" && r.result) return renderPlan(task, session, r);
@@ -1264,7 +1606,7 @@ function renderResult(task, session) {
     }
   }
   const conf = r.confidence != null ? r.confidence : 0;
-  html += `<div class="result-answer">${linkify(r.answer || "(no answer produced)")}</div>
+  html += `<div class="result-answer md">${renderMarkdown(r.answer || "(no answer produced)")}</div>
     <div class="result-meta">
       <span class="muted">Confidence</span>
       <div class="conf-bar"><div class="conf-fill" style="width:${Math.round(conf * 100)}%"></div></div>
@@ -1272,12 +1614,13 @@ function renderResult(task, session) {
     </div>`;
 
   html += `<div id="media-gallery-${esc(task.id)}" class="media-gallery"></div>`;
+  html += `<div id="deliverables-${esc(task.id)}"></div>`;
 
   const steps = r.steps || [];
   if (steps.length) {
     html += `<div class="steps-list"><h3>Step outputs</h3>` + steps.map(st =>
       `<div class="step-card"><h4>Step ${esc(st.id)} · ${esc(st.agent)} ${st.verified ? "✓" : ""}</h4>
-        <div class="out">${linkify((st.output || "").slice(0, 1200))}</div></div>`).join("") + `</div>`;
+        <div class="out md">${renderMarkdown((st.output || "").slice(0, 1200))}</div></div>`).join("") + `</div>`;
   }
 
   html += tokensBlock(r.tokens);
@@ -1293,6 +1636,7 @@ function renderResult(task, session) {
     });
     wireResourceApproval(task, session);
     loadMediaGallery(task.id);
+    loadDeliverables(task.id);
   }, 0);
   return html;
 }
