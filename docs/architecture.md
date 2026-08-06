@@ -3,6 +3,11 @@
 The framework follows **clean architecture**: dependencies point inward, the LLM is an
 implementation detail behind an interface, and every layer is independently testable.
 
+> **Diagrams:** see [architecture-diagrams.md](architecture-diagrams.md) for the module
+> map, the full LangGraph state machine (including the approval-halt and checkpoint-resume
+> paths), the agent's ReAct loop with its circuit breakers, and the runtime path of one
+> task through the web console.
+
 ## Layer map
 
 ```

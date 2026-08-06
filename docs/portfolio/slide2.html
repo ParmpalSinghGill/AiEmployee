@@ -1,0 +1,122 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8">
+<style>
+  @page { size: 1600px 900px; margin: 0; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:1600px; height:900px; }
+  body {
+    background:#12151a; color:#e9e7e2;
+    font-family: ui-sans-serif,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    display:flex; flex-direction:column; padding:56px 64px 44px;
+  }
+  .eyebrow { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:17px;
+    letter-spacing:.18em; text-transform:uppercase; color:#7fb5d0; }
+  h1 { font-size:52px; font-weight:650; letter-spacing:-.02em; margin-top:12px; line-height:1.08; }
+  .sub { font-size:23px; color:#a8b1bd; margin-top:14px; max-width:1250px; line-height:1.45; }
+  .wrap { flex:1; display:flex; align-items:center; justify-content:center; }
+  svg { width:100%; height:auto; max-height:565px; color:#e9e7e2; }
+  .b { fill:none; stroke:currentColor; stroke-width:1.7; }
+  .lbl { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:19px; fill:currentColor; font-weight:600; }
+  .sml { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:14px; fill:#98a2ae; }
+  .ln { stroke:currentColor; stroke-width:1.7; fill:none; }
+  .thin { stroke:#7d8794; stroke-width:1.5; fill:none; }
+  .edge { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:14px; fill:#98a2ae; }
+  .amber { stroke:#d9a566; } .amberf { fill:#d9a566; }
+  .green { stroke:#83bd94; } .greenf { fill:#83bd94; }
+  .foot { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:16px; color:#7d8794;
+    border-top:1px solid #2b323a; padding-top:16px; line-height:1.6; }
+  .foot b { color:#d9a566; font-weight:600; }
+</style></head>
+<body>
+  <div class="eyebrow">Execution Engine</div>
+  <h1>Stateful pipeline with human-in-the-loop approval</h1>
+  <div class="sub">A goal is decomposed into steps, each executed by a specialist agent and independently verified. Sensitive operations pause the run — approving resumes from a checkpoint rather than restarting.</div>
+
+  <div class="wrap">
+  <svg viewBox="0 0 1420 600" role="img" aria-label="Execution state machine: plan, then an execute loop with per-step verification and retry, a pause-for-human branch that checkpoints state, then synthesize and reflect into memory.">
+    <defs>
+      <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+        <path d="M0,0.5 L9,5 L0,9.5 z" fill="currentColor"/></marker>
+      <marker id="am" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+        <path d="M0,0.5 L9,5 L0,9.5 z" fill="#d9a566"/></marker>
+      <marker id="as" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+        <path d="M0,0.5 L9,5 L0,9.5 z" fill="#7d8794"/></marker>
+    </defs>
+
+    <!-- ROW 1 (y=150..220): the main left-to-right spine -->
+    <text class="sml" x="24" y="152" fill="#68727e">GOAL</text>
+    <circle cx="52" cy="185" r="15" class="b"/>
+    <path class="ln" d="M67,185 L126,185" marker-end="url(#a)"/>
+
+    <rect class="b" x="128" y="152" width="186" height="66" rx="3"/>
+    <text class="lbl" x="221" y="180" text-anchor="middle">PLAN</text>
+    <text class="sml" x="221" y="201" text-anchor="middle">decompose → steps</text>
+
+    <path class="ln" d="M314,185 L412,185" marker-end="url(#a)"/>
+    <text class="edge" x="363" y="140" text-anchor="middle">assign agents</text>
+
+    <rect class="b" x="414" y="144" width="238" height="82" rx="3" stroke-width="2.8"/>
+    <text class="lbl" x="533" y="176" text-anchor="middle">EXECUTE</text>
+    <text class="sml" x="533" y="197" text-anchor="middle">specialist agent</text>
+    <text class="sml" x="533" y="215" text-anchor="middle">runs its tools</text>
+
+    <path class="ln" d="M652,185 L806,185" marker-end="url(#a)"/>
+    <text class="edge" x="729" y="140" text-anchor="middle">all steps complete</text>
+
+    <rect class="b" x="808" y="152" width="200" height="66" rx="3"/>
+    <text class="lbl" x="908" y="180" text-anchor="middle">SYNTHESIZE</text>
+    <text class="sml" x="908" y="201" text-anchor="middle">integrate results</text>
+
+    <path class="ln" d="M1008,185 L1076,185" marker-end="url(#a)"/>
+    <rect class="b green" x="1078" y="152" width="196" height="66" rx="3" fill="#1a2620"/>
+    <text class="lbl greenf" x="1176" y="180" text-anchor="middle">REFLECT</text>
+    <text class="sml" x="1176" y="201" text-anchor="middle" fill="#83bd94">learn a skill</text>
+
+    <path class="thin" d="M1274,185 L1332,185" marker-end="url(#as)"/>
+    <circle cx="1358" cy="185" r="15" class="b"/>
+    <text class="sml" x="1358" y="152" text-anchor="middle" fill="#68727e">RESULT</text>
+
+    <!-- ABOVE the spine (y<144): the step loop -->
+    <path class="ln" d="M533,144 L533,96 L700,96 L700,120 L468,120 L468,142" marker-end="url(#a)"/>
+    <text class="edge" x="546" y="88">next step — loop until the plan is complete</text>
+
+    <!-- verify/retry self-loop, right of EXECUTE, clear of SYNTHESIZE -->
+    <path class="thin" d="M652,206 C704,232 704,150 654,140" marker-end="url(#as)"/>
+    <text class="edge" x="668" y="246">verify each step · retry on failure</text>
+
+    <!-- dependency skip, left of EXECUTE -->
+    <path class="thin" d="M414,210 C356,240 356,164 412,158" marker-end="url(#as)"/>
+    <text class="edge" x="120" y="268">skip a step when its dependency</text>
+    <text class="edge" x="120" y="288">produced nothing usable</text>
+
+    <!-- ROW 2 (y=330..400): the approval branch, well below the spine -->
+    <path class="ln amber" d="M533,226 L533,352 L806,352" marker-end="url(#am)"/>
+    <text class="edge" x="546" y="322" fill="#d9a566">sensitive operation detected — halt the run</text>
+
+    <rect class="b amber" x="808" y="326" width="270" height="56" rx="3" fill="#2b2419"/>
+    <text class="lbl amberf" x="943" y="352" text-anchor="middle">PAUSE FOR HUMAN</text>
+    <text class="sml" x="943" y="372" text-anchor="middle" fill="#d9a566">full state checkpointed</text>
+
+    <!-- resume path returns to EXECUTE, routed below then up the far left -->
+    <path class="thin" d="M943,382 L943,404 L120,404 L120,196 L126,196" stroke-dasharray="5 4" marker-end="url(#as)"/>
+    <text class="edge" x="300" y="428">approve → resumes exactly where it stopped: no re-planning, no lost work</text>
+
+    <!-- ROW 3 (y=470..540): memory + guardrails -->
+    <path class="thin" d="M1176,218 L1176,470 L1108,470" marker-end="url(#as)"/>
+    <rect class="b" x="820" y="446" width="286" height="56" rx="3" stroke="#7d8794"/>
+    <text class="sml" x="963" y="470" text-anchor="middle">persistent memory</text>
+    <text class="sml" x="963" y="490" text-anchor="middle">+ reusable learned skills</text>
+    <text class="edge" x="820" y="528">written only when the step is verified</text>
+    <text class="edge" x="820" y="548">and confidence clears a threshold</text>
+
+    <rect class="b" x="120" y="446" width="560" height="56" rx="3" stroke="#7d8794" stroke-dasharray="5 4"/>
+    <text class="sml" x="400" y="470" text-anchor="middle">every loop is bounded — iteration caps, duplicate-call detection,</text>
+    <text class="sml" x="400" y="490" text-anchor="middle">per-error retry limits, stall detection</text>
+  </svg>
+  </div>
+
+  <div class="foot">
+    <b>Why this matters:</b> long-running autonomous work fails halfway. Checkpointing means an approval — or a server restart — costs seconds, not the whole run. Every loop is explicitly bounded so a stuck agent can't burn budget indefinitely.
+  </div>
+</body></html>

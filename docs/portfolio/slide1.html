@@ -1,0 +1,140 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8">
+<style>
+  @page { size: 1600px 900px; margin: 0; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:1600px; height:900px; }
+  body {
+    background:#12151a; color:#e9e7e2;
+    font-family: ui-sans-serif,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    display:flex; flex-direction:column; padding:56px 64px 48px;
+  }
+  .eyebrow { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:17px;
+    letter-spacing:.18em; text-transform:uppercase; color:#7fb5d0; }
+  h1 { font-size:52px; font-weight:650; letter-spacing:-.02em; margin-top:12px; line-height:1.08; }
+  .sub { font-size:23px; color:#a8b1bd; margin-top:14px; max-width:1150px; line-height:1.45; }
+  .wrap { flex:1; display:flex; align-items:center; justify-content:center; margin-top:8px; }
+  svg { width:100%; height:auto; max-height:560px; color:#e9e7e2; }
+  .b { fill:none; stroke:currentColor; stroke-width:1.6; }
+  .lbl { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:17px; fill:currentColor; font-weight:600; }
+  .sml { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:13.5px; fill:#98a2ae; }
+  .ln { stroke:currentColor; stroke-width:1.6; fill:none; }
+  .thin { stroke:#7d8794; stroke-width:1.4; fill:none; }
+  .edge { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:13px; fill:#98a2ae; }
+  .foot { display:flex; gap:44px; font-family:ui-monospace,Menlo,Consolas,monospace;
+    font-size:16px; color:#7d8794; border-top:1px solid #2b323a; padding-top:18px; margin-top:8px; }
+  .foot b { color:#7fb5d0; font-weight:600; }
+</style></head>
+<body>
+  <div class="eyebrow">System Architecture</div>
+  <h1>AI Employee — Multi-Agent Orchestration Framework</h1>
+  <div class="sub">Python · LangGraph · FastAPI · Postgres/pgvector · Redis — provider-independent: one env var swaps the LLM, and the whole stack runs offline for testing.</div>
+
+  <div class="wrap">
+  <svg viewBox="0 0 1420 560" role="img" aria-label="Layered architecture from entry points down to the Brain abstraction and seven interchangeable providers.">
+    <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0.5 L9,5 L0,9.5 z" fill="currentColor"/></marker>
+      <marker id="as" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0.5 L9,5 L0,9.5 z" fill="#7d8794"/></marker></defs>
+
+    <text class="sml" x="8" y="34" fill="#68727e">ENTRY POINTS</text>
+    <rect class="b" x="150" y="14" width="200" height="46" rx="3"/>
+    <text class="lbl" x="250" y="36" text-anchor="middle">CLI</text>
+    <text class="sml" x="250" y="52" text-anchor="middle">python -m ai_employee</text>
+
+    <rect class="b" x="374" y="14" width="200" height="46" rx="3"/>
+    <text class="lbl" x="474" y="36" text-anchor="middle">REST API</text>
+    <text class="sml" x="474" y="52" text-anchor="middle">FastAPI · OpenAPI</text>
+
+    <rect class="b" x="598" y="14" width="230" height="46" rx="3"/>
+    <text class="lbl" x="713" y="36" text-anchor="middle">Web Console</text>
+    <text class="sml" x="713" y="52" text-anchor="middle">live task dashboard</text>
+
+    <rect class="b" x="852" y="14" width="230" height="46" rx="3" stroke-dasharray="4 3"/>
+    <text class="lbl" x="967" y="36" text-anchor="middle">Task Runner</text>
+    <text class="sml" x="967" y="52" text-anchor="middle">async · resumable</text>
+
+    <line class="ln" x1="250" y1="60" x2="560" y2="104" marker-end="url(#a)"/>
+    <line class="ln" x1="474" y1="60" x2="620" y2="104" marker-end="url(#a)"/>
+    <line class="ln" x1="713" y1="60" x2="967" y2="76" marker-end="url(#a)"/>
+    <line class="ln" x1="967" y1="90" x2="790" y2="104" marker-end="url(#a)"/>
+
+    <rect class="b" x="450" y="106" width="520" height="56" rx="3" stroke-width="2.4" fill="#1b2a33"/>
+    <text class="lbl" x="710" y="132" text-anchor="middle">AIEmployee — facade &amp; dependency container</text>
+    <text class="sml" x="710" y="151" text-anchor="middle">run · plan · research · download · chat</text>
+
+    <line class="ln" x1="590" y1="162" x2="330" y2="200" marker-end="url(#a)"/>
+    <line class="ln" x1="710" y1="162" x2="710" y2="200" marker-end="url(#a)"/>
+    <line class="ln" x1="830" y1="162" x2="1090" y2="200" marker-end="url(#a)"/>
+
+    <text class="sml" x="8" y="228" fill="#68727e">ORCHESTRATION</text>
+    <rect class="b" x="200" y="202" width="260" height="52" rx="3"/>
+    <text class="lbl" x="330" y="224" text-anchor="middle">Execution Graph</text>
+    <text class="sml" x="330" y="243" text-anchor="middle">plan → execute → verify</text>
+
+    <rect class="b" x="580" y="202" width="260" height="52" rx="3"/>
+    <text class="lbl" x="710" y="224" text-anchor="middle">Planning Graph</text>
+    <text class="sml" x="710" y="243" text-anchor="middle">how-to guides</text>
+
+    <rect class="b" x="960" y="202" width="260" height="52" rx="3"/>
+    <text class="lbl" x="1090" y="224" text-anchor="middle">Research Graph</text>
+    <text class="sml" x="1090" y="243" text-anchor="middle">models · datasets · papers</text>
+    <text class="edge" x="1234" y="232">3 LangGraph state machines</text>
+
+    <line class="ln" x1="330" y1="254" x2="190" y2="300" marker-end="url(#a)"/>
+    <line class="ln" x1="600" y1="254" x2="490" y2="300" marker-end="url(#a)"/>
+    <line class="ln" x1="790" y1="254" x2="880" y2="300" marker-end="url(#a)"/>
+    <line class="ln" x1="1090" y1="254" x2="1170" y2="300" marker-end="url(#a)"/>
+
+    <text class="sml" x="8" y="296" fill="#68727e">CAPABILITIES</text>
+    <rect class="b" x="100" y="302" width="240" height="74" rx="3"/>
+    <text class="lbl" x="220" y="326" text-anchor="middle">29 Agents</text>
+    <text class="sml" x="220" y="345" text-anchor="middle">declarative specs</text>
+    <text class="sml" x="220" y="363" text-anchor="middle">ReAct tool loops</text>
+
+    <rect class="b" x="370" y="302" width="240" height="74" rx="3"/>
+    <text class="lbl" x="490" y="326" text-anchor="middle">23 Tools</text>
+    <text class="sml" x="490" y="345" text-anchor="middle">sandboxed registry</text>
+    <text class="sml" x="490" y="363" text-anchor="middle">approval-gated</text>
+
+    <rect class="b" x="640" y="302" width="240" height="74" rx="3"/>
+    <text class="lbl" x="760" y="326" text-anchor="middle">Memory</text>
+    <text class="sml" x="760" y="345" text-anchor="middle">7 namespaces</text>
+    <text class="sml" x="760" y="363" text-anchor="middle">pgvector / in-process</text>
+
+    <rect class="b" x="910" y="302" width="240" height="74" rx="3"/>
+    <text class="lbl" x="1030" y="326" text-anchor="middle">Knowledge</text>
+    <text class="sml" x="1030" y="345" text-anchor="middle">RAG · 8 loaders</text>
+    <text class="sml" x="1030" y="363" text-anchor="middle">chunk · embed · cite</text>
+
+    <rect class="b" x="1180" y="302" width="150" height="74" rx="3" stroke-dasharray="4 3"/>
+    <text class="lbl" x="1255" y="332" text-anchor="middle">Verifier</text>
+    <text class="sml" x="1255" y="351" text-anchor="middle">self-review</text>
+    <text class="sml" x="1255" y="367" text-anchor="middle">+ retry</text>
+
+    <line class="ln" x1="220" y1="376" x2="560" y2="438" marker-end="url(#a)"/>
+    <line class="ln" x1="760" y1="376" x2="700" y2="438" marker-end="url(#a)"/>
+    <line class="ln" x1="1255" y1="376" x2="860" y2="438" marker-end="url(#a)"/>
+
+    <text class="sml" x="8" y="466" fill="#68727e">MODEL LAYER</text>
+    <rect class="b" x="430" y="440" width="560" height="54" rx="3" stroke-width="2.4" fill="#1b2a33"/>
+    <text class="lbl" x="710" y="465" text-anchor="middle">Brain — the single interface to any model</text>
+    <text class="sml" x="710" y="484" text-anchor="middle">chat · stream · tool-calling · structured output · embeddings</text>
+
+    <line class="ln" x1="710" y1="494" x2="710" y2="520" marker-end="url(#a)"/>
+    <text class="edge" x="726" y="514">one env var selects</text>
+    <rect class="b" x="330" y="522" width="760" height="32" rx="3" stroke="#7d8794"/>
+    <text class="sml" x="710" y="543" text-anchor="middle">DeepSeek · OpenAI · Gemini · GLM · OpenCode · Local (Ollama/vLLM) · Mock (offline)</text>
+  </svg>
+  </div>
+
+  <div class="foot">
+    <span><b>29</b> agents</span>
+    <span><b>23</b> tools</span>
+    <span><b>7</b> LLM providers</span>
+    <span><b>7</b> memory namespaces</span>
+    <span><b>21</b> test modules</span>
+    <span><b>0</b> LLM SDK imports in business logic</span>
+  </div>
+</body></html>

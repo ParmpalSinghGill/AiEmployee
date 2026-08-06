@@ -1,0 +1,124 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8">
+<style>
+  @page { size: 1600px 900px; margin: 0; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:1600px; height:900px; }
+  body {
+    background:#12151a; color:#e9e7e2;
+    font-family: ui-sans-serif,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    display:flex; flex-direction:column; padding:56px 64px 48px;
+  }
+  .eyebrow { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:17px;
+    letter-spacing:.18em; text-transform:uppercase; color:#7fb5d0; }
+  h1 { font-size:52px; font-weight:650; letter-spacing:-.02em; margin-top:12px; line-height:1.08; }
+  .sub { font-size:23px; color:#a8b1bd; margin-top:14px; max-width:1200px; line-height:1.45; }
+  .wrap { flex:1; display:flex; align-items:center; justify-content:center; }
+  svg { width:100%; height:auto; max-height:500px; color:#e9e7e2; }
+  .b { fill:none; stroke:currentColor; stroke-width:1.6; }
+  .lbl { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:18px; fill:currentColor; font-weight:600; }
+  .sml { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:14px; fill:#98a2ae; }
+  .ln { stroke:currentColor; stroke-width:1.6; fill:none; }
+  .edge { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:13.5px; fill:#98a2ae; }
+  .accent { stroke:#7fb5d0; } .accentf { fill:#7fb5d0; }
+  .foot { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:16px; color:#7d8794;
+    border-top:1px solid #2b323a; padding-top:18px; line-height:1.6; }
+  .foot b { color:#7fb5d0; font-weight:600; }
+</style></head>
+<body>
+  <div class="eyebrow">Vendor Independence</div>
+  <h1>Swap the LLM without touching business logic</h1>
+  <div class="sub">Every model call routes through one interface. No agent, tool, or workflow imports a vendor SDK — so changing provider is a config edit, and the whole system runs offline for tests and CI.</div>
+
+  <div class="wrap">
+  <svg viewBox="0 0 1420 460" role="img" aria-label="All business logic calls the Brain interface, which routes to seven interchangeable providers selected by one environment variable.">
+    <defs>
+      <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0.5 L9,5 L0,9.5 z" fill="currentColor"/></marker>
+      <marker id="ac" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0.5 L9,5 L0,9.5 z" fill="#7fb5d0"/></marker>
+    </defs>
+
+    <text class="sml" x="20" y="30" fill="#68727e">BUSINESS LOGIC — vendor-agnostic, never imports an SDK</text>
+
+    <rect class="b" x="90" y="46" width="200" height="52" rx="3"/>
+    <text class="lbl" x="190" y="70" text-anchor="middle">Agents</text>
+    <text class="sml" x="190" y="88" text-anchor="middle">29 specialists</text>
+
+    <rect class="b" x="320" y="46" width="200" height="52" rx="3"/>
+    <text class="lbl" x="420" y="70" text-anchor="middle">Planner</text>
+    <text class="sml" x="420" y="88" text-anchor="middle">goal → steps</text>
+
+    <rect class="b" x="550" y="46" width="200" height="52" rx="3"/>
+    <text class="lbl" x="650" y="70" text-anchor="middle">Verifier</text>
+    <text class="sml" x="650" y="88" text-anchor="middle">self-review</text>
+
+    <rect class="b" x="780" y="46" width="200" height="52" rx="3"/>
+    <text class="lbl" x="880" y="70" text-anchor="middle">RAG</text>
+    <text class="sml" x="880" y="88" text-anchor="middle">embed + retrieve</text>
+
+    <rect class="b" x="1010" y="46" width="200" height="52" rx="3"/>
+    <text class="lbl" x="1110" y="70" text-anchor="middle">Chat</text>
+    <text class="sml" x="1110" y="88" text-anchor="middle">conversation</text>
+
+    <line class="ln" x1="190" y1="98" x2="540" y2="152" marker-end="url(#a)"/>
+    <line class="ln" x1="420" y1="98" x2="620" y2="152" marker-end="url(#a)"/>
+    <line class="ln" x1="650" y1="98" x2="680" y2="152" marker-end="url(#a)"/>
+    <line class="ln" x1="880" y1="98" x2="760" y2="152" marker-end="url(#a)"/>
+    <line class="ln" x1="1110" y1="98" x2="840" y2="152" marker-end="url(#a)"/>
+
+    <rect class="b accent" x="410" y="154" width="600" height="72" rx="3" stroke-width="2.8" fill="#1b2a33"/>
+    <text class="lbl accentf" x="710" y="182" text-anchor="middle">Brain — one interface, every model</text>
+    <text class="sml" x="710" y="203" text-anchor="middle">chat · stream · tool-calling · structured output · embeddings</text>
+    <text class="sml" x="710" y="220" text-anchor="middle">+ token metering and cost tracking on every call</text>
+
+    <path class="ln accent" d="M710,226 L710,272" marker-end="url(#ac)"/>
+    <rect class="b accent" x="520" y="274" width="380" height="36" rx="3" fill="#1b2a33"/>
+    <text class="sml" x="710" y="297" text-anchor="middle" fill="#7fb5d0">LLM_PROVIDER = &lt;name&gt;  ←  the only switch</text>
+
+    <line class="ln" x1="710" y1="310" x2="710" y2="336"/>
+    <line class="ln" x1="150" y1="336" x2="1270" y2="336"/>
+
+    <line class="ln" x1="150" y1="336" x2="150" y2="366" marker-end="url(#a)"/>
+    <line class="ln" x1="337" y1="336" x2="337" y2="366" marker-end="url(#a)"/>
+    <line class="ln" x1="524" y1="336" x2="524" y2="366" marker-end="url(#a)"/>
+    <line class="ln" x1="710" y1="336" x2="710" y2="366" marker-end="url(#a)"/>
+    <line class="ln" x1="896" y1="336" x2="896" y2="366" marker-end="url(#a)"/>
+    <line class="ln" x1="1083" y1="336" x2="1083" y2="366" marker-end="url(#a)"/>
+    <line class="ln" x1="1270" y1="336" x2="1270" y2="366" marker-end="url(#a)"/>
+
+    <rect class="b" x="78" y="368" width="144" height="56" rx="3"/>
+    <text class="sml" x="150" y="392" text-anchor="middle">DeepSeek</text>
+    <text class="sml" x="150" y="410" text-anchor="middle" fill="#68727e">default</text>
+
+    <rect class="b" x="265" y="368" width="144" height="56" rx="3"/>
+    <text class="sml" x="337" y="392" text-anchor="middle">OpenAI</text>
+    <text class="sml" x="337" y="410" text-anchor="middle" fill="#68727e">GPT</text>
+
+    <rect class="b" x="452" y="368" width="144" height="56" rx="3"/>
+    <text class="sml" x="524" y="392" text-anchor="middle">Gemini</text>
+    <text class="sml" x="524" y="410" text-anchor="middle" fill="#68727e">Google</text>
+
+    <rect class="b" x="638" y="368" width="144" height="56" rx="3"/>
+    <text class="sml" x="710" y="392" text-anchor="middle">GLM</text>
+    <text class="sml" x="710" y="410" text-anchor="middle" fill="#68727e">Zhipu</text>
+
+    <rect class="b" x="824" y="368" width="144" height="56" rx="3"/>
+    <text class="sml" x="896" y="392" text-anchor="middle">OpenCode</text>
+    <text class="sml" x="896" y="410" text-anchor="middle" fill="#68727e">hosted</text>
+
+    <rect class="b" x="1011" y="368" width="144" height="56" rx="3"/>
+    <text class="sml" x="1083" y="392" text-anchor="middle">Local</text>
+    <text class="sml" x="1083" y="410" text-anchor="middle" fill="#68727e">Ollama · vLLM</text>
+
+    <rect class="b accent" x="1198" y="368" width="144" height="56" rx="3" fill="#1b2a33"/>
+    <text class="sml" x="1270" y="392" text-anchor="middle" fill="#7fb5d0">Mock</text>
+    <text class="sml" x="1270" y="410" text-anchor="middle" fill="#7fb5d0">offline tests</text>
+  </svg>
+  </div>
+
+  <div class="foot">
+    <b>Why this matters:</b> no vendor lock-in, and pricing stays negotiable — switch to a cheaper model, or self-host entirely, without a rewrite. The mock provider runs the full pipeline with no API keys and no network, so the test suite is fast, free, and deterministic.
+  </div>
+</body></html>
