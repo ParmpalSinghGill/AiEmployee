@@ -269,7 +269,7 @@ All **266 tests** run offline in seconds — no network, no database, no API key
 | Guide | What's in it |
 |---|---|
 | [docs/setup.md](docs/setup.md) | Install, configure, first run |
-| [docs/operator-sop.html](docs/operator-sop.html) | Operator SOP for the web console — for non-technical users (open in a browser) |
+| [docs/operator-sop.md](docs/operator-sop.md) | Operator SOP for the web console — for non-technical users ([printable HTML](docs/operator-sop.html)) |
 | [docs/agent-flow.md](docs/agent-flow.md) | How a goal becomes a result, step by step |
 | [docs/architecture.md](docs/architecture.md) | Full design; [diagrams](docs/architecture-diagrams.md) |
 | [docs/providers.md](docs/providers.md) | Switching LLMs, running local models |
