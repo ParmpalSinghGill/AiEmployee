@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Employee Operator SOP</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Public+Sans:ital,wght@0,400;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  :root {
+    --paper: #F7F8FB;
+    --surface: #FFFFFF;
+    --ink: #1C2733;
+    --ink-soft: #4A5866;
+    --line: #D8DEE6;
+    --accent: #2B5BA8;
+    --accent-soft: #E8EEF7;
+    --ok: #1E7A4E;
+    --ok-bg: #E9F4EE;
+    --warn: #9A5B0B;
+    --warn-bg: #FAF1E2;
+    --stop: #AD3A2D;
+    --stop-bg: #F9ECEA;
+    --chip-bg: #EDF1F6;
+    --chip-line: #C9D3DF;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper: #12181F;
+      --surface: #1A222B;
+      --ink: #E4EAF1;
+      --ink-soft: #9AA8B6;
+      --line: #2E3944;
+      --accent: #7BA5E0;
+      --accent-soft: #1E2A3C;
+      --ok: #6DBE93;
+      --ok-bg: #17281F;
+      --warn: #D9A45B;
+      --warn-bg: #2C2214;
+      --stop: #E08A7C;
+      --stop-bg: #301B18;
+      --chip-bg: #232D38;
+      --chip-line: #3A4754;
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper: #12181F;
+    --surface: #1A222B;
+    --ink: #E4EAF1;
+    --ink-soft: #9AA8B6;
+    --line: #2E3944;
+    --accent: #7BA5E0;
+    --accent-soft: #1E2A3C;
+    --ok: #6DBE93;
+    --ok-bg: #17281F;
+    --warn: #D9A45B;
+    --warn-bg: #2C2214;
+    --stop: #E08A7C;
+    --stop-bg: #301B18;
+    --chip-bg: #232D38;
+    --chip-line: #3A4754;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: "Public Sans", -apple-system, "Segoe UI", sans-serif;
+    font-size: 1rem;
+    line-height: 1.65;
+    margin: 0;
+    padding: 3rem 1.25rem 5rem;
+  }
+  .doc { max-width: 46rem; margin: 0 auto; }
+
+  h1, h2, h3 {
+    font-family: "Archivo", "Public Sans", sans-serif;
+    letter-spacing: -0.01em;
+    text-wrap: balance;
+    line-height: 1.2;
+  }
+  h1 { font-size: 2.1rem; font-weight: 700; margin: 0 0 0.4rem; }
+  h2 { font-size: 1.35rem; font-weight: 700; margin: 3rem 0 0.9rem; padding-top: 1.6rem; border-top: 1px solid var(--line); }
+  h2 .no {
+    color: var(--accent);
+    font-variant-numeric: tabular-nums;
+    margin-right: 0.55rem;
+  }
+  h3 { font-size: 1.05rem; font-weight: 600; margin: 1.8rem 0 0.5rem; }
+  p { margin: 0 0 1rem; max-width: 70ch; }
+  ul, ol { margin: 0 0 1.1rem; padding-left: 1.4rem; }
+  li { margin-bottom: 0.45rem; }
+  li::marker { color: var(--ink-soft); }
+  strong { font-weight: 600; }
+  em { color: var(--ink-soft); }
+
+  .eyebrow {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.72rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 0.8rem;
+  }
+  .lede { font-size: 1.08rem; color: var(--ink-soft); max-width: 62ch; }
+
+  /* Doc-control block */
+  .doc-control {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr));
+    gap: 0;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    overflow: hidden;
+    margin: 1.6rem 0 0;
+    background: var(--surface);
+  }
+  .doc-control > div { padding: 0.65rem 0.9rem; border-right: 1px solid var(--line); }
+  .doc-control > div:last-child { border-right: none; }
+  .doc-control dt {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.66rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-soft);
+    margin: 0 0 0.15rem;
+  }
+  .doc-control dd { margin: 0; font-size: 0.9rem; font-weight: 600; }
+
+  /* UI-control chips */
+  .ui {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.82em;
+    font-weight: 500;
+    background: var(--chip-bg);
+    border: 1px solid var(--chip-line);
+    border-bottom-width: 2px;
+    border-radius: 5px;
+    padding: 0.08em 0.45em;
+    white-space: nowrap;
+    color: var(--ink);
+  }
+  code {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.86em;
+    background: var(--chip-bg);
+    border-radius: 4px;
+    padding: 0.1em 0.35em;
+  }
+
+  /* Callouts */
+  .callout {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 0.75rem;
+    border-radius: 6px;
+    padding: 0.85rem 1rem;
+    margin: 1.2rem 0;
+    font-size: 0.95rem;
+  }
+  .callout p { margin: 0; }
+  .callout p + p { margin-top: 0.5rem; }
+  .callout .tag {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.68rem;
+    font-weight: 500;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    align-self: start;
+    padding-top: 0.25em;
+  }
+  .callout.note  { background: var(--accent-soft); }
+  .callout.note .tag { color: var(--accent); }
+  .callout.caution { background: var(--warn-bg); }
+  .callout.caution .tag { color: var(--warn); }
+  .callout.stop { background: var(--stop-bg); }
+  .callout.stop .tag { color: var(--stop); }
+  .callout.ok { background: var(--ok-bg); }
+  .callout.ok .tag { color: var(--ok); }
+
+  /* Steps */
+  ol.steps { counter-reset: step; list-style: none; padding-left: 0; }
+  ol.steps > li {
+    counter-increment: step;
+    position: relative;
+    padding-left: 2.6rem;
+    margin-bottom: 0.9rem;
+  }
+  ol.steps > li::before {
+    content: counter(step);
+    position: absolute;
+    left: 0; top: 0.1rem;
+    width: 1.7rem; height: 1.7rem;
+    border-radius: 50%;
+    background: var(--accent);
+    color: var(--paper);
+    font-family: "Archivo", sans-serif;
+    font-weight: 700;
+    font-size: 0.85rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Tables */
+  .tbl-wrap { overflow-x: auto; margin: 1.2rem 0; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
+  table { border-collapse: collapse; width: 100%; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 0.6rem 0.9rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  th {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.68rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-soft);
+    font-weight: 500;
+    background: var(--chip-bg);
+  }
+  td:first-child { font-weight: 600; }
+
+  /* Example goal cards */
+  .goal-pair { display: grid; grid-template-columns: 1fr; gap: 0.8rem; margin: 1.2rem 0; }
+  @media (min-width: 640px) { .goal-pair { grid-template-columns: 1fr 1fr; } }
+  .goal {
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--surface);
+    padding: 0.9rem 1rem;
+    font-size: 0.93rem;
+  }
+  .goal .verdict {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.68rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    margin-bottom: 0.4rem;
+  }
+  .goal.bad .verdict { color: var(--stop); }
+  .goal.good .verdict { color: var(--ok); }
+  .goal q { font-style: italic; quotes: "“" "”"; }
+  .goal .why { color: var(--ink-soft); font-size: 0.86rem; margin-top: 0.5rem; }
+
+  /* Quick reference */
+  .quickref {
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--surface);
+    padding: 1.2rem 1.4rem 0.6rem;
+    margin-top: 1.2rem;
+  }
+  .quickref h3 { margin-top: 0; }
+  .quickref dl { display: grid; grid-template-columns: auto 1fr; gap: 0.35rem 1.1rem; margin: 0 0 1rem; }
+  .quickref dt { white-space: nowrap; }
+  .quickref dd { margin: 0; color: var(--ink-soft); font-size: 0.93rem; }
+
+  footer {
+    margin-top: 3.5rem;
+    padding-top: 1.2rem;
+    border-top: 1px solid var(--line);
+    color: var(--ink-soft);
+    font-size: 0.85rem;
+  }
+  a { color: var(--accent); }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+</style>
+
+</head>
+<body>
+<div class="doc">
+  <header>
+    <p class="eyebrow">Standard Operating Procedure · SOP-AIE-001</p>
+    <h1>Running Tasks with the AI Employee</h1>
+    <p class="lede">How to give the AI Employee a goal, watch it work, approve sensitive steps, and collect the results — written for team members with no technical background.</p>
+    <dl class="doc-control">
+      <div><dt>Version</dt><dd>1.0</dd></div>
+      <div><dt>Effective</dt><dd>21 Aug 2026</dd></div>
+      <div><dt>Applies to</dt><dd>AI Employee Web Console</dd></div>
+      <div><dt>Audience</dt><dd>All operators</dd></div>
+      <div><dt>Owner</dt><dd>Engineering (admin)</dd></div>
+    </dl>
+  </header>
+
+  <h2><span class="no">1</span>What the AI Employee is</h2>
+  <p>The AI Employee is not a chatbot. You give it <strong>one goal in plain English</strong> — for example, <em>“Research our three top competitors and write a one-page comparison”</em> — and it does the whole job: it breaks the goal into steps, assigns each step to a specialist (a researcher, an analyst, a writer, and so on), runs them, checks its own work, and hands you the finished output.</p>
+  <p>Your job as the operator is to: write a clear goal, keep an eye on progress, <strong>approve or decline</strong> anything sensitive it asks permission for, and collect the result. This document covers exactly that — nothing here requires installing software or writing code.</p>
+
+  <h2><span class="no">2</span>Before you start</h2>
+  <ul>
+    <li><strong>Access:</strong> open the console in your web browser at the address your administrator gave you (it looks like <code>http://&lt;server&gt;:8010/ui</code>). No login software or installation is needed.</li>
+    <li><strong>If the page won’t load:</strong> the server is probably not running. Contact the administrator (Section 9) — do not try to restart anything yourself.</li>
+    <li><strong>One task, one tab:</strong> each task you start gets its own tab inside the console. Old tasks stay in the left-hand list, so you can come back to them any time.</li>
+  </ul>
+
+  <h2><span class="no">3</span>Starting a task</h2>
+  <ol class="steps">
+    <li>In the box labelled <span class="ui">Give the employee a goal…</span>, type what you want done — one complete sentence, as if briefing a new colleague.</li>
+    <li>Leave the toggles as you find them unless this SOP or your administrator says otherwise. In particular, leave <strong>auto-approve off</strong> (see Section 5).</li>
+    <li>Press <span class="ui">▶ Run</span>. A new tab opens for the task and work starts immediately.</li>
+  </ol>
+
+  <h3>Writing a goal that works</h3>
+  <p>The single biggest factor in getting a good result is the goal you type. Include <strong>what</strong> you want, <strong>what the finished output should be</strong>, and any limits.</p>
+  <div class="goal-pair">
+    <div class="goal bad">
+      <div class="verdict">Too vague</div>
+      <q>Look into customer churn.</q>
+      <p class="why">No deliverable named — the employee has to guess what “look into” means, and you may get something you didn’t want.</p>
+    </div>
+    <div class="goal good">
+      <div class="verdict">Good</div>
+      <q>Analyse the attached churn spreadsheet, chart churn by month, and write a half-page summary of the top three drivers.</q>
+      <p class="why">Names the input, the outputs (a chart and a summary), and the size.</p>
+    </div>
+  </div>
+  <div class="callout note">
+    <span class="tag">Note</span>
+    <p>You don’t need to tell it <em>how</em> to do the work or which specialist to use — planning is its job. Describe the destination, not the route.</p>
+  </div>
+
+  <h2><span class="no">4</span>While it runs — the four views</h2>
+  <p>Each task tab has four views. You will mostly use the first and last.</p>
+  <div class="tbl-wrap"><table>
+    <tr><th>View</th><th>What it shows</th><th>When to use it</th></tr>
+    <tr><td><span class="ui">⬡ Flow</span></td><td>A live diagram of which specialists and tools are working right now.</td><td>Default view. Glance here to see progress and spot a pause that’s waiting on you.</td></tr>
+    <tr><td><span class="ui">🔎 Explain</span></td><td>A plain-language account of each step: what was asked, what was decided, and why.</td><td>When a result surprises you and you want to see the reasoning behind it.</td></tr>
+    <tr><td><span class="ui">≡ Logs</span></td><td>The raw technical event stream.</td><td>Only when the administrator asks you to check something specific.</td></tr>
+    <tr><td><span class="ui">★ Result</span></td><td>The finished deliverables — reports, charts, files.</td><td>When the task finishes. This is where you collect the output.</td></tr>
+  </table></div>
+  <p>You do not need to keep the page open. A running task continues on the server; close the browser, come back later, and open the task from the left-hand list to see where it got to.</p>
+
+  <h2><span class="no">5</span>Approvals — the part that needs your judgement</h2>
+  <p>Some operations are deliberately <strong>gated</strong>: before the employee downloads a large file, runs a system command, or does anything else sensitive, the task <strong>pauses</strong> and asks you. This is a safety feature, not an error.</p>
+  <p>When a task pauses for approval:</p>
+  <ol class="steps">
+    <li>Read the request text. It says exactly what the employee wants to do (for example, download a specific dataset).</li>
+    <li>Ask yourself: <em>does this clearly serve the goal I typed?</em> A task about competitor research asking to fetch a competitor’s public web page — fine. The same task asking to run an unfamiliar system command — decline and ask the administrator.</li>
+    <li>If it makes sense, press <span class="ui">Approve &amp; continue</span>. The task resumes exactly where it paused.</li>
+    <li>If you’re unsure, <strong>leave it paused</strong> and ask the administrator. A paused task loses nothing by waiting.</li>
+  </ol>
+  <div class="callout stop">
+    <span class="tag">Policy</span>
+    <p>Leave the auto-approve toggle (<em>“Never pause for approval”</em>) <strong>off</strong>. It grants every gated operation automatically and is reserved for administrators running pre-vetted jobs. If you find it switched on, switch it off and mention it to the administrator.</p>
+  </div>
+
+  <h2><span class="no">6</span>Stopping and resuming</h2>
+  <ul>
+    <li><strong>To stop a running task,</strong> press <span class="ui">Stop</span> in its tab. Progress up to the last completed step is saved automatically.</li>
+    <li><strong>To continue later,</strong> open the task and press <span class="ui">Resume from last checkpoint</span>. It carries on from where it stopped — it does not start over.</li>
+    <li>This also covers accidents: if the server restarts or your browser crashes mid-run, the task shows up as interrupted and offers the same resume button. Nothing is lost.</li>
+  </ul>
+
+  <h2><span class="no">7</span>Collecting results and asking follow-ups</h2>
+  <p>When the flow view shows the task is finished, open <span class="ui">★ Result</span>. You’ll find the written output plus any files it produced — charts, reports, spreadsheets, code. Download what you need from there; files also remain saved on the server with the task.</p>
+  <p>If the result is close but not quite right, don’t start a new task. Type into the box at the bottom of the same tab — <span class="ui">↳ Ask follow-up</span> — for example <em>“Shorten the summary to three bullet points”</em>. The employee remembers everything from the run and revises with full context.</p>
+  <div class="callout ok">
+    <span class="tag">Tip</span>
+    <p>Follow-ups in the same tab are almost always faster and better than re-running from scratch, because the research and files from the first run are reused.</p>
+  </div>
+
+  <h2><span class="no">8</span>Housekeeping — what’s safe and what isn’t</h2>
+  <div class="tbl-wrap"><table>
+    <tr><th>Control</th><th>What it does</th><th>Safe for operators?</th></tr>
+    <tr><td><span class="ui">🗑 Delete task</span></td><td>Permanently removes one saved task and its history.</td><td>Yes — but only for your own finished tasks you no longer need.</td></tr>
+    <tr><td><span class="ui">🧹 Clear memories</span></td><td>Erases everything the employee has learned across <em>all</em> tasks.</td><td><strong>No.</strong> Administrator only. (There is an <span class="ui">↩</span> restore button, but don’t rely on it.)</td></tr>
+    <tr><td><span class="ui">🔑 Keys</span></td><td>Manages the service credentials the employee uses.</td><td><strong>No.</strong> Administrator only — never edit or share keys.</td></tr>
+    <tr><td><span class="ui">📊 Usage</span></td><td>Shows how much the AI service has been used, by day.</td><td>Yes — read-only; useful if asked to report usage.</td></tr>
+  </table></div>
+
+  <h2><span class="no">9</span>Troubleshooting</h2>
+  <div class="tbl-wrap"><table>
+    <tr><th>Symptom</th><th>What it usually means</th><th>What to do</th></tr>
+    <tr><td>Page won’t load</td><td>The server is down.</td><td>Contact the administrator. Running tasks will resume once it’s back.</td></tr>
+    <tr><td>Task seems frozen</td><td>Most often it’s paused, waiting for an approval.</td><td>Check the <span class="ui">⬡ Flow</span> view for a pending approval prompt (Section 5). If there is none and nothing changes for 15+ minutes, press <span class="ui">Stop</span>, then <span class="ui">Resume from last checkpoint</span>.</td></tr>
+    <tr><td>Result is wrong or incomplete</td><td>Usually a goal that was too vague.</td><td>Use <span class="ui">↳ Ask follow-up</span> to correct it, and check <span class="ui">🔎 Explain</span> to see where it went off course. Refine the goal next time (Section 3).</td></tr>
+    <tr><td>A step shows as failed</td><td>The employee retries failed steps on its own within limits.</td><td>Wait first. If the whole task ends in failure, note the task name and time and report it (Section 10).</td></tr>
+    <tr><td>Asked to approve something odd</td><td>Possibly a planning mistake.</td><td>Don’t approve. Leave it paused and escalate.</td></tr>
+  </table></div>
+
+  <h2><span class="no">10</span>Escalation</h2>
+  <p>Contact the administrator — don’t work around the problem — when any of these happen:</p>
+  <ul>
+    <li>The console is unreachable, or every new task fails immediately.</li>
+    <li>An approval request asks for something you can’t confidently connect to your goal.</li>
+    <li>A task produced output that looks sensitive, wrong, or outward-facing (e.g. it drafted an email you didn’t expect) — <strong>do not send or publish it</strong>; flag it first.</li>
+    <li>Anything involving <span class="ui">🔑 Keys</span>, <span class="ui">🧹 Clear memories</span>, or the auto-approve toggle.</li>
+  </ul>
+  <p>When you report a problem, include: the <strong>task name</strong>, the <strong>time</strong> it happened, and a screenshot of the <span class="ui">⬡ Flow</span> view. That’s enough for the administrator to find the full record.</p>
+
+  <h2><span class="no">11</span>Quick reference</h2>
+  <div class="quickref">
+    <h3>The whole workflow in six lines</h3>
+    <dl>
+      <dt><span class="ui">▶ Run</span></dt><dd>Type a specific goal with a named deliverable, then run it.</dd>
+      <dt><span class="ui">⬡ Flow</span></dt><dd>Watch progress; this is where approval pauses appear.</dd>
+      <dt><span class="ui">Approve &amp; continue</span></dt><dd>Approve only what clearly serves your goal; unsure = leave paused &amp; ask.</dd>
+      <dt><span class="ui">★ Result</span></dt><dd>Collect the finished report, charts, and files.</dd>
+      <dt><span class="ui">↳ Ask follow-up</span></dt><dd>Refine the result in the same tab instead of re-running.</dd>
+      <dt><span class="ui">Stop</span> / <span class="ui">Resume</span></dt><dd>Pause any time; it always continues from the last saved step.</dd>
+    </dl>
+  </div>
+
+  <footer>
+    <p>SOP-AIE-001 · v1.0 · Review due Feb 2027. Questions and change requests go to the document owner (Engineering). This procedure covers operator use of the AI Employee Web Console only; installation and configuration are covered in the administrator runbook.</p>
+  </footer>
+</div>
+
+</body>
+</html>
