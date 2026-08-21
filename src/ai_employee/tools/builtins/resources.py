@@ -10,6 +10,8 @@ from pydantic import BaseModel, Field
 
 from ai_employee.config import Settings
 from ai_employee.core.exceptions import ApprovalRequired
+from ai_employee.core.logging import get_logger
+from ai_employee.observability.asset_registry import AssetRegistry
 from ai_employee.observability.resource_ctx import (
     get_approved_ops,
     get_resource_decision,
@@ -32,6 +34,8 @@ from ai_employee.verification.resources import (
     format_waiting_for_user_message,
     is_manual_download_error,
 )
+
+log = get_logger("resources")
 
 _HUB_TOOLS = (
     "hf_search",
@@ -135,11 +139,7 @@ class HubSearchAllTool(Tool):
         for hub, tool in tools:
             try:
                 if tool.name == "hf_search":
-                    hf_kind = (
-                        "datasets"
-                        if args.kind in {"tabular", "image", "speech"}
-                        else "both"
-                    )
+                    hf_kind = "datasets" if args.kind in {"tabular", "image", "speech"} else "both"
                     r = await tool.execute(query=args.query, kind=hf_kind, limit=args.limit)
                 elif tool.name == "youtube_search":
                     r = await tool.execute(query=args.query, max_results=args.limit)
@@ -204,6 +204,37 @@ class DownloadResourceTool(Tool):
         except ValueError as exc:
             return ToolResult(ok=False, error=str(exc))
 
+        # Bandwidth guard: if this exact URL was already fetched into the workspace
+        # and the file is still there, hand back the local copy. Context tells the
+        # agent to prefer local assets, but context is advisory — this is the check
+        # that actually guarantees we never pull the same bytes twice.
+        registry = AssetRegistry(ws)
+        cached = registry.find_by_url(url)
+        if cached is not None:
+            local = ws / cached.path
+            registry.touch(cached.path)
+            log.info("download_skipped_cached", url=url, path=cached.path)
+            return ToolResult(
+                ok=True,
+                output={
+                    "path": str(local),
+                    "bytes": cached.bytes,
+                    "source": cached.source,
+                    "cached": True,
+                    "note": (
+                        "Already present in the workspace — reused the existing copy "
+                        "instead of downloading again."
+                    ),
+                },
+                metadata={
+                    "source": cached.source,
+                    "local_path": str(local),
+                    "canonical_destination": str(local),
+                    "session_id": session_id,
+                    "cache_hit": True,
+                },
+            )
+
         kind = args.source_hint if args.source_hint != "auto" else detect_source(url)
 
         async def run_shell(cmd: list[str]) -> tuple[int, str, str]:
@@ -255,6 +286,13 @@ class DownloadResourceTool(Tool):
                 info = await download_github(url, dest, run_shell=run_shell)
             else:
                 info = await download_http(url, dest)
+            # Index it so any later task — in any session — finds it without a refetch.
+            registry.record(
+                path=info.get("path") or dest,
+                source=kind,
+                url=url,
+                session_id=session_id or "",
+            )
             return ToolResult(
                 ok=True,
                 output=info,
@@ -396,11 +434,83 @@ def _credential_hint(kind: str, settings: Settings, error: str = "") -> str:
     return ""
 
 
+class SearchLocalAssetsTool(Tool):
+    """Look up already-downloaded models/datasets before hitting the network."""
+
+    name = "search_local_assets"
+    description = (
+        "Search models, datasets and files ALREADY downloaded in this workspace. "
+        "Call this FIRST, before hf_search / kaggle_search / github_search / "
+        "download_resource — if a suitable asset is already local, use its path "
+        "instead of downloading it again. Leave the query empty to list everything. "
+        "Read-only and offline: no network, no approval needed."
+    )
+    category = "research"
+
+    def __init__(self, settings: Settings) -> None:
+        self._ws = settings.workspace_dir
+
+    class Args(BaseModel):
+        query: str = Field(
+            "",
+            description="What you need, e.g. 'defect detection model'. Empty lists all.",
+        )
+        kind: str = Field(
+            "",
+            description="Optional filter: model | dataset | repo | media | file",
+        )
+
+    async def _run(self, args: SearchLocalAssetsTool.Args) -> ToolResult:
+        ws = ensure_workspace(self._ws)
+        registry = AssetRegistry(ws)
+        if args.query.strip():
+            records = registry.find(args.query, limit=20)
+            if args.kind:
+                records = [r for r in records if r.kind == args.kind]
+        else:
+            records = registry.list_assets(kind=args.kind.strip())
+
+        items = [
+            {
+                "identifier": r.identifier,
+                "kind": r.kind,
+                "path": str(ws / r.path),
+                "relative_path": r.path,
+                "source": r.source,
+                "url": r.url,
+                "bytes": r.bytes,
+            }
+            for r in records
+        ]
+        if not items:
+            return ToolResult(
+                ok=True,
+                output={
+                    "assets": [],
+                    "count": 0,
+                    "note": ("Nothing local matches. Searching the hubs is appropriate now."),
+                },
+            )
+        return ToolResult(
+            ok=True,
+            output={
+                "assets": items,
+                "count": len(items),
+                "note": (
+                    "These are already on disk — use one of these paths instead of "
+                    "downloading again unless the user asked for something new."
+                ),
+            },
+            metadata={"count": len(items)},
+        )
+
+
 def build_resource_tools(settings: Settings) -> list[Tool]:
     return [
         YoutubeSearchTool(settings),
         HubSearchAllTool(settings),
         DownloadResourceTool(settings),
+        SearchLocalAssetsTool(settings),
         RequestResourceInputTool(),
     ]
 
@@ -409,6 +519,7 @@ __all__ = [
     "YoutubeSearchTool",
     "HubSearchAllTool",
     "DownloadResourceTool",
+    "SearchLocalAssetsTool",
     "RequestResourceInputTool",
     "build_resource_tools",
 ]

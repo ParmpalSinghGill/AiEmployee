@@ -389,9 +389,7 @@ def audit_resources(
         and not any(_url_was_verified(u, trace) for u in urls)
         and outcome not in ("waiting_for_user", "completed")
     ):
-        issues.append(
-            "Success criteria require verification but no tool confirmed any listed URL."
-        )
+        issues.append("Success criteria require verification but no tool confirmed any listed URL.")
 
     return {
         "applies": True,

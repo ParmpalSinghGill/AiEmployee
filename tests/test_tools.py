@@ -103,3 +103,61 @@ def test_tool_spec_shape(registry):
     spec = registry.get("read_file").to_spec()
     assert spec.name == "read_file"
     assert spec.parameters["type"] == "object"
+
+
+@pytest.mark.asyncio
+async def test_list_dir_recursive_replaces_level_by_level_walking(tmp_path) -> None:
+    """Agents walked deep dataset trees one level at a time, tripping the duplicate
+    guard. One recursive call now returns the whole tree."""
+    from ai_employee.tools.builtins.filesystem import ListDirTool
+
+    for split in ("train", "validation"):
+        for cls in ("crazing", "scratches"):
+            d = tmp_path / "NEU-DET" / split / "images" / cls
+            d.mkdir(parents=True)
+            for i in range(3):
+                (d / f"{cls}_{i}.jpg").write_bytes(b"x")
+
+    tool = ListDirTool(tmp_path)
+
+    flat = await tool.execute(path="NEU-DET")
+    assert sorted(e["name"] for e in flat.output) == ["train", "validation"]
+
+    rec = await tool.execute(path="NEU-DET", recursive=True)
+    assert rec.metadata["count"] == 12
+    assert all(e["type"] == "file" for e in rec.output)
+    assert any(e["name"].startswith("train/images/crazing/") for e in rec.output)
+
+
+@pytest.mark.asyncio
+async def test_list_dir_truncation_points_at_python_exec(tmp_path) -> None:
+    from ai_employee.tools.builtins.filesystem import ListDirTool
+
+    d = tmp_path / "big"
+    d.mkdir()
+    for i in range(20):
+        (d / f"f{i}.txt").write_bytes(b"x")
+
+    out = await ListDirTool(tmp_path).execute(path="big", recursive=True, max_entries=5)
+    assert len(out.output) == 5
+    assert out.metadata["count"] == 20
+    assert out.metadata["truncated"] is True
+    # The agent must be told to compute, not to list again.
+    assert "python_exec" in out.metadata["note"]
+
+
+def test_duplicate_message_names_the_next_step() -> None:
+    """A bare 'duplicate' left the model retrying near-identical calls."""
+    from ai_employee.tools.base import ToolResult
+    from ai_employee.tools.invocation_history import duplicate_payload
+
+    prev = ToolResult(ok=True, output="listing")
+    generic = duplicate_payload(prev)
+    assert "materially different" in generic["message"]
+
+    listing = duplicate_payload(prev, "list_dir")
+    assert "python_exec" in listing["message"]
+    assert "recursive=true" in listing["message"]
+
+    hub = duplicate_payload(prev, "hf_search")
+    assert "kaggle_search" in hub["message"]

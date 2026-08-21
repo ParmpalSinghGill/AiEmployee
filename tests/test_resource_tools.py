@@ -6,7 +6,11 @@ from pathlib import Path
 
 import pytest
 
-from ai_employee.tools.builtins.resource_download import build_ytdlp_command, detect_source, youtube_needs_cookies
+from ai_employee.tools.builtins.resource_download import (
+    build_ytdlp_command,
+    detect_source,
+    youtube_needs_cookies,
+)
 
 
 def test_detect_source_youtube() -> None:
@@ -224,9 +228,14 @@ def test_canonical_artifact_dest_routes_into_three_workspace_buckets(tmp_path: P
 
 
 @pytest.mark.asyncio
-async def test_download_resource_tool_canonicalizes_session_destination(tmp_path: Path, monkeypatch) -> None:
+async def test_download_resource_tool_canonicalizes_session_destination(
+    tmp_path: Path, monkeypatch
+) -> None:
     from ai_employee.config import get_settings
-    from ai_employee.observability.resource_ctx import bind_resource_session, clear_resource_decision
+    from ai_employee.observability.resource_ctx import (
+        bind_resource_session,
+        clear_resource_decision,
+    )
     from ai_employee.tools.builtins.resources import DownloadResourceTool
 
     settings = get_settings().model_copy(deep=True)
@@ -237,7 +246,7 @@ async def test_download_resource_tool_canonicalizes_session_destination(tmp_path
 
     async def fake_download_http(url: str, dest: Path, *, timeout: int = 120) -> dict[str, object]:
         seen["dest"] = dest
-        dest.write_bytes(b"x")
+        dest.write_bytes(b"x")  # noqa: ASYNC240 — tiny write in a test fake
         return {"path": str(dest), "bytes": 1, "source": "http"}
 
     monkeypatch.setattr("ai_employee.tools.builtins.resources.download_http", fake_download_http)
@@ -383,3 +392,81 @@ def test_hub_search_all_tabular_skips_video_hubs() -> None:
     assert "roboflow" in image and "youtube" not in image
     speech = hubs_for_kind("speech")
     assert "huggingface" in speech and "youtube" not in speech and "roboflow" not in speech
+
+
+@pytest.mark.asyncio
+async def test_download_resource_reuses_cached_copy_across_sessions(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A URL fetched once must never be downloaded again — this is the bandwidth saving."""
+    from ai_employee.config import get_settings
+    from ai_employee.observability.resource_ctx import bind_resource_session
+    from ai_employee.tools.builtins.resources import DownloadResourceTool
+
+    settings = get_settings().model_copy(deep=True)
+    settings.workspace_dir = tmp_path / "workspace"
+    settings.workspace_dir.mkdir(parents=True)
+
+    calls = {"n": 0}
+
+    async def fake_download_http(url: str, dest: Path, *, timeout: int = 120) -> dict[str, object]:
+        calls["n"] += 1
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"payload")  # noqa: ASYNC240 - test fixture, sync fs is fine
+        return {"path": str(dest), "bytes": 7, "source": "http"}
+
+    monkeypatch.setattr("ai_employee.tools.builtins.resources.download_http", fake_download_http)
+
+    url = "https://example.com/files/corpus.zip"
+    tool = DownloadResourceTool(settings)
+
+    bind_resource_session("sess-one")
+    first = await tool.execute(url=url, destination="./corpus.zip", approved=True)
+    assert first.ok
+    assert calls["n"] == 1
+
+    # A different session — i.e. a brand-new task — must hit the cache, not the network.
+    bind_resource_session("sess-two")
+    second = await tool.execute(url=url, destination="./corpus.zip", approved=True)
+    assert second.ok
+    assert calls["n"] == 1, "second download re-fetched the same URL"
+    assert second.output["cached"] is True
+    assert second.metadata["cache_hit"] is True
+    assert Path(second.output["path"]).exists()  # noqa: ASYNC240 - test fixture, sync fs is fine
+
+
+@pytest.mark.asyncio
+async def test_download_resource_refetches_when_local_copy_deleted(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The ledger is an index, not the truth — a deleted file must download again."""
+    from ai_employee.config import get_settings
+    from ai_employee.observability.resource_ctx import bind_resource_session
+    from ai_employee.tools.builtins.resources import DownloadResourceTool
+
+    settings = get_settings().model_copy(deep=True)
+    settings.workspace_dir = tmp_path / "workspace"
+    settings.workspace_dir.mkdir(parents=True)
+
+    calls = {"n": 0}
+
+    async def fake_download_http(url: str, dest: Path, *, timeout: int = 120) -> dict[str, object]:
+        calls["n"] += 1
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"payload")  # noqa: ASYNC240 - test fixture, sync fs is fine
+        return {"path": str(dest), "bytes": 7, "source": "http"}
+
+    monkeypatch.setattr("ai_employee.tools.builtins.resources.download_http", fake_download_http)
+
+    url = "https://example.com/files/corpus.zip"
+    tool = DownloadResourceTool(settings)
+    bind_resource_session("sess-one")
+
+    first = await tool.execute(url=url, destination="./corpus.zip", approved=True)
+    assert first.ok and calls["n"] == 1
+
+    Path(first.output["path"]).unlink()  # noqa: ASYNC240 - test fixture, sync fs is fine
+
+    again = await tool.execute(url=url, destination="./corpus.zip", approved=True)
+    assert again.ok
+    assert calls["n"] == 2, "deleted file should have been re-downloaded"

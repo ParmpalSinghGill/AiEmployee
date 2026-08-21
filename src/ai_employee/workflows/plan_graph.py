@@ -68,9 +68,7 @@ class GuideStep(BaseModel):
     depends_on: list[int] = Field(
         default_factory=list, description="Earlier step ids that must finish first."
     )
-    success_criteria: str = Field(
-        default="", description="How to know this step is done."
-    )
+    success_criteria: str = Field(default="", description="How to know this step is done.")
     tips: str = Field(default="", description="Optional pitfalls or alternatives.")
 
 
@@ -164,9 +162,7 @@ class PlanOrchestrator:
         )
         notes = ""
         try:
-            agent_name = (
-                "plan_researcher" if "plan_researcher" in self._agents.names() else "scout"
-            )
+            agent_name = "plan_researcher" if "plan_researcher" in self._agents.names() else "scout"
             res = await self._agents.get(agent_name).run(task, ctx)
             notes = res.output or ""
         except Exception as exc:  # noqa: BLE001
@@ -306,9 +302,8 @@ class PlanOrchestrator:
                 success_criteria="Result meets acceptance criteria and is reproducible.",
             ),
         ]
-        summary = (
-            f"Fallback how-to plan for: {goal}."
-            + (f" (LLM unavailable: {error})" if error else "")
+        summary = f"Fallback how-to plan for: {goal}." + (
+            f" (LLM unavailable: {error})" if error else ""
         )
         approach = (
             "Start with clear success criteria, prefer open-source tooling when viable, "

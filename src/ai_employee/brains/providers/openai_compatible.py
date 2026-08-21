@@ -7,6 +7,7 @@ Subclasses only declare base URL, key, model names and capability flags.
 
 from __future__ import annotations
 
+import re
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
@@ -248,6 +249,68 @@ def _to_openai_message(m: Message) -> dict[str, Any]:
     return out
 
 
+# DeepSeek's native tool-call markup, which occasionally arrives as plain text in
+# `content` rather than as structured `tool_calls`. The sentinel uses full-width
+# bars (U+FF5C), sometimes rendered with ASCII pipes by intermediate proxies.
+_BAR = r"[｜|]"
+_INLINE_INVOKE_RE = re.compile(
+    rf"<{_BAR}*\s*DSML{_BAR}*invoke\s+name=\"(?P<name>[\w.-]+)\"\s*>(?P<body>.*?)"
+    rf"(?=<{_BAR}*\s*DSML{_BAR}*invoke|<\s*/{_BAR}*\s*DSML{_BAR}*tool_calls|\Z)",
+    re.DOTALL | re.IGNORECASE,
+)
+_INLINE_PARAM_RE = re.compile(
+    rf"<{_BAR}*\s*DSML{_BAR}*parameter\s+name=\"(?P<key>[\w.-]+)\""
+    rf"(?P<attrs>[^>]*)>(?P<value>.*?)<\s*/{_BAR}*\s*DSML{_BAR}*parameter\s*>",
+    re.DOTALL | re.IGNORECASE,
+)
+_INLINE_ANY_RE = re.compile(rf"<\s*/?{_BAR}*\s*DSML{_BAR}*[^>]*>", re.IGNORECASE)
+
+
+def _has_inline_tool_markup(text: str) -> bool:
+    return bool(text) and "DSML" in text and "invoke" in text
+
+
+def _coerce_param(raw: str, attrs: str) -> Any:
+    """Best-effort typing for a leaked parameter value.
+
+    The markup carries hints like ``string="true"``; otherwise fall back to JSON
+    so lists/objects/numbers survive, and finally to the trimmed string.
+    """
+    import json
+
+    value = raw.strip()
+    if re.search(r'string\s*=\s*"true"', attrs or "", re.IGNORECASE):
+        return value
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, ValueError):
+        return value
+
+
+def _recover_inline_tool_calls(content: str) -> tuple[list[ToolCall], str]:
+    """Parse leaked DSML markup into tool calls; return them and the cleaned text."""
+    calls: list[ToolCall] = []
+    for i, m in enumerate(_INLINE_INVOKE_RE.finditer(content)):
+        name = m.group("name")
+        args: dict[str, Any] = {}
+        for p in _INLINE_PARAM_RE.finditer(m.group("body") or ""):
+            args[p.group("key")] = _coerce_param(p.group("value"), p.group("attrs"))
+        calls.append(ToolCall(id=f"recovered_{i}", name=name, arguments=args))
+
+    if not calls:
+        return [], content
+
+    # Drop everything from the first sentinel onward, then clear stray tags so the
+    # model's genuine prose (if any) survives as the message content.
+    start = content.find("<")
+    prose = content[:start] if start > 0 else ""
+    cleaned = _INLINE_ANY_RE.sub("", prose).strip()
+    log.warning(
+        "brain.recovered_inline_tool_calls", count=len(calls), tools=[c.name for c in calls]
+    )
+    return calls, cleaned
+
+
 def _parse_completion(resp: Any) -> ChatResult:
     import json
 
@@ -260,6 +323,18 @@ def _parse_completion(resp: Any) -> ChatResult:
         except json.JSONDecodeError:
             args = {"_raw": tc.function.arguments}
         tool_calls.append(ToolCall(id=tc.id, name=tc.function.name, arguments=args))
+
+    content = msg.content or ""
+    # Some DeepSeek responses emit their native tool-call markup as plain text
+    # instead of structured tool_calls. Without recovery the agent loop sees no
+    # call, treats the raw markup as its final answer, and the step fails
+    # verification. Parse the markup back into real calls and strip it from
+    # the visible content.
+    if not tool_calls and _has_inline_tool_markup(content):
+        recovered, cleaned = _recover_inline_tool_calls(content)
+        if recovered:
+            tool_calls = recovered
+            content = cleaned
 
     usage = Usage()
     if resp.usage:
@@ -276,7 +351,7 @@ def _parse_completion(resp: Any) -> ChatResult:
         extra["reasoning_content"] = reasoning
 
     return ChatResult(
-        content=msg.content or "",
+        content=content,
         tool_calls=tool_calls,
         finish_reason=choice.finish_reason,
         model=resp.model,

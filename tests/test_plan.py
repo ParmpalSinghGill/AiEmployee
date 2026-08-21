@@ -102,3 +102,81 @@ async def test_plan_mode_task_surfaces_guide(client):
     assert result["steps"]
     assert "summary" in result
     assert "tools" in result
+
+
+# ── Dependency pruning ───────────────────────────────────────────────────────
+# Planners over-link: writing depends_on=[1,2,3,4] when 4 already depends on the
+# rest. Those transitive edges don't change ordering, but the parallel scheduler
+# treats each as a real constraint, so an over-linked plan serializes needlessly.
+
+
+def _steps(*specs):
+    from ai_employee.planning.planner import PlanStep
+
+    return [
+        PlanStep(id=i, description=f"s{i}", agent="research", depends_on=list(d)) for i, d in specs
+    ]
+
+
+def test_prune_drops_transitive_dependencies() -> None:
+    from ai_employee.planning.planner import prune_redundant_dependencies
+
+    # 5 depends on everything, but 4 already depends on 1,2,3 transitively.
+    steps = _steps((1, []), (2, []), (3, [1]), (4, [2, 3]), (5, [1, 2, 3, 4]))
+    prune_redundant_dependencies(steps)
+
+    by_id = {s.id: s.depends_on for s in steps}
+    assert by_id[5] == [4], "only the direct dependency should remain"
+    assert by_id[4] == [2, 3]
+    assert by_id[1] == [] and by_id[2] == []
+
+
+def test_prune_improves_achievable_parallelism() -> None:
+    from ai_employee.planning.planner import prune_redundant_dependencies
+    from ai_employee.workflows.scheduler import describe_schedule
+
+    # Over-linked: 3 and 4 both list 1 and 2 though 2 already depends on 1.
+    steps = _steps((1, []), (2, [1]), (3, [1, 2]), (4, [1, 2]), (5, [1, 2, 3, 4]))
+    prune_redundant_dependencies(steps)
+
+    shape = describe_schedule([{"id": s.id, "depends_on": s.depends_on} for s in steps])
+    assert shape["waves"] == [[1], [2], [3, 4], [5]]
+    # 5's four links collapse to the two that actually gate it.
+    assert {s.id: s.depends_on for s in steps}[5] == [3, 4]
+
+
+def test_prune_keeps_genuine_dependencies() -> None:
+    """Pruning must never make a dependent step runnable too early."""
+    from ai_employee.planning.planner import prune_redundant_dependencies
+
+    steps = _steps((1, []), (2, []), (3, [1]), (4, [1, 2]), (5, [4]))
+    prune_redundant_dependencies(steps)
+
+    by_id = {s.id: s.depends_on for s in steps}
+    assert by_id[3] == [1]
+    assert by_id[4] == [1, 2], "1 and 2 are independent, so both are direct"
+    assert by_id[5] == [4]
+
+
+def test_prune_removes_self_and_unknown_links() -> None:
+    from ai_employee.planning.planner import prune_redundant_dependencies
+
+    steps = _steps((1, [1]), (2, [99, 1]), (3, [2, 2]))
+    prune_redundant_dependencies(steps)
+
+    by_id = {s.id: s.depends_on for s in steps}
+    assert by_id[1] == []  # self-reference dropped
+    assert by_id[2] == [1]  # unknown id 99 dropped
+    assert by_id[3] == [2]  # duplicate collapsed
+
+
+def test_prune_breaks_cycles_so_the_plan_can_schedule() -> None:
+    from ai_employee.planning.planner import prune_redundant_dependencies
+    from ai_employee.workflows.scheduler import schedule_rounds
+
+    steps = _steps((1, [3]), (2, [1]), (3, [2]))
+    prune_redundant_dependencies(steps)
+
+    waves = schedule_rounds([{"id": s.id, "depends_on": s.depends_on} for s in steps])
+    assert sorted(i for w in waves for i in w) == [1, 2, 3]
+    assert {s.id: s.depends_on for s in steps}[1] == []

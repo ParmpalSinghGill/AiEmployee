@@ -84,6 +84,12 @@ class MemorySettingsRequest(BaseModel):
     save_default: bool = False
 
 
+class ParallelSettingsRequest(BaseModel):
+    parallel_steps: bool
+    max_parallel_steps: int | None = None
+    save_default: bool = False
+
+
 class KeyValueRequest(BaseModel):
     value: str = Field(min_length=1)
 
@@ -482,6 +488,39 @@ async def set_memory_settings(req: MemorySettingsRequest) -> dict:
     }
 
 
+@router.get("/ui/api/parallel/settings", tags=["ui"])
+async def get_parallel_settings() -> dict:
+    """Current parallel-execution mode and its saved default."""
+    from ai_employee.config.ui_preferences import read_preferences
+
+    s = get_settings()
+    prefs = read_preferences(s)
+    saved = prefs.get("parallel_steps")
+    return {
+        "parallel_steps": s.parallel_steps,
+        "max_parallel_steps": s.max_parallel_steps,
+        "saved_default": saved if isinstance(saved, bool) else None,
+    }
+
+
+@router.post("/ui/api/parallel/settings", tags=["ui"])
+async def set_parallel_settings(req: ParallelSettingsRequest) -> dict:
+    """Turn multi-agent parallel step execution on or off."""
+    from ai_employee.config.ui_preferences import save_parallel_default
+
+    s = get_settings()
+    s.parallel_steps = req.parallel_steps
+    if req.max_parallel_steps and req.max_parallel_steps > 0:
+        s.max_parallel_steps = int(req.max_parallel_steps)
+    if req.save_default:
+        save_parallel_default(s, req.parallel_steps, s.max_parallel_steps)
+    return {
+        "parallel_steps": s.parallel_steps,
+        "max_parallel_steps": s.max_parallel_steps,
+        "saved_default": req.save_default,
+    }
+
+
 @router.post("/ui/api/memory/restore", tags=["ui"])
 async def restore_memories(emp: AIEmployee = Depends(get_employee)) -> dict:
     """Reload memory from the archive saved before the last clear."""
@@ -576,12 +615,15 @@ async def workspace_media(
         # a large image dataset degrades to a sample instead of flooding the page.
         # ``since`` scopes results to files this run created — the workspace is
         # shared, so without it older runs' charts appear in every gallery.
+        # Dataset content is excluded outright: this sweep asks "what did the run
+        # produce?", and downloaded training images are inputs, not results.
         return sample_media(
             get_settings().workspace_dir,
             [*flat, "."],
             sample_when_over=60,
             sample_size=60,
             modified_since=since,
+            exclude_dataset_content=True,
         )
     if not flat:
         return {"videos": [], "images": [], "total": 0, "shown": 0, "sampled": False}

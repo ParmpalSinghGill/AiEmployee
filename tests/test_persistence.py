@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from ai_employee.memory import MemoryNamespace
 from ai_employee.memory.in_memory import InMemoryVectorStore
 from ai_employee.memory.manager import MemoryManager

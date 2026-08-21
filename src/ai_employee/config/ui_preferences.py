@@ -57,10 +57,13 @@ def read_preferences(settings: Settings) -> dict[str, Any]:
             "model": data.get("llm_model"),
         }
     use_mem = data.get("use_stored_memory")
+    parallel = data.get("parallel_steps")
     return {
         "brain": brain,
         "coding_backend": data.get("coding_backend"),
         "use_stored_memory": use_mem if isinstance(use_mem, bool) else None,
+        "parallel_steps": parallel if isinstance(parallel, bool) else None,
+        "max_parallel_steps": data.get("max_parallel_steps"),
     }
 
 
@@ -90,6 +93,14 @@ def apply_ui_preferences(settings: Settings) -> bool:
     use_mem = data.get("use_stored_memory")
     if isinstance(use_mem, bool):
         settings.use_stored_memory = use_mem
+        applied = True
+    parallel = data.get("parallel_steps")
+    if isinstance(parallel, bool):
+        settings.parallel_steps = parallel
+        applied = True
+    max_par = data.get("max_parallel_steps")
+    if isinstance(max_par, int) and max_par > 0:
+        settings.max_parallel_steps = max_par
         applied = True
     if applied:
         log.info(
@@ -121,6 +132,17 @@ def save_coding_default(settings: Settings, backend: str) -> None:
     log.info("ui_prefs.coding_saved", backend=backend)
 
 
+def save_parallel_default(
+    settings: Settings, parallel_steps: bool, max_parallel_steps: int | None = None
+) -> None:
+    data = _load(settings)
+    data["parallel_steps"] = parallel_steps
+    if max_parallel_steps and max_parallel_steps > 0:
+        data["max_parallel_steps"] = int(max_parallel_steps)
+    _save(settings, data)
+    log.info("ui_prefs.parallel_saved", parallel_steps=parallel_steps)
+
+
 def save_memory_default(settings: Settings, use_stored_memory: bool) -> None:
     data = _load(settings)
     data["use_stored_memory"] = use_stored_memory
@@ -134,4 +156,5 @@ __all__ = [
     "save_brain_default",
     "save_coding_default",
     "save_memory_default",
+    "save_parallel_default",
 ]

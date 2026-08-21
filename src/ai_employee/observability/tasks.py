@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import uuid
 from datetime import UTC, datetime
 from enum import Enum
@@ -99,6 +100,8 @@ class TaskRecord:
         self.approved_ops: set[str] = set()
         self.resource_decision: dict[str, Any] | None = None
         self.resumable = False
+        # Last time a mid-run checkpoint was stored (used to show resume freshness).
+        self.progress_saved_at: datetime | None = None
         # When True, never pause for approval — grant every gated op automatically.
         self.auto_approve: bool = False
 
@@ -133,6 +136,19 @@ class TaskRecord:
             "approved_ops": sorted(self.approved_ops),
             "resource_decision": self.resource_decision,
             "resumable": self.resumable,
+            "can_resume": self.can_resume(),
+            "progress_saved_at": (
+                self.progress_saved_at.isoformat() if self.progress_saved_at else None
+            ),
+            "completed_steps": len(
+                ((self.result or {}).get("workflow_checkpoint") or {}).get("step_results") or []
+            ),
+            "planned_steps": len(
+                (((self.result or {}).get("workflow_checkpoint") or {}).get("plan") or {}).get(
+                    "steps"
+                )
+                or []
+            ),
             "auto_approve": self.auto_approve,
         }
 
@@ -301,7 +317,9 @@ class TaskManager:
         resume: bool = False,
     ) -> None:
         """(Re)start a task's execution in the background, tracking its handle."""
-        handle = asyncio.create_task(self._execute(employee, task, approval=approval, resume=resume))
+        handle = asyncio.create_task(
+            self._execute(employee, task, approval=approval, resume=resume)
+        )
         self._handles[task.id] = handle
         handle.add_done_callback(lambda _h, tid=task.id: self._handles.pop(tid, None))
 
@@ -388,6 +406,22 @@ class TaskManager:
         handle.cancel()
         return True
 
+    def _record_progress(self, task: TaskRecord, checkpoint: dict[str, Any]) -> None:
+        """Store a mid-run checkpoint so an interrupted task stays resumable.
+
+        Only the checkpoint is written — never an ``answer`` — so a partially
+        finished run is never mistaken for a completed one.
+        """
+        if not checkpoint or not checkpoint.get("plan"):
+            return
+        result = dict(task.result or {})
+        result["workflow_checkpoint"] = checkpoint
+        result.setdefault("goal", task.goal)
+        result.setdefault("steps", checkpoint.get("step_results") or [])
+        result.setdefault("plan", checkpoint.get("plan"))
+        task.result = result
+        task.progress_saved_at = _now()
+
     async def _execute(
         self,
         employee: Any,
@@ -448,14 +482,19 @@ class TaskManager:
                         resource_decision=task.resource_decision,
                     )
                 else:
-                    result = await employee.run(
-                        task.goal,
-                        session_id=task.session_id,
-                        approved_ops=approved_ops,
-                        resource_decision=task.resource_decision,
-                        workflow_checkpoint=checkpoint if should_resume else None,
-                        session_context=session_context,
-                    )
+                    kwargs: dict[str, Any] = {
+                        "session_id": task.session_id,
+                        "approved_ops": approved_ops,
+                        "resource_decision": task.resource_decision,
+                        "workflow_checkpoint": checkpoint if should_resume else None,
+                        "session_context": session_context,
+                    }
+                    # Progress checkpoints keep an interrupted run resumable, but
+                    # only pass the hook to a run() that accepts it — tests and
+                    # custom employees may implement a narrower signature.
+                    if _accepts_kwarg(employee.run, "on_progress"):
+                        kwargs["on_progress"] = lambda cp, t=task: self._record_progress(t, cp)
+                    result = await employee.run(task.goal, **kwargs)
                 task.result = result
                 pending = result.get("needs_approval")
                 if not pending:
@@ -470,9 +509,11 @@ class TaskManager:
                     break
                 # Grant every related op and continue without pausing the UI.
                 op = (pending or {}).get("operation")
-                task.approved_ops = set(task.approved_ops) | _expand_approved_ops(
-                    op, pending, approve_all_similar=True
-                ) | _auto_approve_ops()
+                task.approved_ops = (
+                    set(task.approved_ops)
+                    | _expand_approved_ops(op, pending, approve_all_similar=True)
+                    | _auto_approve_ops()
+                )
                 if op == "waiting_for_user" and not task.resource_decision:
                     task.resource_decision = {"decision": "proceed_without"}
                 cleared = dict(result)
@@ -495,12 +536,16 @@ class TaskManager:
             # state and let the cancellation propagate so the asyncio task ends.
             task.status = TaskStatus.cancelled
             task.error = "cancelled by user"
-            log.info("task.cancelled")
+            # Progress checkpoints are saved as steps finish, so a stopped run can
+            # continue from the last completed step instead of starting over.
+            task.resumable = _resume_checkpoint(task.result) is not None
+            log.info("task.cancelled", resumable=task.resumable)
             raise
         except Exception as exc:  # noqa: BLE001 - surface failure to the UI
             task.status = TaskStatus.failed
             task.error = f"{type(exc).__name__}: {exc}"
-            log.warning("task.failed", error=task.error)
+            task.resumable = _resume_checkpoint(task.result) is not None
+            log.warning("task.failed", error=task.error, resumable=task.resumable)
         finally:
             task.finished_at = _now()
             structlog.contextvars.unbind_contextvars("task_id")
@@ -581,7 +626,32 @@ class TaskManager:
 
     # ── Queries ──────────────────────────────────────────────────────────────
     def get_task(self, task_id: str) -> TaskRecord | None:
-        return self._tasks.get(task_id)
+        task = self._tasks.get(task_id)
+        if task is not None:
+            self._reconcile_liveness(task)
+        return task
+
+    def _reconcile_liveness(self, task: TaskRecord) -> None:
+        """Flip a 'running' task to stopped when its worker is no longer alive.
+
+        A run whose asyncio task died without reaching the except handlers (the
+        event loop went away, the worker was killed) would otherwise sit at
+        'running' forever and the UI would poll it indefinitely. The UI polls this
+        every second, so a dead task is surfaced within a second or two.
+        """
+        if task.status not in {TaskStatus.running, TaskStatus.pending}:
+            return
+        handle = self._handles.get(task.id)
+        if handle is not None and not handle.done():
+            return  # genuinely still running
+        if handle is None and task.status == TaskStatus.pending:
+            return  # queued by startup, not yet launched
+        task.status = TaskStatus.failed
+        task.error = task.error or "interrupted (worker stopped)"
+        task.resumable = _resume_checkpoint(task.result) is not None
+        task.finished_at = task.finished_at or _now()
+        log.warning("task.stopped_unexpectedly", task_id=task.id, resumable=task.resumable)
+        self._persist_task(task)
 
     def list_sessions(self) -> list[dict[str, Any]]:
         out = []
@@ -617,18 +687,39 @@ class TaskManager:
         return [self._tasks[t] for t in s.task_ids if t in self._tasks]
 
     def _build_session_context(self, task: TaskRecord) -> str:
-        """Context from earlier runs in this session (loaded from disk after restart)."""
+        """Context for a run: local asset inventory + earlier runs in this session.
+
+        The inventory is workspace-wide and deliberately *not* session-scoped — a
+        brand-new task must still know what has already been downloaded so it
+        reuses those files instead of spending bandwidth re-fetching them.
+        """
+        from ai_employee.observability.asset_registry import (
+            AssetRegistry,
+            build_local_inventory_context,
+        )
         from ai_employee.observability.session_context import build_prior_session_context
 
+        parts: list[str] = []
+        try:
+            from ai_employee.config import get_settings
+
+            inventory = build_local_inventory_context(AssetRegistry(get_settings().workspace_dir))
+            if inventory:
+                parts.append(inventory)
+        except Exception as exc:  # noqa: BLE001 - inventory must never break a run
+            log.warning("asset_inventory_failed", error=str(exc))
+
         session = self._sessions.get(task.session_id)
-        if not session:
-            return ""
-        prior = [
-            self._tasks[tid]
-            for tid in session.task_ids
-            if tid != task.id and tid in self._tasks
-        ]
-        return build_prior_session_context(prior)
+        if session:
+            prior = [
+                self._tasks[tid]
+                for tid in session.task_ids
+                if tid != task.id and tid in self._tasks
+            ]
+            prior_ctx = build_prior_session_context(prior)
+            if prior_ctx:
+                parts.append(prior_ctx)
+        return "\n\n".join(parts)
 
     def session_detail(self, session_id: str) -> dict[str, Any] | None:
         """Full session payload (meta + every run's snapshot) for opening/resuming."""
@@ -654,6 +745,18 @@ def _pending_approval(result: dict[str, Any] | None) -> dict[str, Any] | None:
         return None
     pending = result.get("needs_approval")
     return pending if isinstance(pending, dict) else None
+
+
+def _accepts_kwarg(fn: Any, name: str) -> bool:
+    """True if ``fn`` accepts keyword ``name`` (directly or via **kwargs)."""
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    params = sig.parameters
+    if name in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 def _resume_checkpoint(result: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -698,9 +801,12 @@ def _auto_approve_ops() -> set[str]:
     """Every known approval key — used when Auto Approve is enabled."""
     from ai_employee.config import get_settings
 
-    return set(get_settings().approval_required) | set(_AUTO_APPROVE_EXTRA) | set(
-        _TOOL_APPROVAL_KEYS.values()
-    ) | set(_RESOURCE_WORKFLOW_OPS)
+    return (
+        set(get_settings().approval_required)
+        | set(_AUTO_APPROVE_EXTRA)
+        | set(_TOOL_APPROVAL_KEYS.values())
+        | set(_RESOURCE_WORKFLOW_OPS)
+    )
 
 
 def _expand_approved_ops(

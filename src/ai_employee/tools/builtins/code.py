@@ -63,9 +63,7 @@ class PythonExecTool(Tool):
     async def _run(self, args: PythonExecTool.Args) -> ToolResult:
         ws = ensure_workspace(self._ws)
         # Same interpreter as pip_install / the running API process.
-        code, out, err = await _run_subprocess(
-            [sys.executable, "-c", args.code], ws, args.timeout
-        )
+        code, out, err = await _run_subprocess([sys.executable, "-c", args.code], ws, args.timeout)
         return ToolResult(
             ok=(code == 0),
             output={"stdout": out, "stderr": err, "returncode": code},

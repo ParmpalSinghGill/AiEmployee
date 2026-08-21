@@ -155,25 +155,23 @@ def _prior_run_section(
         lines.append(f"Answer:\n{clipped}")
     urls = urls_from_result(result)
     if urls:
-        lines.append("URLs found (use these when the user refers to 'the link', 'that video', etc.):")
+        lines.append(
+            "URLs found (use these when the user refers to 'the link', 'that video', etc.):"
+        )
         lines.extend(f"- {u}" for u in urls[:40])
         if len(urls) > 40:
             lines.append(f"… and {len(urls) - 40} more URL(s)")
     existing, missing = _resource_pairs_from_result(result, workspace=workspace)
     if existing:
         lines.append("Existing local resources (verified on disk now):")
-        lines.extend(
-            f"- {path}" + (f"  ← {url}" if url else "") for path, url in existing[:40]
-        )
+        lines.extend(f"- {path}" + (f"  ← {url}" if url else "") for path, url in existing[:40])
         if len(existing) > 40:
             lines.append(f"… and {len(existing) - 40} more existing local resource(s)")
     if missing:
         lines.append(
             "Missing prior downloads (these paths do NOT exist now; verify or re-download from the URL if needed):"
         )
-        lines.extend(
-            f"- {path}" + (f"  ← {url}" if url else "") for path, url in missing[:40]
-        )
+        lines.extend(f"- {path}" + (f"  ← {url}" if url else "") for path, url in missing[:40])
         if len(missing) > 40:
             lines.append(f"… and {len(missing) - 40} more missing local resource(s)")
     return "\n".join(lines)

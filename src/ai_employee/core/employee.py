@@ -10,6 +10,7 @@ from configuration, and exposes a tiny high-level API:
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from typing import Any
 
 from ai_employee.agents import build_agent_registry
@@ -32,14 +33,15 @@ def _normalize_download_goal(goal: str) -> str:
     g = goal.strip()
     if not g:
         return "Download the requested resource into the workspace."
-    if "http://" in g or "https://" in g:
-        if not re.search(r"\b(download|save|clone|pull|fetch|acquire)\b", g, re.I):
-            return (
-                "Download this resource URL into the workspace and report the saved path. "
-                "If it is YouTube, GitHub, Hugging Face, or Kaggle, use the automated "
-                "downloader.\n\n"
-                f"URL:\n{g}"
-            )
+    if ("http://" in g or "https://" in g) and not re.search(
+        r"\b(download|save|clone|pull|fetch|acquire)\b", g, re.I
+    ):
+        return (
+            "Download this resource URL into the workspace and report the saved path. "
+            "If it is YouTube, GitHub, Hugging Face, or Kaggle, use the automated "
+            "downloader.\n\n"
+            f"URL:\n{g}"
+        )
     return g
 
 
@@ -107,8 +109,13 @@ class AIEmployee:
         resource_decision: dict[str, Any] | None = None,
         workflow_checkpoint: dict[str, Any] | None = None,
         session_context: str = "",
+        on_progress: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
-        """Plan and execute a high-level goal end-to-end."""
+        """Plan and execute a high-level goal end-to-end.
+
+        ``on_progress`` receives a resume checkpoint after each completed node, so a
+        run stopped mid-flight can be continued instead of restarting from scratch.
+        """
         from ai_employee.core.usage import track_usage
 
         with track_usage() as meter:
@@ -119,6 +126,7 @@ class AIEmployee:
                 resource_decision=resource_decision,
                 workflow_checkpoint=workflow_checkpoint,
                 session_context=session_context,
+                on_progress=on_progress,
             )
         checkpoint = self.orchestrator.checkpoint_from_state(
             state, goal=goal, session_id=session_id

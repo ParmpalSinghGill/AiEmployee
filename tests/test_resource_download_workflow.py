@@ -173,9 +173,7 @@ def test_audit_text_waiting_for_user_without_download_is_found_not_downloaded(
     audit = audit_resources(
         task="Download mall entrance footage",
         success_criteria="Video saved locally",
-        output=(
-            f"Found {url}. Status: waiting_for_user because automatic download is blocked."
-        ),
+        output=(f"Found {url}. Status: waiting_for_user because automatic download is blocked."),
         tool_trace=[],
         workspace=tmp_path,
     )

@@ -87,3 +87,56 @@ def test_factory_unknown_provider_raises():
 
     with pytest.raises(ConfigurationError):
         _build(Fake(), get_settings())  # type: ignore[arg-type]
+
+
+# ── Recovery of leaked DeepSeek tool-call markup ─────────────────────────────
+# Some DeepSeek responses emit native tool-call markup as plain text instead of
+# structured tool_calls. The agent loop then sees no call, treats the raw markup
+# as the final answer, and the step fails verification (observed on the
+# `documentation` step of a real run).
+
+_LEAKED = (
+    "Let me examine the dataset structure.\n\n"
+    '<｜｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name="list_dir">\n'
+    '<｜｜DSML｜｜parameter name="path" string="true">data/neu-det</｜｜DSML｜｜parameter>\n'
+    "</｜｜DSML｜｜invoke>\n</｜｜DSML｜｜tool_calls>"
+)
+
+
+def test_recovers_leaked_tool_call_markup() -> None:
+    from ai_employee.brains.providers.openai_compatible import (
+        _has_inline_tool_markup,
+        _recover_inline_tool_calls,
+    )
+
+    assert _has_inline_tool_markup(_LEAKED) is True
+    calls, cleaned = _recover_inline_tool_calls(_LEAKED)
+    assert [c.name for c in calls] == ["list_dir"]
+    assert calls[0].arguments == {"path": "data/neu-det"}
+    # The model's genuine prose survives; the markup does not.
+    assert "DSML" not in cleaned
+    assert cleaned.startswith("Let me examine")
+
+
+def test_recovers_multiple_leaked_calls() -> None:
+    from ai_employee.brains.providers.openai_compatible import _recover_inline_tool_calls
+
+    text = (
+        '<｜｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name="read_file">\n'
+        '<｜｜DSML｜｜parameter name="path" string="true">a.md</｜｜DSML｜｜parameter>\n'
+        "</｜｜DSML｜｜invoke>\n"
+        '<｜｜DSML｜｜invoke name="list_dir">\n'
+        '<｜｜DSML｜｜parameter name="path" string="true">docs</｜｜DSML｜｜parameter>\n'
+        "</｜｜DSML｜｜invoke>\n</｜｜DSML｜｜tool_calls>"
+    )
+    calls, _ = _recover_inline_tool_calls(text)
+    assert [c.name for c in calls] == ["read_file", "list_dir"]
+    assert calls[1].arguments == {"path": "docs"}
+
+
+def test_plain_answers_are_never_touched() -> None:
+    """Ordinary prose (even mentioning tools) must pass through unchanged."""
+    from ai_employee.brains.providers.openai_compatible import _has_inline_tool_markup
+
+    assert _has_inline_tool_markup("Here is the README. Use list_dir to inspect it.") is False
+    assert _has_inline_tool_markup("") is False

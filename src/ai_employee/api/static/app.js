@@ -1006,9 +1006,11 @@ function modelBadges() {
 /* ── Flow (derive an n8n-style graph from the event stream) ────────────── */
 function deriveFlow(task) {
   let plan = null, synth = false, reflect = false, approval = null;
+  // Parallel execution: how the plan was scheduled, and which steps are in flight.
+  let schedule = null;
   const steps = new Map();
   const ensure = (n, agent) => {
-    if (!steps.has(n)) steps.set(n, { step: n, agent: agent || "?", tools: new Map(), verified: null, confidence: null, retries: 0 });
+    if (!steps.has(n)) steps.set(n, { step: n, agent: agent || "?", tools: new Map(), verified: null, confidence: null, retries: 0, running: false, started: false });
     const s = steps.get(n); if (agent) s.agent = agent; return s;
   };
   for (const e of (task.events || [])) {
@@ -1022,6 +1024,17 @@ function deriveFlow(task) {
       case "tool.approval_required": if (f.step != null && f.tool) { ensure(f.step).tools.set(f.tool, { name: f.tool, status: "approval" }); } approval = { ...(approval || {}), tool: f.tool, args: f.args, key: f.key, step: f.step }; break;
       case "verifier.verdict": if (f.step != null) { const s = ensure(f.step); s.verified = f.passed; s.confidence = f.confidence; } break;
       case "workflow.retry": if (f.step != null) ensure(f.step).retries = f.attempt || 0; break;
+      // Parallel mode: these are the only events that say a step is *in flight*
+      // right now — a step with no tool calls yet is otherwise invisible.
+      case "workflow.parallel_schedule":
+        schedule = { steps: f.steps, waves: f.waves, maxParallel: f.max_parallelism, limit: f.limit };
+        break;
+      case "workflow.parallel_start": {
+        const s = ensure(f.step, f.agent); s.running = true; s.started = true; break;
+      }
+      case "workflow.parallel_done": {
+        const s = ensure(f.step); s.running = false; break;
+      }
       case "workflow.node": if (f.node === "synthesize") synth = true; if (f.node === "reflect") reflect = true; break;
       case "agent.needs_approval": approval = { ...(approval || {}), operation: f.op, tool: f.tool ?? approval?.tool, args: f.args ?? approval?.args }; break;
     }
@@ -1031,7 +1044,7 @@ function deriveFlow(task) {
     const s = steps.get(r.id);
     if (s && (!s.agent || s.agent === "?") && r.agent) s.agent = r.agent;
   }
-  return { plan, steps: [...steps.values()].sort((a, b) => a.step - b.step), synth, reflect, approval };
+  return { plan, steps: [...steps.values()].sort((a, b) => a.step - b.step), synth, reflect, approval, schedule };
 }
 
 /* ``jumpKey`` links a flow node to its Explain card (matching ``data-xk``), so
@@ -1151,12 +1164,35 @@ function renderFlow(task, session) {
   const tools = new Set();
   fl.steps.forEach(s => s.tools.forEach(t => tools.add(t.name)));
 
+  const liveSteps = TERMINAL.has(task.status) ? [] : fl.steps.filter(s => s.running);
+  const liveStat = liveSteps.length
+    ? `<div class="stat"><div class="v">${liveSteps.length}</div><div class="k">Running now</div></div>`
+    : "";
+
   const summary = `<div class="flow-summary">
     <div class="stat"><div class="v">${fl.steps.length || (fl.plan?.steps || 0)}</div><div class="k">Steps</div></div>
     <div class="stat"><div class="v">${agents.size}</div><div class="k">Agents</div></div>
+    ${liveStat}
     <div class="stat"><div class="v">${tools.size}</div><div class="k">Tools used</div></div>
     <div class="stat"><div class="v">${esc(statusLabel(task.status))}</div><div class="k">Status</div></div>
   </div>`;
+
+  // Name the agents working concurrently — the whole point of parallel mode is
+  // seeing that several are live at the same moment.
+  let parallelBar = "";
+  if (liveSteps.length > 1) {
+    const who = liveSteps
+      .map(s => `<span class="pchip"><span class="pulse"></span>${esc(s.agent)} <span class="muted">· step ${s.step}</span></span>`)
+      .join("");
+    parallelBar = `<div class="parallel-bar">
+      <span class="pbar-title">⚡ ${liveSteps.length} agents running in parallel</span>
+      <span class="pbar-chips">${who}</span></div>`;
+  } else if (fl.schedule && fl.schedule.maxParallel > 1 && !TERMINAL.has(task.status)) {
+    parallelBar = `<div class="parallel-bar">
+      <span class="pbar-title">⚡ Parallel plan</span>
+      <span class="pbar-chips"><span class="muted">up to ${fl.schedule.maxParallel} step(s) at once`
+      + `${fl.schedule.limit ? `, capped at ${fl.schedule.limit}` : ""}</span></span></div>`;
+  }
 
   const nodes = [];
   nodes.push(nodeHtml("plan", "Planner", "◇",
@@ -1172,9 +1208,13 @@ function renderFlow(task, session) {
     let badge = "";
     if (s.verified === true) badge = `<div class="badge ok">✓ verified${s.confidence != null ? " · " + s.confidence : ""}</div>`;
     else if (s.verified === false) badge = `<div class="badge fail">✗ needs work</div>`;
+    // In parallel mode several agents are live at once — mark which, so the flow
+    // shows concurrency rather than looking like a sequential list.
+    const live = s.running && !TERMINAL.has(task.status)
+      ? `<div class="badge running"><span class="pulse"></span>running now</div>` : "";
     const retry = s.retries ? `<div class="node-sub">retried ×${s.retries}</div>` : "";
-    nodes.push(nodeHtml("step", `Step ${s.step} · agent`, "▣", s.agent, chips + badge + retry,
-      "comp:step:" + s.step));
+    nodes.push(nodeHtml("step" + (s.running ? " is-running" : ""), `Step ${s.step} · agent`, "▣",
+      s.agent, live + chips + badge + retry, "comp:step:" + s.step));
   }
   if (fl.approval && (task.status === "awaiting_approval" || task.status === "waiting_for_user"))
     nodes.push(approvalNode(fl.approval, task));
@@ -1196,7 +1236,7 @@ function renderFlow(task, session) {
     }, 0);
   }
 
-  return summary + `<div class="flow">` + nodes.join(conn()) + `</div>`;
+  return summary + parallelBar + `<div class="flow">` + nodes.join(conn()) + `</div>`;
 }
 
 function statusLabel(s) {
@@ -1575,8 +1615,32 @@ function renderResult(task, session) {
       <button class="btn primary" id="resume-${task.id}" style="margin-top:10px">Resume from last checkpoint</button>
     </div>${partial}`;
   }
-  if (task.status === "failed") return `<div class="approval-banner" style="border-color:var(--red);color:var(--red);background:rgba(239,94,107,.12)">Task failed: ${linkify(task.error || "unknown error")}</div>`;
-  if (task.status === "cancelled") return `<div class="approval-banner" style="border-color:var(--muted);color:var(--muted);background:rgba(140,140,150,.10)">Task stopped: ${linkify(task.error || "cancelled by user")}</div>`;
+  if (task.status === "failed" || task.status === "cancelled") {
+    const stopped = task.status === "cancelled";
+    const label = stopped ? "Task stopped" : "Task failed";
+    const color = stopped ? "var(--muted)" : "var(--red)";
+    const bg = stopped ? "rgba(140,140,150,.10)" : "rgba(239,94,107,.12)";
+    const detail = linkify(task.error || (stopped ? "stopped" : "unknown error"));
+    // Say how much survived, so "Resume" is an obvious continue rather than a redo.
+    const done = task.completed_steps || 0;
+    const planned = task.planned_steps || 0;
+    const progress = planned
+      ? ` — ${done} of ${planned} step(s) completed and saved.`
+      : "";
+    const action = task.can_resume
+      ? `<div style="margin-top:8px">
+           <button class="btn primary" id="resume-banner-${task.id}">▶ Resume from last checkpoint</button>
+         </div>`
+      : "";
+    if (task.can_resume) {
+      setTimeout(() => {
+        const btn = document.getElementById(`resume-banner-${task.id}`);
+        if (btn) btn.addEventListener("click", () => resumeTask(session.id, task.id));
+      }, 0);
+    }
+    return `<div class="approval-banner" style="border-color:${color};color:${color};background:${bg}">`
+      + `${label}: ${detail}${progress}${action}</div>`;
+  }
   const r = task.result;
   // ``task.result`` only lands when the whole pipeline finishes, but finished
   // steps are already in the event stream — show them as they arrive instead of
@@ -1950,6 +2014,52 @@ function openMemoryPicker() {
   pop.style.top = (r.bottom + 6) + "px";
   pop.style.right = (window.innerWidth - r.right) + "px";
 }
+
+/* ── Parallel execution toggle ──────────────────────────────────────────── */
+let _parallelSettings = null;
+
+async function loadParallelBadge() {
+  const badge = $("#parallel-badge");
+  if (!badge) return;
+  let st;
+  try { st = await api("GET", "/ui/api/parallel/settings"); }
+  catch { badge.textContent = "parallel: ?"; return; }
+  _parallelSettings = st;
+  renderParallelBadge(st);
+}
+
+function renderParallelBadge(st) {
+  const badge = $("#parallel-badge");
+  const on = !!st.parallel_steps;
+  // "warn" is the dimmed/off styling the memory badge uses for its off state.
+  badge.classList.toggle("warn", !on);
+  badge.innerHTML =
+    `<span class="b-led"></span><span>⚡ Parallel: ${on ? "On" : "Off"}</span>`;
+  badge.title = on
+    ? `Independent plan steps run at the same time (up to ${st.max_parallel_steps}). `
+      + "Steps that depend on others wait, then start the moment those finish. Click to turn off."
+    : "Steps run one at a time. Click to run independent steps in parallel.";
+}
+
+async function toggleParallel() {
+  const badge = $("#parallel-badge");
+  const next = !(_parallelSettings && _parallelSettings.parallel_steps);
+  badge.disabled = true;
+  try {
+    const st = await api("POST", "/ui/api/parallel/settings", {
+      parallel_steps: next,
+      save_default: true,   // persist, so it survives a restart like the other badges
+    });
+    _parallelSettings = st;
+    renderParallelBadge(st);
+  } catch (e) {
+    badge.title = "Failed to change: " + e.message;
+  } finally {
+    badge.disabled = false;
+  }
+}
+
+$("#parallel-badge").addEventListener("click", toggleParallel);
 
 $("#clear-memories").addEventListener("click", clearAllMemories);
 $("#restore-memories").addEventListener("click", restoreArchivedMemories);
@@ -2410,3 +2520,4 @@ loadSessionList();
 loadBrainBadge();
 loadCodingBadge();
 loadMemoryBadge();
+loadParallelBadge();

@@ -321,7 +321,9 @@ async def test_research_agent_continues_after_fetch_page_failures(settings):
                     ],
                     usage=Usage(),
                 )
-            return ChatResult(content="downloaded exactly one required clip", tool_calls=[], usage=Usage())
+            return ChatResult(
+                content="downloaded exactly one required clip", tool_calls=[], usage=Usage()
+            )
 
     class _Agent(ToolUsingAgent):
         name = "research"
@@ -416,7 +418,9 @@ async def test_resource_downloader_tries_next_url_after_failed_downloads(setting
                     ],
                     usage=Usage(),
                 )
-            return ChatResult(content="downloaded the third candidate", tool_calls=[], usage=Usage())
+            return ChatResult(
+                content="downloaded the third candidate", tool_calls=[], usage=Usage()
+            )
 
     class _Agent(ToolUsingAgent):
         name = "resource_downloader"
@@ -427,7 +431,9 @@ async def test_resource_downloader_tries_next_url_after_failed_downloads(setting
     reg.register(DownloadTool())
     begin_task_tool_history()
     try:
-        result = await _Agent().run("download one of these URLs", AgentContext(brain=_Brain(), tools=reg))
+        result = await _Agent().run(
+            "download one of these URLs", AgentContext(brain=_Brain(), tools=reg)
+        )
     finally:
         clear_task_tool_history()
 
@@ -601,3 +607,78 @@ def test_error_class_normalizes_truncated_tool_json():
         "    For further information visit https://errors.pydantic.dev/2.13/v/missing"
     )
     assert ToolUsingAgent._error_class(err) == "InvalidToolArgs"
+
+
+# ── Truncated-output recovery ────────────────────────────────────────────────
+# A response cut off at the token ceiling arrives with finish_reason="length" and
+# ends mid-word. The old guard only caught outputs under 20 chars, so a 124-char
+# stub ("…auto-downloads it from the official `ult") shipped as the step's answer.
+
+
+async def test_truncated_answer_triggers_a_complete_retry(settings):
+    from ai_employee.agents.base import AgentContext, ToolUsingAgent
+    from ai_employee.brains.schemas import ChatResult, Usage
+    from ai_employee.tools.registry import ToolRegistry
+
+    calls: list[str] = []
+
+    class _TruncBrain:
+        async def chat(self, messages, **kwargs):
+            if not calls:
+                calls.append("truncated")
+                return ChatResult(
+                    content="Ultralytics 8.4.87 confirmed; yolov8n.pt is not on disk (the fram",
+                    tool_calls=[],
+                    finish_reason="length",
+                    usage=Usage(),
+                )
+            calls.append("retry")
+            return ChatResult(
+                content="Complete: YOLOv8n selected; weights auto-download on first use.",
+                tool_calls=[],
+                finish_reason="stop",
+                usage=Usage(),
+            )
+
+    class _A(ToolUsingAgent):
+        name = "codesmith"
+        allowed_tools: list[str] = []
+        max_iterations = 3
+
+    result = await _A().run(
+        "write training code", AgentContext(brain=_TruncBrain(), tools=ToolRegistry(settings))
+    )
+
+    assert calls == ["truncated", "retry"], "a truncated answer must be re-asked"
+    assert result.output.startswith("Complete:")
+    assert "(the fram" not in result.output
+
+
+async def test_complete_answer_is_not_retried(settings):
+    """finish_reason='stop' means the model finished — never spend a second call."""
+    from ai_employee.agents.base import AgentContext, ToolUsingAgent
+    from ai_employee.brains.schemas import ChatResult, Usage
+    from ai_employee.tools.registry import ToolRegistry
+
+    calls: list[str] = []
+
+    class _OkBrain:
+        async def chat(self, messages, **kwargs):
+            calls.append("call")
+            return ChatResult(
+                content="A short but complete answer about the chosen model.",
+                tool_calls=[],
+                finish_reason="stop",
+                usage=Usage(),
+            )
+
+    class _A(ToolUsingAgent):
+        name = "documentation"
+        allowed_tools: list[str] = []
+        max_iterations = 3
+
+    result = await _A().run(
+        "summarize", AgentContext(brain=_OkBrain(), tools=ToolRegistry(settings))
+    )
+    assert len(calls) == 1
+    assert result.output.startswith("A short but complete")

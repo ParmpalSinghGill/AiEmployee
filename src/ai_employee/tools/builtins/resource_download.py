@@ -465,11 +465,7 @@ async def download_http(url: str, dest: Path, *, timeout: int = 120) -> dict[str
 def _resolve_ytdlp_path(candidate: Path, workspace: Path) -> Path:
     """yt-dlp runs with cwd=workspace; relative paths are relative to that."""
     p = candidate.expanduser()
-    if not p.is_absolute():
-        p = (workspace / p).resolve()
-    else:
-        p = p.resolve()
-    return p
+    return (workspace / p).resolve() if not p.is_absolute() else p.resolve()
 
 
 async def download_youtube(
@@ -482,8 +478,8 @@ async def download_youtube(
     cookies_file: str | Path | None = None,
 ) -> dict[str, Any]:
     """``run_shell`` is an async callable(cmd: list[str]) -> (code, stdout, stderr)."""
-    ws = workspace.resolve()
-    dest_abs = dest.resolve() if dest.is_absolute() else (ws / dest).resolve()
+    ws = workspace.resolve()  # noqa: ASYNC240 — cheap path math, no blocking I/O
+    dest_abs = dest.resolve() if dest.is_absolute() else (ws / dest).resolve()  # noqa: ASYNC240
     try:
         out_tpl = str(dest_abs.relative_to(ws).with_suffix("")) + ".%(ext)s"
     except ValueError:
@@ -563,7 +559,7 @@ async def download_huggingface(
     repo_type, repo_id = parsed
     dest_dir = dest if dest.suffix == "" else dest.parent / dest.stem
     dest_dir.mkdir(parents=True, exist_ok=True)
-    hf_home = workspace.resolve() / ".hf_home"
+    hf_home = workspace.resolve() / ".hf_home"  # noqa: ASYNC240 — cheap path math
     hf_home.mkdir(parents=True, exist_ok=True)
     cache_dir = hf_home / "hub"
     cache_dir.mkdir(parents=True, exist_ok=True)

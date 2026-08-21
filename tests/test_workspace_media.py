@@ -8,6 +8,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from ai_employee.api.workspace_files import (
+    is_dataset_content,
     resolve_workspace_path,
     sample_media,
 )
@@ -119,3 +120,90 @@ async def test_workspace_media_endpoint_samples(client) -> None:
     assert body["sampled"] is True
     assert body["shown"] == 3
     assert len(body["images"]) == 3
+
+
+def test_is_dataset_content_flags_download_buckets_and_splits() -> None:
+    # Downloaded corpora live under the canonical buckets.
+    assert is_dataset_content(("data", "coco", "cat.jpg")) is True
+    assert is_dataset_content(("models", "yolo", "preview.png")) is True
+    # Split directories mark dataset content wherever they are nested.
+    assert is_dataset_content(("sessions", "s1", "repo", "train", "0001.jpg")) is True
+    assert is_dataset_content(("sessions", "s1", "images", "0001.jpg")) is True
+    # Generated output: workspace root, or a session dir that isn't a split.
+    assert is_dataset_content(("accuracy_by_class.png",)) is False
+    assert is_dataset_content(("sessions", "s1", "confusion_matrix.png")) is False
+
+
+def test_sample_media_excludes_dataset_content(tmp_path: Path) -> None:
+    """The unnamed sweep must show generated figures, never dataset samples."""
+    ws = tmp_path / "workspace"
+    # A downloaded image dataset: exactly what used to flood the Result tab.
+    dataset = ws / "data" / "defects" / "train"
+    dataset.mkdir(parents=True)
+    for i in range(40):
+        (dataset / f"sample{i:03d}.jpg").write_bytes(b"\xff\xd8\xff")
+    # Model-bucket art is also corpus content, not a result.
+    (ws / "models" / "yolo").mkdir(parents=True)
+    (ws / "models" / "yolo" / "arch.png").write_bytes(b"i")
+    # What the run actually produced.
+    ws.mkdir(exist_ok=True)
+    (ws / "confusion_matrix.png").write_bytes(b"i")
+    (ws / "accuracy_by_class.png").write_bytes(b"i")
+
+    out = sample_media(ws, ["."], sample_when_over=60, sample_size=60, exclude_dataset_content=True)
+
+    names = sorted(i["name"] for i in out["images"])
+    assert names == ["accuracy_by_class.png", "confusion_matrix.png"]
+    assert out["total"] == 2
+    assert out["sampled"] is False
+
+
+def test_sample_media_keeps_dataset_content_when_not_excluded(tmp_path: Path) -> None:
+    """Explicitly-named paths still resolve — the filter is opt-in."""
+    ws = tmp_path / "workspace"
+    dataset = ws / "data" / "defects"
+    dataset.mkdir(parents=True)
+    (dataset / "sample.jpg").write_bytes(b"\xff\xd8\xff")
+
+    out = sample_media(ws, ["data/defects"])
+    assert out["total"] == 1
+    assert out["images"][0]["name"] == "sample.jpg"
+
+
+def test_deliverables_exclude_dataset_annotations(tmp_path: Path) -> None:
+    """A detection dataset ships thousands of per-image .xml annotations.
+
+    Those are inputs the run consumed; listing them as "files produced" buried the
+    actual deliverables (the training script, README and metrics).
+    """
+    from ai_employee.api.workspace_files import collect_deliverables
+
+    ws = tmp_path / "workspace"
+    ann = ws / "data" / "metal-surface-defects" / "NEU-DET" / "validation" / "annotations"
+    ann.mkdir(parents=True)
+    for i in range(280, 340):
+        (ann / f"scratches_{i}.xml").write_text("<annotation/>")
+    # Model-bucket config files are corpus content too.
+    (ws / "models" / "yolo").mkdir(parents=True)
+    (ws / "models" / "yolo" / "config.json").write_text("{}")
+    # What the run actually produced.
+    (ws / "train_defect_model.py").write_text("print('train')")
+    (ws / "README.md").write_text("# How to run")
+
+    out = collect_deliverables(ws)
+
+    assert sorted(f["path"] for f in out["files"]) == ["README.md", "train_defect_model.py"]
+    assert out["total"] == 2
+
+
+def test_deliverables_hide_internal_ledger(tmp_path: Path) -> None:
+    """assets.json is framework bookkeeping, not a user-facing deliverable."""
+    from ai_employee.api.workspace_files import collect_deliverables
+
+    ws = tmp_path / "workspace"
+    ws.mkdir(parents=True)
+    (ws / "assets.json").write_text("{}")
+    (ws / "report.md").write_text("# report")
+
+    out = collect_deliverables(ws)
+    assert [f["path"] for f in out["files"]] == ["report.md"]

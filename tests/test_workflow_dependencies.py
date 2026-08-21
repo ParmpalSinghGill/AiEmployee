@@ -21,9 +21,7 @@ class _StubAgent:
 
 
 def test_data_analysis_empty_output_is_not_unusable():
-    assert not _looks_unusable(
-        {"id": 3, "agent": "data_analysis", "output": "", "verified": False}
-    )
+    assert not _looks_unusable({"id": 3, "agent": "data_analysis", "output": "", "verified": False})
     assert _looks_unusable({"id": 3, "agent": "data_analysis", "output": "", "skipped": True})
 
 
@@ -118,3 +116,56 @@ async def test_analysis_pipeline_continues_after_empty_clean_step(brain, setting
     assert not any(r.get("skipped") for r in results)
     assert "shape=(9994, 21)" in (results[1].get("output") or "")
     assert "Total sales" in (results[2].get("output") or "")
+
+
+# ── Dependency gating vs audit issues ────────────────────────────────────────
+# A scout that found real model URLs but didn't download them gets an audit issue
+# logged. Treating that as "produced nothing usable" skipped hardware_analyst,
+# codesmith AND documentation — three agents never ran, and the Explain tab showed
+# only the two steps that did.
+
+
+def test_audit_issue_with_resources_still_feeds_dependents() -> None:
+    from ai_employee.workflows.employee_graph import _looks_unusable
+
+    record = {
+        "id": 2,
+        "agent": "scout",
+        "output": "Found YOLO11 and yolov8n with verified URLs. " * 20,
+        "resource_audit": {
+            "applies": True,
+            "outcome": "found_not_downloaded",
+            "issues": ["automatic download was not attempted"],
+            "has_urls": True,
+            "resources": [
+                {"name": "YOLO11", "web_url": "https://huggingface.co/Ultralytics/YOLO11"},
+            ],
+        },
+    }
+    assert _looks_unusable(record) is False
+
+
+def test_audit_issue_without_any_resource_blocks_dependents() -> None:
+    """No URLs and no resources really is nothing to build on — still blocked."""
+    from ai_employee.workflows.employee_graph import _looks_unusable
+
+    record = {
+        "id": 2,
+        "agent": "scout",
+        "output": "I searched several hubs but found no suitable model at all. " * 5,
+        "resource_audit": {
+            "applies": True,
+            "outcome": "not_found",
+            "issues": ["no usable resource located"],
+            "has_urls": False,
+            "resources": [],
+        },
+    }
+    assert _looks_unusable(record) is True
+
+
+def test_skipped_and_empty_steps_remain_unusable() -> None:
+    from ai_employee.workflows.employee_graph import _looks_unusable
+
+    assert _looks_unusable({"id": 1, "agent": "scout", "skipped": True}) is True
+    assert _looks_unusable({"id": 1, "agent": "scout", "output": "ok"}) is True

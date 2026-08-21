@@ -64,7 +64,11 @@ class Settings(BaseSettings):
     # ── LLM selection ────────────────────────────────────────────────────────
     llm_provider: LLMProvider = LLMProvider.deepseek
     llm_temperature: float = 0.2
-    llm_max_tokens: int = 2048
+    # Output ceiling per call. 2048 was far too low for this workload: agents write
+    # training scripts and READMEs, and on reasoning models the chain-of-thought is
+    # billed against the SAME budget — so long reasoning left nothing for the answer
+    # and responses came back cut off mid-word (finish_reason="length").
+    llm_max_tokens: int = 8192
     llm_request_timeout: int = 60
     llm_max_retries: int = 3
 
@@ -188,6 +192,14 @@ class Settings(BaseSettings):
     # Don't re-run a step whose agent refused on policy grounds — the retry would
     # just reproduce the same refusal. Accept-with-note instead.
     no_retry_on_refusal: bool = True
+    # Run plan steps that don't depend on each other at the same time. Off by
+    # default: sequential execution is easier to follow in the live flow view, and
+    # concurrent agents multiply token spend and provider rate-limit pressure.
+    # Toggled per task from the web console (⚡ Parallel).
+    parallel_steps: bool = False
+    # Ceiling on steps in flight at once when parallel_steps is on. Keeps a wide
+    # plan from opening dozens of simultaneous provider connections.
+    max_parallel_steps: int = 4
 
     # ── External coding agents (delegate the coding step to a CLI) ────────────
     # brain  → use the configured LLM via the normal tool-using loop (default).

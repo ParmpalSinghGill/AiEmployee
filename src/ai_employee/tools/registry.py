@@ -102,7 +102,7 @@ class ToolRegistry:
         if history is not None:
             previous = history.get(name, arguments)
             if previous is not None and previous.result.ok:
-                payload = duplicate_payload(previous.result)
+                payload = duplicate_payload(previous.result, name)
                 log.info(
                     "tool.duplicate_blocked",
                     tool=name,

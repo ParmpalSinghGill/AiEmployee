@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -53,26 +54,81 @@ class WriteFileTool(Tool):
 
 class ListDirTool(Tool):
     name = "list_dir"
-    description = "List files and subdirectories of a workspace directory."
+    description = (
+        "List files and subdirectories of a workspace directory. Set recursive=true "
+        "to see the whole tree in ONE call instead of walking level by level. "
+        "For counting, measuring or parsing many files (image counts, dimensions, "
+        "class totals) do NOT keep listing — use python_exec once and compute it."
+    )
     category = "filesystem"
 
     class Args(BaseModel):
         path: str = Field(".", description="Directory relative to the workspace root.")
+        recursive: bool = Field(
+            False,
+            description="Walk subdirectories too. Use this instead of repeated calls.",
+        )
+        max_entries: int = Field(
+            400,
+            description="Cap on returned entries; a truncated listing says so.",
+        )
 
     def __init__(self, workspace: Path) -> None:
         self._ws = workspace
 
     async def _run(self, args: ListDirTool.Args) -> ToolResult:
         p = resolve_in_workspace(self._ws, args.path, must_exist=True)
-        entries = [
-            {
-                "name": e.name,
-                "type": "dir" if e.is_dir() else "file",
-                "size": e.stat().st_size if e.is_file() else None,
-            }
-            for e in sorted(p.iterdir())
-        ]
-        return ToolResult(output=entries, metadata={"count": len(entries)})
+        limit = max(1, int(args.max_entries))
+
+        if not args.recursive:
+            entries = [
+                {
+                    "name": e.name,
+                    "type": "dir" if e.is_dir() else "file",
+                    "size": e.stat().st_size if e.is_file() else None,
+                }
+                for e in sorted(p.iterdir())
+            ]
+            truncated = len(entries) > limit
+            return ToolResult(
+                output=entries[:limit],
+                metadata={"count": len(entries), "truncated": truncated},
+            )
+
+        # Recursive: one call replaces the level-by-level walking that used to
+        # trip the duplicate-call guard on deep dataset trees.
+        import os
+
+        rows: list[dict[str, Any]] = []
+        total = 0
+        for dirpath, dirnames, filenames in os.walk(p):
+            dirnames.sort()
+            rel_dir = Path(dirpath).relative_to(p)
+            for fn in sorted(filenames):
+                total += 1
+                if len(rows) < limit:
+                    fp = Path(dirpath) / fn
+                    try:
+                        size = fp.stat().st_size
+                    except OSError:
+                        size = None
+                    rows.append(
+                        {
+                            "name": str(rel_dir / fn) if str(rel_dir) != "." else fn,
+                            "type": "file",
+                            "size": size,
+                        }
+                    )
+        note = (
+            f"Truncated to {limit} of {total} files. Use python_exec to count or "
+            "aggregate rather than listing again."
+            if total > limit
+            else None
+        )
+        return ToolResult(
+            output=rows,
+            metadata={"count": total, "truncated": total > limit, "note": note},
+        )
 
 
 class MakeDirTool(Tool):

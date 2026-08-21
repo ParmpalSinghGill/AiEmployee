@@ -254,6 +254,23 @@ body {
   padding: 3px 8px; border-radius: 6px; }
 .badge.ok { background: rgba(70,201,139,.14); color: var(--green); }
 .badge.fail { background: rgba(239,94,107,.14); color: var(--red); }
+
+/* ── Parallel execution: which agents are live right now ─────────────────── */
+.badge.running { background: rgba(90,162,255,.14); color: var(--blue); }
+/* A step in flight gets a lit border so concurrency is visible at a glance. */
+.node.step.is-running { border-left-color: var(--blue); box-shadow: 0 0 0 1px rgba(90,162,255,.35); }
+.pulse { width: 7px; height: 7px; border-radius: 50%; background: currentColor;
+  animation: pulse-fade 1.2s ease-in-out infinite; flex: none; }
+@keyframes pulse-fade { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
+@media (prefers-reduced-motion: reduce) { .pulse { animation: none; } }
+.parallel-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  margin: 0 0 14px; padding: 8px 12px; border-radius: 8px;
+  background: rgba(90,162,255,.08); border: 1px solid rgba(90,162,255,.22); }
+.pbar-title { font-size: 12px; font-weight: 600; color: var(--blue); }
+.pbar-chips { display: flex; gap: 8px; flex-wrap: wrap; }
+.pchip { display: inline-flex; align-items: center; gap: 6px; font-size: 11px;
+  padding: 3px 9px; border-radius: 999px; background: var(--bg-3); color: var(--blue); }
+.pchip .muted { color: var(--muted); }
 .node-sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
 
 /* Approval-required node: wider so the exact command/args are legible. */

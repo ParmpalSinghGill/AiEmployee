@@ -127,7 +127,9 @@ def test_build_prior_session_context_marks_missing_prior_downloads(tmp_path):
                                 },
                                 {
                                     "web_url": "https://www.youtube.com/watch?v=def456",
-                                    "local_path": str(workspace / "sessions" / "sess-1" / "missing.mp4"),
+                                    "local_path": str(
+                                        workspace / "sessions" / "sess-1" / "missing.mp4"
+                                    ),
                                 },
                             ]
                         },

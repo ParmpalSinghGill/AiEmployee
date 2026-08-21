@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import abc
+import itertools
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -17,6 +18,15 @@ from ai_employee.core.logging import get_logger
 from ai_employee.core.trace import clip, clip_obj
 from ai_employee.memory import MemoryManager, MemoryNamespace
 from ai_employee.tools import ToolRegistry
+from ai_employee.tools.invocation_history import bind_dedup_scope, reset_dedup_scope
+
+_SCOPE_SEQ = itertools.count()
+
+
+def _scope_counter() -> int:
+    """Unique per agent turn, so a retry of the same step starts with a clean slate."""
+    return next(_SCOPE_SEQ)
+
 
 log = get_logger("agent")
 
@@ -78,6 +88,16 @@ class ToolUsingAgent(BaseAgent):
     """
 
     async def run(self, task: str, ctx: AgentContext) -> AgentResult:
+        # Scope duplicate detection to this agent's turn. Task-wide dedup blocked an
+        # agent from reading something a *different* agent had already read, which
+        # tripped the repeated-duplicate abort and killed the step before it worked.
+        token = bind_dedup_scope(f"{self.name}:{id(ctx)}:{_scope_counter()}")
+        try:
+            return await self._run_inner(task, ctx)
+        finally:
+            reset_dedup_scope(token)
+
+    async def _run_inner(self, task: str, ctx: AgentContext) -> AgentResult:
         log.info("agent.start", agent=self.name, session=ctx.session_id)
         messages = await self._build_initial_messages(task, ctx)
         tool_specs = ctx.tools.specs(self.allowed_tools)
@@ -101,12 +121,27 @@ class ToolUsingAgent(BaseAgent):
             )
             if not result.has_tool_calls:
                 output = (result.content or "").strip()
-                if len(output) < 20:
+                # finish_reason="length" means the model was cut off at the token
+                # ceiling — the answer ends mid-word. Length alone can't detect it
+                # (a 124-char stub looks "long enough"), so trust the provider's
+                # signal and ask for a complete answer instead of shipping a stub.
+                truncated = str(result.finish_reason or "").lower() == "length"
+                if len(output) < 20 or truncated:
+                    if truncated:
+                        log.warning(
+                            "agent.output_truncated",
+                            agent=self.name,
+                            chars=len(output),
+                            note="hit llm_max_tokens; retrying for a complete answer",
+                        )
                     output = await self._final_answer(
                         messages,
                         trace,
                         ctx,
-                        stop_reason="empty_or_truncated_answer",
+                        stop_reason=(
+                            "truncated_at_token_limit" if truncated else "empty_or_truncated_answer"
+                        ),
+                        previous=output if truncated else "",
                     )
                 await self._remember(task, output, ctx)
                 log.info(
@@ -232,7 +267,11 @@ class ToolUsingAgent(BaseAgent):
                                     "continue trying the next distinct resource URL before asking "
                                     "the user for manual help."
                                 )
-                            elif ecls in {"UnicodeDecodeError", "InvalidToolArgs", "ValidationError"}:
+                            elif ecls in {
+                                "UnicodeDecodeError",
+                                "InvalidToolArgs",
+                                "ValidationError",
+                            }:
                                 # Recoverable: encoding mismatch or truncated tool JSON.
                                 pass
                             else:
@@ -356,8 +395,13 @@ class ToolUsingAgent(BaseAgent):
         trace: list[dict[str, Any]],
         ctx: AgentContext,
         stop_reason: str | None,
+        previous: str = "",
     ) -> str:
-        """Force a non-empty step output so dependents are not skipped."""
+        """Force a non-empty step output so dependents are not skipped.
+
+        ``previous`` carries a partial answer that was cut off at the token limit;
+        the retry is told to be brief so the whole thing fits this time.
+        """
         settings = get_settings()
         history = self._compact_history(messages, settings.agent_history_window)
         if self.name in _RESOURCE_DOWNLOAD_AGENTS and not self._downloads_attempted(trace):
@@ -367,6 +411,14 @@ class ToolUsingAgent(BaseAgent):
                 "automated). Try YouTube URLs first. Only after download_resource succeeds "
                 "or fails for each URL, give your final answer with real local paths or "
                 "call request_resource_input with the actual download errors."
+            )
+        elif previous:
+            prompt = (
+                "Your previous answer was cut off at the output limit mid-sentence. "
+                "Write the COMPLETE answer again, but shorter so it fits — under 250 "
+                "words. Lead with results, file paths and concrete numbers; drop "
+                "preamble and reasoning. It must end with a finished sentence.\n\n"
+                f"The truncated attempt started:\n{previous[:500]}"
             )
         else:
             prompt = (
@@ -508,8 +560,7 @@ class ToolUsingAgent(BaseAgent):
         if context_blobs:
             messages.append(
                 Message.system(
-                    "Relevant prior knowledge & learned skills:\n"
-                    + "\n---\n".join(context_blobs)
+                    "Relevant prior knowledge & learned skills:\n" + "\n---\n".join(context_blobs)
                 )
             )
         messages.append(Message.user(task))

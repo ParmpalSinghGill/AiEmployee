@@ -63,7 +63,9 @@ async def test_download_mode_routes_to_employee_download():
     calls = []
 
     class _FakeEmployee:
-        async def download(self, goal, *, session_id=None, approved_ops=None, resource_decision=None):
+        async def download(
+            self, goal, *, session_id=None, approved_ops=None, resource_decision=None
+        ):
             calls.append(
                 {
                     "goal": goal,

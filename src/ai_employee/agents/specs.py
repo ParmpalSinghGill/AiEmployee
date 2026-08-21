@@ -76,6 +76,8 @@ _FETCHING = (
     "is worse than an honest failure.\n"
 )
 _DISCOVER = (
+    # Local inventory first — reusing a downloaded asset beats re-fetching it.
+    "search_local_assets",
     "hf_search",
     "paperswithcode_search",
     "arxiv_search",
@@ -88,6 +90,7 @@ _DISCOVER = (
     "fetch_page",
 )
 _RESOURCE = (
+    "search_local_assets",
     "hub_search_all",
     "youtube_search",
     "hf_search",
@@ -191,8 +194,7 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
             "code/tests. Never leave the workspace in a broken state.\n"
             # The planner often routes data-fetching and charting here rather than to
             # data_analysis, so this agent carries the same contracts.
-            + _FETCHING
-            + _PLOTTING
+            + _FETCHING + _PLOTTING
         ),
     ),
     AgentSpec(
@@ -562,7 +564,13 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
         max_iterations=10,
         system_prompt=(
             "You are an ML resource scout. Given a problem, find (1) ready-to-use "
-            "pretrained MODELS and (2) DATASETS for it. Search Hugging Face first "
+            "pretrained MODELS and (2) DATASETS for it. "
+            "ALWAYS call search_local_assets FIRST: the workspace may already hold a "
+            "suitable model or dataset from an earlier task, and reusing it saves a "
+            "large download. If a local asset fits, report it with its path and do not "
+            "search the hubs for a replacement. Only search online for what is genuinely "
+            "missing, or when the user explicitly asks for something new or different. "
+            "When searching online, use Hugging Face first "
             "(hf_search kind='both'), then Papers With Code, Kaggle, arXiv, and GitHub. "
             "Use hub_search_all kind=tabular for spreadsheet/CSV (no YouTube). "
             "kind=image for still-image/CV datasets (Roboflow/HF). "

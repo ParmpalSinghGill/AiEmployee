@@ -41,6 +41,45 @@ def _is_library_path(path: Path, root: Path) -> bool:
     return any(part in _SKIP_DIRS for part in rel.parts[:-1])
 
 
+# Buckets that hold *downloaded corpus content* rather than the agent's own output.
+# ``canonical_artifact_dest`` routes model weights into ``models/`` and datasets into
+# ``data/``, so an image under either is a dataset sample — never a result. Surfacing
+# those turns the Result tab into a contact sheet of somebody else's training images,
+# which buries the charts and evaluation figures the run actually produced.
+_DATASET_ROOTS = {"models", "data", "datasets"}
+# Directory names that mark dataset content even when nested elsewhere (e.g. a repo
+# cloned into sessions/ that ships its own train/val split).
+_DATASET_DIR_NAMES = {
+    "train",
+    "val",
+    "valid",
+    "validation",
+    "test",
+    "images",
+    "img",
+    "imgs",
+    "jpegimages",
+    "annotations",
+    "masks",
+    "labels",
+    "samples",
+    "raw",
+}
+
+
+def is_dataset_content(rel_parts: tuple[str, ...]) -> bool:
+    """True if a workspace-relative path points into downloaded dataset/model content.
+
+    ``rel_parts`` is the path relative to the workspace, file name included.
+    """
+    dirs = [p.lower() for p in rel_parts[:-1]]
+    if not dirs:
+        return False  # workspace root — where generated charts land
+    if dirs[0] in _DATASET_ROOTS:
+        return True
+    return any(d in _DATASET_DIR_NAMES for d in dirs)
+
+
 def resolve_workspace_path(workspace: Path, path_str: str) -> Path:
     """Resolve ``path_str`` to a path inside ``workspace``.
 
@@ -125,6 +164,7 @@ def sample_media(
     sample_when_over: int = 5,
     sample_size: int = 3,
     modified_since: float | None = None,
+    exclude_dataset_content: bool = False,
 ) -> dict[str, Any]:
     """Collect video/image files under ``paths`` and sample when there are many.
 
@@ -135,6 +175,11 @@ def sample_media(
     ``modified_since`` (a POSIX timestamp) keeps only files written at or after
     that moment. The workspace is shared across runs, so without it a task's
     gallery shows every chart every previous task ever produced.
+
+    ``exclude_dataset_content`` drops images that live under the download buckets
+    (``models/``, ``data/``) or a dataset split directory. Used for the unnamed
+    sweep, where the intent is "show what this run produced" — charts and
+    evaluation figures — not the corpus it downloaded to work with.
     """
     ws = workspace.resolve()
     seen: set[Path] = set()
@@ -149,6 +194,13 @@ def sample_media(
         for f in _collect_under(root):
             if f in seen:
                 continue
+            if exclude_dataset_content:
+                try:
+                    rel_parts = f.resolve().relative_to(ws).parts
+                except ValueError:
+                    continue
+                if is_dataset_content(rel_parts):
+                    continue
             if modified_since is not None:
                 try:
                     if f.stat().st_mtime < modified_since:
@@ -208,7 +260,13 @@ _DELIVERABLE_EXTS = {e: k for k, exts in _DELIVERABLE_KINDS.items() for e in ext
 _MAX_DELIVERABLES = 80
 
 
+# Framework bookkeeping that lives in the workspace but isn't the run's output.
+_INTERNAL_FILES = {"assets.json"}
+
+
 def deliverable_kind(path: Path) -> str | None:
+    if path.name in _INTERNAL_FILES:
+        return None
     return _DELIVERABLE_EXTS.get(path.suffix.lower())
 
 
@@ -233,9 +291,21 @@ def collect_deliverables(
     found: list[tuple[float, Path]] = []
     for dirpath, dirnames, filenames in os.walk(ws):
         dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+        # Don't descend into downloaded corpora. A single object-detection dataset
+        # holds thousands of per-image .xml annotations, which are inputs the run
+        # consumed — listing them as "files produced" buries the real deliverables.
+        try:
+            rel_dir = Path(dirpath).resolve().relative_to(ws)
+        except ValueError:
+            rel_dir = Path()
+        if rel_dir != Path() and is_dataset_content((*rel_dir.parts, "_")):
+            dirnames[:] = []
+            continue
         for fn in filenames:
             p = Path(dirpath) / fn
             if deliverable_kind(p) is None:
+                continue
+            if is_dataset_content(Path(workspace_relative(ws, p)).parts):
                 continue
             try:
                 st = p.stat()
