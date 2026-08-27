@@ -104,6 +104,10 @@ class TaskRecord:
         self.progress_saved_at: datetime | None = None
         # When True, never pause for approval — grant every gated op automatically.
         self.auto_approve: bool = False
+        # Hard token cap for this run (0 = the global settings default applies).
+        self.token_budget: int = 0
+        # Tokens spent so far (updated as the run progresses).
+        self.tokens_used: int = 0
 
     def add_log(self, event_dict: dict[str, Any]) -> None:
         self._seq += 1
@@ -150,6 +154,8 @@ class TaskRecord:
                 or []
             ),
             "auto_approve": self.auto_approve,
+            "token_budget": self.token_budget,
+            "tokens_used": self.tokens_used,
         }
 
     @classmethod
@@ -281,6 +287,7 @@ class TaskManager:
         approved_ops: set[str] | None = None,
         mode: str = "task",
         auto_approve: bool = False,
+        token_budget: int | None = None,
     ) -> TaskRecord:
         """Create a task (new session unless ``session_id`` given) and run it in
         the background. Returns immediately. ``mode`` selects the pipeline:
@@ -296,6 +303,8 @@ class TaskManager:
 
         task = TaskRecord(goal=goal, session_id=session.id, parent_id=parent_id, mode=mode)
         task.auto_approve = bool(auto_approve)
+        if token_budget is not None:
+            task.token_budget = max(0, int(token_budget))
         ops = set(approved_ops or set())
         if task.auto_approve:
             ops |= _auto_approve_ops()
@@ -436,6 +445,16 @@ class TaskManager:
         task.status = TaskStatus.running
         task.resumable = False
         log.info("task.started", goal=task.goal[:120])
+        # Bind a budgeted meter for the whole run (all rounds, incl. resumes in
+        # this call). The Brain choke point enforces the cap; we total spend.
+        from ai_employee.config import get_settings as _get_settings
+        from ai_employee.core.usage import track_usage
+
+        budget = task.token_budget or int(
+            getattr(_get_settings(), "task_token_budget", 0) or 0
+        )
+        _usage_cm = track_usage(budget=budget)
+        _meter = _usage_cm.__enter__()
         # Record what the user just approved, inline in the flow/logs/explain, so
         # it's clear which sensitive op was granted and when.
         if approval:
@@ -547,12 +566,48 @@ class TaskManager:
             task.resumable = _resume_checkpoint(task.result) is not None
             log.warning("task.failed", error=task.error, resumable=task.resumable)
         finally:
+            task.tokens_used += _meter.total_tokens
+            _usage_cm.__exit__(None, None, None)
+            self._notify_transition(task)
             task.finished_at = _now()
             structlog.contextvars.unbind_contextvars("task_id")
             self._persist_task(task)
             # Persist memory so a resumed session keeps its accumulated context.
             with contextlib.suppress(Exception):
                 employee.persist_memory()
+
+    def _notify_transition(self, task: TaskRecord) -> None:
+        """Push the terminal/paused state to the operator's phone (ntfy)."""
+        from ai_employee.config import get_settings
+        from ai_employee.core.notify import push_soon
+
+        s = get_settings()
+        url = f"http://localhost:{getattr(s, 'api_port', 8000)}/ui"
+        goal = task.goal[:140]
+        if task.status in (TaskStatus.awaiting_approval, TaskStatus.waiting_for_user):
+            pending = (task.result or {}).get("needs_approval") or {}
+            what = pending.get("tool") or pending.get("operation") or "a sensitive operation"
+            push_soon(
+                s,
+                "Approval needed",
+                f"{goal}\nWants to run: {str(what)[:160]}",
+                priority="high",
+                tags="raised_hand",
+                click_url=url,
+            )
+        elif task.status is TaskStatus.failed:
+            push_soon(
+                s,
+                "Task failed",
+                f"{goal}\n{(task.error or '')[:200]}",
+                priority="high",
+                tags="x",
+                click_url=url,
+            )
+        elif task.status is TaskStatus.completed:
+            push_soon(
+                s, "Task completed", goal, tags="white_check_mark", click_url=url
+            )
 
     # ── Auto-naming ──────────────────────────────────────────────────────────
     def _spawn_name(self, employee: Any, task: TaskRecord) -> None:

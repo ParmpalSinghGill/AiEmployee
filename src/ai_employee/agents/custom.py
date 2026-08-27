@@ -183,6 +183,17 @@ class HumanApprovalAgent(BaseAgent):
 
     async def run(self, task: str, ctx: AgentContext) -> AgentResult:
         operation = ctx.scratch.get("pending_operation", task)
+        # Once the human clicks Approve, the operation lands in approved_ops and
+        # the workflow re-runs this step — it must then succeed, not ask again
+        # (that would loop forever: approve → resume → re-request).
+        if operation in ctx.approved_ops or "human_approval" in ctx.approved_ops:
+            log.info("approval.already_granted", operation=operation)
+            return AgentResult(
+                agent=self.name,
+                success=True,
+                output=f"Human approval granted for: {operation}",
+                confidence=1.0,
+            )
         log.info("approval.requested", operation=operation)
         return AgentResult(
             agent=self.name,

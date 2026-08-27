@@ -49,6 +49,7 @@ Tests force offline config via `tests/conftest.py` (sets `LLM_PROVIDER=mock` etc
 | LLM abstraction | `brains/base.py`, `brains/schemas.py` |
 | Providers | `brains/providers/` (`mock`, `openai_compatible`, `concrete`) |
 | Tools | `tools/base.py`, `tools/registry.py`, `tools/builtins/` |
+| MCP connectors | `tools/mcp/` (`catalog` presets, `store` JSON cache, `client` sessions, `proxy` tools, `oauth` browser sign-in) |
 | Agents | `agents/base.py`, `agents/specs.py` (declarative), `agents/custom.py` |
 | Planner | `planning/planner.py` |
 | Orchestration (LangGraph) | `workflows/employee_graph.py` |
@@ -57,6 +58,8 @@ Tests force offline config via `tests/conftest.py` (sets `LLM_PROVIDER=mock` etc
 | API | `api/` (`app`, `routes`, `schemas`, `deps`) |
 | Web UI | `api/ui.py` + `api/static/` (SPA); task runner in `observability/tasks.py` |
 | Persistence (save/resume) | `observability/store.py` (`SessionStore`); memory dump/restore in `core/employee.py` |
+| Schedules & watchers (⏰) | `observability/schedules.py` (store + `SchedulerRunner`, started in `api/app.py` lifespan) |
+| Autonomy & safety (🛡) | `config/approval_policies.py` (rule-based auto-approval), `observability/audit.py` (outward-action trail), `core/notify.py` (ntfy push), token budgets in `core/usage.py` + `brains/metering.py` |
 | DB models / migrations | `database/models.py`, `migrations/` |
 
 ## Extending
@@ -67,6 +70,14 @@ Tests force offline config via `tests/conftest.py` (sets `LLM_PROVIDER=mock` etc
   `agents/custom.py` for bespoke logic).
 - **New provider:** add a subclass in `brains/providers/` and a branch in
   `brains/factory.py._build`.
+- **New MCP connector preset:** add a `ConnectorSpec` to
+  `tools/mcp/catalog.py`. Servers are enabled from the console (🔌 MCP); their
+  discovered tools are cached in `data/mcp_servers.json` so startup stays
+  offline — live MCP sessions only open when a tool runs. Remote servers with
+  `auth="oauth"` need no keys: Connect runs the MCP OAuth 2.1 flow
+  (`tools/mcp/oauth.py` — discovery, dynamic client registration, PKCE, token
+  refresh) via the provider's consent page in the browser; tokens live in the
+  store entry's `auth` field and refresh transparently before tool calls.
 
 After any change: `make lint && make test`.
 

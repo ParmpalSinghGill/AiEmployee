@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=AI Employee
+Comment=Start the AI Employee server in the background and open the console
+Exec=/media/parmpal/Data/Codes/VibeCoding/AIEmployee/start_server.sh
+Path=/media/parmpal/Data/Codes/VibeCoding/AIEmployee
+Icon=applications-science
+Terminal=false
+Categories=Development;

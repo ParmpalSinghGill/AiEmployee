@@ -51,6 +51,7 @@ your approval before it downloads anything large.
 | **Parallel execution** | Independent plan steps run **concurrently**; dependent steps wait and start the instant they're unblocked. One toggle in the console. |
 | **Hierarchical planning** | Goal → decomposition → agent assignment → execution → verification → reflection → memory. |
 | **Tools** | **24 sandboxed tools**: filesystem, Python/shell execution, HTTP, web fetch/search, CSV/JSON, hub search (HF/Kaggle/Roboflow/arXiv/GitHub) — with a human-approval gate for sensitive ops. |
+| **MCP connectors** | Plug in popular **Model Context Protocol** servers from the console — GitHub, Git, Gmail, Google Calendar/Drive/Maps, Slack, Postgres, SQLite, Brave Search, Playwright, Notion, Linear, Sentry, Context7, or any custom stdio/HTTP server. Their tools appear to every agent as `mcp_*` tools, with an optional approval gate per connector. |
 | **Asset reuse** | Downloaded models/datasets are indexed workspace-wide and **never fetched twice** — enforced in the download tool, not just suggested to the model. |
 | **Memory** | Short-term, long-term, conversation, task, knowledge, project, skill — over pgvector or in-memory. |
 | **RAG** | Ingest PDF, Markdown, Word, PowerPoint, CSV, Excel, web pages, codebases; chunk, embed, retrieve, ground. |

@@ -89,14 +89,28 @@ class ToolRegistry:
         arguments = arguments or {}
 
         approval_key = tool.requires_approval(arguments)
+        approved_by = "human" if approved else "auto"
         if approval_key and approval_key in self._settings.approval_required and not approved:
-            log.info(
-                "tool.approval_required",
-                tool=name,
-                key=approval_key,
-                args=clip_obj(arguments),
-            )
-            raise ApprovalRequired(approval_key, payload={"tool": name, "args": arguments})
+            from ai_employee.config.approval_policies import auto_allows
+
+            if auto_allows(self._settings, approval_key, arguments):
+                # Operator policy grants this call (recipients matched, quota
+                # free) — proceed without pausing, and audit it as such.
+                approved_by = "policy"
+                log.info(
+                    "tool.approval_policy_granted",
+                    tool=name,
+                    key=approval_key,
+                    args=clip_obj(arguments),
+                )
+            else:
+                log.info(
+                    "tool.approval_required",
+                    tool=name,
+                    key=approval_key,
+                    args=clip_obj(arguments),
+                )
+                raise ApprovalRequired(approval_key, payload={"tool": name, "args": arguments})
 
         history = current_tool_history()
         if history is not None:
@@ -134,15 +148,37 @@ class ToolRegistry:
             output=clip(result.as_text()),
             error=result.error,
         )
+        if approval_key:  # sensitive op executed — put it on the audit trail
+            import structlog
+
+            from ai_employee.observability.audit import record_action
+
+            record_action(
+                self._settings,
+                tool=name,
+                approval_key=approval_key,
+                arguments=arguments,
+                ok=result.ok,
+                approved_by=approved_by,
+                task_id=structlog.contextvars.get_contextvars().get("task_id"),
+            )
         if history is not None and result.ok:
             history.record(name, arguments, result)
         return result
 
 
 def default_registry(settings: Settings | None = None) -> ToolRegistry:
-    """Build a registry pre-loaded with all built-in tools."""
+    """Build a registry pre-loaded with all built-in tools + enabled MCP connectors."""
     from ai_employee.tools.builtins import build_builtin_tools
+    from ai_employee.tools.mcp import build_mcp_tools
 
-    reg = ToolRegistry(settings)
-    reg.register_many(build_builtin_tools(settings or get_settings()))
+    s = settings or get_settings()
+    reg = ToolRegistry(s)
+    reg.register_many(build_builtin_tools(s))
+    try:
+        # Offline-safe: proxies come from the cached tool lists in the MCP store;
+        # no server is spawned or contacted until a tool actually runs.
+        reg.register_many(build_mcp_tools(s), replace=True)
+    except Exception as exc:  # noqa: BLE001 - a bad MCP config must not block startup
+        log.warning("mcp.load_failed", error=str(exc))
     return reg

@@ -22,9 +22,21 @@ from pydantic import BaseModel
 
 from ai_employee.brains.base import Brain
 from ai_employee.brains.schemas import ChatResult, Message, ToolSpec
-from ai_employee.core.usage import brain_label, record_usage
+from ai_employee.core.exceptions import BudgetExceeded
+from ai_employee.core.usage import active_meters, brain_label, record_usage
 
 TModel = TypeVar("TModel", bound=BaseModel)
+
+
+def _enforce_budget() -> None:
+    """Refuse the call if any active meter has spent its token budget.
+
+    Enforcement lives here — outside the model — so no prompt can talk the
+    system past its cap: once exhausted, every further LLM call raises.
+    """
+    for meter in active_meters():
+        if meter.budget and meter.total_tokens >= meter.budget:
+            raise BudgetExceeded(meter.total_tokens, meter.budget)
 
 
 class MeteredBrain(Brain):
@@ -53,6 +65,7 @@ class MeteredBrain(Brain):
         model: str | None = None,
         reasoning: bool = False,
     ) -> ChatResult:
+        _enforce_budget()
         with brain_label(self._inner.name, model or self._inner.model_name):
             result = await self._inner.chat(
                 messages,
@@ -73,6 +86,7 @@ class MeteredBrain(Brain):
         temperature: float | None = None,
         model: str | None = None,
     ) -> TModel:
+        _enforce_budget()
         with brain_label(self._inner.name, model or self._inner.model_name):
             return await self._inner.structured_output(
                 messages, schema, temperature=temperature, model=model

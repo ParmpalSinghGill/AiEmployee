@@ -527,11 +527,18 @@ function autoApprovePausedTasks() {
   }
 }
 
+function tokenBudget() {
+  const el = $("#token-budget");
+  const v = el ? parseInt(el.value, 10) : 0;
+  return Number.isFinite(v) && v > 0 ? v : null;
+}
+
 async function newTask(goal, mode) {
   const body = {
     goal,
     mode: mode || "task",
     auto_approve: isAutoApprove(),
+    token_budget: tokenBudget(),
   };
   const { task_id, session_id } = await api("POST", "/ui/api/tasks", body);
   const session = {
@@ -1216,15 +1223,20 @@ function renderFlow(task, session) {
     nodes.push(nodeHtml("step" + (s.running ? " is-running" : ""), `Step ${s.step} · agent`, "▣",
       s.agent, live + chips + badge + retry, "comp:step:" + s.step));
   }
-  if (fl.approval && (task.status === "awaiting_approval" || task.status === "waiting_for_user"))
-    nodes.push(approvalNode(fl.approval, task));
+  // Always offer the approve control in-flow while paused — fall back to the
+  // result payload (or a generic card) when the approval events were trimmed.
+  const pausedNow = task.status === "awaiting_approval" || task.status === "waiting_for_user";
+  const apprInfo = pausedNow
+    ? (fl.approval || (task.result && task.result.needs_approval) || { operation: "sensitive operation" })
+    : null;
+  if (apprInfo) nodes.push(approvalNode(apprInfo, task));
   if (fl.synth) nodes.push(nodeHtml("synthesize", "CEO", "★", "Synthesize", `<div class="node-sub">integrate step outputs</div>`, "comp:synthesize"));
   if (fl.reflect) nodes.push(nodeHtml("reflect", "Memory", "↻", "Reflect", `<div class="node-sub">store outcome + learn skill</div>`, "comp:reflect"));
   // The deliverable itself is produced by synthesis, so Result jumps there.
   if (task.status === "completed") nodes.push(nodeHtml("result", "Output", "✓", "Result", `<div class="node-sub">final deliverable ready</div>`, fl.synth ? "comp:synthesize" : ""));
 
   // Wire the in-flow approve button once it's in the DOM (mirrors the Result tab).
-  if (fl.approval && (task.status === "awaiting_approval" || task.status === "waiting_for_user") && session) {
+  if (apprInfo && session) {
     setTimeout(() => {
       const btn = document.getElementById(`fapprove-${task.id}`);
       if (btn) btn.addEventListener("click", () => {
@@ -2067,6 +2079,9 @@ $("#memory-badge").addEventListener("click", openMemoryPicker);
 $("#brain-badge").addEventListener("click", openBrainPicker);
 $("#coding-badge").addEventListener("click", openCodingPicker);
 $("#keys-badge").addEventListener("click", openKeysModal);
+$("#mcp-badge").addEventListener("click", openMcpModal);
+$("#schedules-badge").addEventListener("click", openSchedulesModal);
+$("#autonomy-badge").addEventListener("click", openAutonomyModal);
 $("#usage-badge").addEventListener("click", openUsageModal);
 
 /* ── Token usage dashboard (per brain, by date) ─────────────────────────── */
@@ -2248,6 +2263,458 @@ function keyRow(overlay, k) {
     } catch (e) { alert("Failed: " + e.message); }
   });
   return row;
+}
+
+/* ── MCP connectors modal (enable popular MCP servers as tools) ──────────── */
+let _mcpModal = null;
+
+async function openMcpModal() {
+  if (_mcpModal) return;
+  let data;
+  try { data = await api("GET", "/ui/api/mcp/options"); }
+  catch (e) { alert("Failed to load MCP connectors: " + e.message); return; }
+
+  const overlay = el(`<div class="modal-overlay"><div class="modal mcp-modal">
+    <div class="modal-head"><h3>🔌 MCP connectors</h3><button class="icon-btn modal-close" title="Close">✕</button></div>
+    <p class="modal-sub">Plug external <b>Model Context Protocol</b> servers into the employee —
+       their tools appear to every agent as <code>mcp_*</code> tools. Connecting may take a
+       moment the first time (the server package is downloaded).</p>
+    <div class="keys-body mcp-body"></div>
+  </div></div>`);
+  document.body.appendChild(overlay);
+  _mcpModal = overlay;
+
+  const close = () => { overlay.remove(); _mcpModal = null; };
+  $(".modal-close", overlay).addEventListener("click", close);
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+  renderMcp(overlay, data);
+}
+
+function renderMcp(overlay, data) {
+  const body = $(".mcp-body", overlay);
+  body.innerHTML = "";
+  const rt = data.runtime || {};
+  renderGoogleAccounts(body);  // async — fills its own section when loaded
+  if (!rt.sdk) {
+    body.appendChild(el(`<div class="key-status err" style="padding-top:10px">
+      ✗ The <code>mcp</code> Python package is not installed — run <code>pip install mcp</code> and restart.</div>`));
+  }
+  const groups = [
+    ["Enabled", data.connectors.filter(c => c.configured && c.enabled)],
+    ["Disabled", data.connectors.filter(c => c.configured && !c.enabled)],
+    ["Available", data.connectors.filter(c => !c.configured)],
+  ];
+  for (const [title, list] of groups) {
+    if (!list.length) continue;
+    const group = el(`<div class="key-group"><h4>${esc(title)}</h4></div>`);
+    list.forEach(c => group.appendChild(mcpRow(overlay, c, rt)));
+    body.appendChild(group);
+  }
+}
+
+function mcpRow(overlay, c, rt) {
+  const rtMissing = c.runtime && rt[c.runtime] === false;
+  let status;
+  if (c.error) status = `<span class="key-unset" style="color:var(--red)">error</span>`;
+  else if (c.configured && c.tools.length) status = `<span class="key-set">● ${c.tools.length} tool${c.tools.length === 1 ? "" : "s"}</span>`;
+  else if (c.configured) status = `<span class="key-unset">no tools yet</span>`;
+  else status = `<span class="key-unset">not connected</span>`;
+  const tags =
+    (c.require_approval ? ` <span class="key-tag">approval-gated</span>` : "") +
+    (c.auth === "oauth" ? ` <span class="key-tag" title="Connect opens the provider's consent page in your browser — no API keys needed">🔐 ${c.authorized ? "authorized" : "browser sign-in"}</span>` : "") +
+    (rtMissing ? ` <span class="key-tag" style="color:var(--red);border-color:var(--red)">needs ${esc(c.runtime)}</span>` : "");
+
+  const paramInputs = c.params.map(p => `
+    <input class="key-input mcp-param" data-param="${esc(p.name)}"
+           type="${p.secret ? "password" : "text"}"
+           placeholder="${esc(p.label)}${p.required ? "" : " (optional)"}${p.configured ? " — saved: " + esc(p.masked || "set") : (p.default ? " — default: " + esc(p.default) : "")}"
+           title="${esc(p.description || p.label)}" />`).join("");
+
+  const row = el(`<div class="key-row">
+    <div class="key-info">
+      <div class="key-label">${esc(c.label)} ${status}${tags}</div>
+      <div class="key-desc">${esc(c.description)}
+        ${c.docs ? ` <a class="x-link" href="${esc(c.docs)}" target="_blank" rel="noopener">docs ↗</a>` : ""}</div>
+      ${c.tools.length ? `<div class="mcp-tools">${c.tools.map(t => `<code>${esc(t)}</code>`).join(" ")}</div>` : ""}
+    </div>
+    <div class="key-actions">
+      ${paramInputs}
+      <label class="mcp-approve" title="Pause for human approval before any tool of this connector runs">
+        <input type="checkbox" class="mcp-approve-box" ${c.require_approval ? "checked" : ""} /> approval
+      </label>
+      <button class="btn key-test mcp-connect">${c.configured ? "Reconnect" : "Connect"}</button>
+      ${c.configured ? `<button class="btn mcp-toggle">${c.enabled ? "Disable" : "Enable"}</button>` : ""}
+      <button class="btn key-del mcp-del" ${c.configured ? "" : "disabled"}>Remove</button>
+    </div>
+    <div class="key-status">${c.error ? "✗ " + esc(c.error) : ""}</div></div>`);
+  if (c.error) $(".key-status", row).classList.add("err");
+
+  const statusEl = $(".key-status", row);
+  const refresh = async () => renderMcp(overlay, await api("GET", "/ui/api/mcp/options"));
+
+  $(".mcp-connect", row).addEventListener("click", async () => {
+    const btn = $(".mcp-connect", row);
+    btn.textContent = "Connecting…"; btn.disabled = true;
+    statusEl.className = "key-status"; statusEl.textContent = "Starting the server and listing its tools…";
+    const params = {};
+    row.querySelectorAll(".mcp-param").forEach(i => { params[i.dataset.param] = i.value.trim(); });
+    try {
+      const res = await api("PUT", `/ui/api/mcp/servers/${c.id}`, {
+        params, require_approval: $(".mcp-approve-box", row).checked,
+      });
+      if (res.ok) { await refresh(); return; }
+      if (res.needs_auth) {  // OAuth connector: open the provider's consent page
+        const ok = await mcpOauthFlow(c, btn, statusEl);
+        if (ok) { await refresh(); return; }
+      } else {
+        statusEl.className = "key-status err"; statusEl.textContent = "✗ " + res.error;
+      }
+    } catch (e) {
+      statusEl.className = "key-status err"; statusEl.textContent = "✗ " + e.message;
+    }
+    btn.textContent = c.configured ? "Reconnect" : "Connect"; btn.disabled = false;
+  });
+
+  const toggleBtn = $(".mcp-toggle", row);
+  if (toggleBtn) toggleBtn.addEventListener("click", async () => {
+    toggleBtn.disabled = true;
+    try { await api("POST", `/ui/api/mcp/servers/${c.id}/toggle`, { enabled: !c.enabled }); await refresh(); }
+    catch (e) { alert("Failed: " + e.message); toggleBtn.disabled = false; }
+  });
+
+  $(".mcp-del", row).addEventListener("click", async () => {
+    if (!confirm(`Remove the ${c.label} connector and its saved settings?`)) return;
+    try { await api("DELETE", `/ui/api/mcp/servers/${c.id}`); await refresh(); }
+    catch (e) { alert("Failed: " + e.message); }
+  });
+  return row;
+}
+
+/* ── Google accounts (Gmail & Calendar via the operator's OAuth app) ──────── */
+async function renderGoogleAccounts(body) {
+  const section = el(`<div class="key-group"><h4>Google accounts (Gmail &amp; Calendar)</h4></div>`);
+  body.prepend(section);
+  let st;
+  try { st = await api("GET", "/ui/api/google/status"); }
+  catch { section.remove(); return; }
+
+  if (!st.configured) {
+    section.appendChild(el(`<div class="key-row"><div class="key-info">
+      <div class="key-desc">One-time operator setup: put your Google Cloud
+      <code>client_secret.json</code> at <code>${esc(st.client_file)}</code> and restart.
+      After that, anyone can connect their own Gmail/Calendar with one click.</div>
+    </div></div>`));
+    return;
+  }
+
+  for (const a of st.accounts) {
+    const row = el(`<div class="key-row">
+      <div class="key-info">
+        <div class="key-label">${esc(a.email)} <span class="key-set">● connected</span></div>
+        <div class="key-desc">since ${esc(a.connected_at || "?")}</div>
+      </div>
+      <div class="key-actions"><button class="btn key-del">Disconnect</button></div>
+      <div class="key-status"></div></div>`);
+    $(".key-del", row).addEventListener("click", async () => {
+      if (!confirm(`Disconnect ${a.email}? The AI employee loses access to this mailbox.`)) return;
+      try { await api("DELETE", `/ui/api/google/accounts/${encodeURIComponent(a.email)}`); row.remove(); }
+      catch (e) { alert("Failed: " + e.message); }
+    });
+    section.appendChild(row);
+  }
+
+  const addRow = el(`<div class="key-row">
+    <div class="key-info"><div class="key-desc">Connect a Google account — approve on Google's
+      consent page; the employee's <code>gmail_*</code>/<code>calendar_*</code> tools then act on that mailbox.
+      Sending mail & creating events stay approval-gated.</div></div>
+    <div class="key-actions"><button class="btn key-test google-connect">Connect Google account</button></div>
+    <div class="key-status"></div></div>`);
+  const btn = $(".google-connect", addRow), statusEl = $(".key-status", addRow);
+  btn.addEventListener("click", async () => {
+    btn.disabled = true; btn.textContent = "Waiting for approval…";
+    statusEl.className = "key-status"; statusEl.textContent = "Approve in the Google window that just opened…";
+    try {
+      const res = await api("POST", "/ui/api/google/authorize", {});
+      const popup = window.open(res.auth_url, "google-oauth", "width=620,height=760");
+      if (!popup) window.open(res.auth_url, "_blank");
+      const before = st.accounts.length, deadline = Date.now() + 3 * 60 * 1000;
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 2000));
+        let cur;
+        try { cur = await api("GET", "/ui/api/google/status"); } catch { continue; }
+        if (cur.accounts.length > before) {  // re-render the whole section fresh
+          section.remove(); renderGoogleAccounts(body); return;
+        }
+      }
+      statusEl.className = "key-status err";
+      statusEl.textContent = "✗ Timed out waiting for approval — try again.";
+    } catch (e) {
+      statusEl.className = "key-status err"; statusEl.textContent = "✗ " + e.message;
+    }
+    btn.disabled = false; btn.textContent = "Connect Google account";
+  });
+  section.appendChild(addRow);
+}
+
+/* ── ⏰ Schedules modal (recurring tasks, one-shots, Gmail watchers) ───────── */
+let _schedModal = null;
+
+async function openSchedulesModal() {
+  if (_schedModal) return;
+  const overlay = el(`<div class="modal-overlay"><div class="modal sched-modal">
+    <div class="modal-head"><h3>⏰ Scheduled tasks &amp; watchers</h3><button class="icon-btn modal-close" title="Close">✕</button></div>
+    <p class="modal-sub">The employee works while you're away: run a goal on a schedule, once at a
+      set time, or whenever new email matches a Gmail search. Runs appear as normal tasks —
+      they pause for approvals and push to your phone if notifications are set up.</p>
+    <div class="keys-body sched-body"></div>
+  </div></div>`);
+  document.body.appendChild(overlay);
+  _schedModal = overlay;
+  const close = () => { overlay.remove(); _schedModal = null; };
+  $(".modal-close", overlay).addEventListener("click", close);
+  overlay.addEventListener("click", e => { if (e.target === overlay) close(); });
+  renderSchedules(overlay);
+}
+
+function schedSummary(s) {
+  if (s.type === "once") return `once at ${s.run_at}`;
+  if (s.type === "gmail_watch") return `watch Gmail "${s.query}" every ${s.interval_minutes} min`;
+  if (s.every_minutes) return `every ${s.every_minutes} min`;
+  const days = s.days ? ` on days ${s.days.join(",")}` : " daily";
+  return `at ${s.at}${days}`;
+}
+
+async function renderSchedules(overlay) {
+  const body = $(".sched-body", overlay);
+  let data;
+  try { data = await api("GET", "/ui/api/schedules"); }
+  catch (e) { body.innerHTML = `<div class="key-status err">✗ ${esc(e.message)}</div>`; return; }
+  body.innerHTML = "";
+  const refresh = () => renderSchedules(overlay);
+
+  const list = el(`<div class="key-group"><h4>Configured</h4></div>`);
+  if (!data.schedules.length)
+    list.appendChild(el(`<div class="key-row"><div class="key-info"><div class="key-desc">Nothing scheduled yet.</div></div></div>`));
+  for (const s of data.schedules) {
+    const status = s.enabled
+      ? `<span class="key-set">● on</span>` : `<span class="key-unset">off</span>`;
+    const err = s.last_error ? `<div class="key-status err">✗ ${esc(s.last_error)}</div>` : "";
+    const row = el(`<div class="key-row">
+      <div class="key-info">
+        <div class="key-label">${esc(s.name)} ${status} <span class="key-tag">${esc(schedSummary(s))}</span>
+          ${s.auto_approve ? '<span class="key-tag">auto-approve</span>' : ""}</div>
+        <div class="key-desc">${esc(s.goal.slice(0, 160))}</div>
+        <div class="key-desc muted">next: ${esc(s.next_run || "—")} · last: ${esc(s.last_run || "never")} · runs: ${s.runs}</div>
+      </div>
+      <div class="key-actions">
+        <button class="btn key-test sch-run">Run now</button>
+        <button class="btn sch-toggle">${s.enabled ? "Disable" : "Enable"}</button>
+        <button class="btn key-del sch-del">Delete</button>
+      </div>${err}</div>`);
+    $(".sch-run", row).addEventListener("click", async () => {
+      try { await api("POST", `/ui/api/schedules/${s.id}/run_now`); loadSessionList(); refresh(); }
+      catch (e) { alert("Failed: " + e.message); }
+    });
+    $(".sch-toggle", row).addEventListener("click", async () => {
+      try { await api("PUT", `/ui/api/schedules/${s.id}`, { enabled: !s.enabled }); refresh(); }
+      catch (e) { alert("Failed: " + e.message); }
+    });
+    $(".sch-del", row).addEventListener("click", async () => {
+      if (!confirm(`Delete schedule "${s.name}"?`)) return;
+      try { await api("DELETE", `/ui/api/schedules/${s.id}`); refresh(); }
+      catch (e) { alert("Failed: " + e.message); }
+    });
+    list.appendChild(row);
+  }
+  body.appendChild(list);
+
+  const form = el(`<div class="key-group"><h4>New schedule</h4>
+    <div class="sched-form">
+      <input class="key-input" id="sch-name" placeholder="Name (optional)" />
+      <textarea class="key-input" id="sch-goal" rows="2" placeholder="Goal, e.g. Summarize my unread emails and today's calendar, then email me the briefing"></textarea>
+      <div class="sched-form-row">
+        <select class="key-input" id="sch-type">
+          <option value="daily">Daily at time</option>
+          <option value="every">Every N minutes</option>
+          <option value="once">Once at date/time</option>
+          <option value="gmail">When new Gmail matches…</option>
+        </select>
+        <input class="key-input" id="sch-at" type="time" value="08:00" />
+        <input class="key-input hidden" id="sch-every" type="number" min="1" placeholder="minutes" />
+        <input class="key-input hidden" id="sch-once" type="datetime-local" />
+        <input class="key-input hidden" id="sch-query" placeholder='Gmail query, e.g. is:unread from:boss@co.com' />
+        <label class="mcp-approve" title="Never pause this schedule's runs for approval">
+          <input type="checkbox" id="sch-auto" /> auto-approve</label>
+        <button class="btn primary" id="sch-add">Add</button>
+      </div>
+      <div class="key-status" id="sch-status"></div>
+    </div></div>`);
+  const typeSel = $("#sch-type", form);
+  const show = id => {
+    for (const f of ["sch-at", "sch-every", "sch-once", "sch-query"])
+      $("#" + f, form).classList.toggle("hidden", f !== id);
+  };
+  typeSel.addEventListener("change", () => {
+    show({ daily: "sch-at", every: "sch-every", once: "sch-once", gmail: "sch-query" }[typeSel.value]);
+  });
+  $("#sch-add", form).addEventListener("click", async () => {
+    const t = typeSel.value;
+    const payload = {
+      name: $("#sch-name", form).value.trim(),
+      goal: $("#sch-goal", form).value.trim(),
+      auto_approve: $("#sch-auto", form).checked,
+      type: t === "gmail" ? "gmail_watch" : t === "once" ? "once" : "recurring",
+    };
+    if (t === "daily") payload.at = $("#sch-at", form).value;
+    if (t === "every") payload.every_minutes = parseInt($("#sch-every", form).value, 10) || null;
+    if (t === "once") payload.run_at = $("#sch-once", form).value;
+    if (t === "gmail") { payload.query = $("#sch-query", form).value.trim(); payload.interval_minutes = 5; }
+    const st = $("#sch-status", form);
+    try { await api("POST", "/ui/api/schedules", payload); refresh(); }
+    catch (e) { st.className = "key-status err"; st.textContent = "✗ " + e.message; }
+  });
+  body.appendChild(form);
+}
+
+/* ── 🛡 Autonomy modal (approval policies, notifications, budget, audit) ──── */
+let _autoModal = null;
+
+async function openAutonomyModal() {
+  if (_autoModal) return;
+  const overlay = el(`<div class="modal-overlay"><div class="modal autonomy-modal">
+    <div class="modal-head"><h3>🛡 Autonomy &amp; safety</h3><button class="icon-btn modal-close" title="Close">✕</button></div>
+    <p class="modal-sub">How much the employee may do on its own — and a full trail of what it has done.</p>
+    <div class="keys-body autonomy-body"></div>
+  </div></div>`);
+  document.body.appendChild(overlay);
+  _autoModal = overlay;
+  const close = () => { overlay.remove(); _autoModal = null; };
+  $(".modal-close", overlay).addEventListener("click", close);
+  overlay.addEventListener("click", e => { if (e.target === overlay) close(); });
+  renderAutonomy(overlay);
+}
+
+async function renderAutonomy(overlay) {
+  const body = $(".autonomy-body", overlay);
+  let st, audit;
+  try {
+    st = await api("GET", "/ui/api/autonomy");
+    audit = await api("GET", "/ui/api/audit?limit=50");
+  } catch (e) { body.innerHTML = `<div class="key-status err">✗ ${esc(e.message)}</div>`; return; }
+  body.innerHTML = "";
+
+  // Push notifications
+  const ntfy = el(`<div class="key-group"><h4>Phone notifications</h4>
+    <div class="key-row"><div class="key-info">
+      <div class="key-label">ntfy ${st.ntfy.enabled ? '<span class="key-set">● configured</span>' : '<span class="key-unset">off</span>'}</div>
+      <div class="key-desc">${st.ntfy.enabled
+        ? `Pushes to topic ${esc(st.ntfy.topic)} on ${esc(st.ntfy.server)} when a run needs approval, completes, or fails.`
+        : `Set <code>NTFY_TOPIC=&lt;a-long-random-name&gt;</code> in <code>.env</code>, restart, and subscribe to the same topic in the free ntfy app — approvals then reach your phone.`}</div>
+    </div>
+    <div class="key-actions">${st.ntfy.enabled ? '<button class="btn key-test ntfy-test">Send test</button>' : ""}</div>
+    <div class="key-status"></div></div></div>`);
+  const testBtn = $(".ntfy-test", ntfy);
+  if (testBtn) testBtn.addEventListener("click", async () => {
+    const s2 = $(".key-status", ntfy);
+    try { await api("POST", "/ui/api/autonomy/notify_test"); s2.className = "key-status ok"; s2.textContent = "✓ sent — check your phone"; }
+    catch (e) { s2.className = "key-status err"; s2.textContent = "✗ " + e.message; }
+  });
+  body.appendChild(ntfy);
+
+  // Approval policies
+  const pol = el(`<div class="key-group"><h4>Approval policies</h4>
+    <div class="key-desc" style="margin:4px 0 8px">Per operation: keep the human gate, or auto-approve
+      within limits (recipient patterns like <code>*@yourco.com</code>, and a daily quota counted from the audit trail).</div>
+    <div class="policy-rows"></div>
+    <div class="key-actions" style="margin-top:8px"><button class="btn primary pol-save">Save policies</button></div>
+    <div class="key-status"></div></div>`);
+  const rows = $(".policy-rows", pol);
+  for (const key of st.approval_keys) {
+    const p = st.policies[key] || {};
+    rows.appendChild(el(`<div class="policy-row" data-key="${esc(key)}">
+      <code class="policy-key">${esc(key)}</code>
+      <select class="key-input pol-mode">
+        <option value="gate" ${p.mode !== "auto" ? "selected" : ""}>ask a human</option>
+        <option value="auto" ${p.mode === "auto" ? "selected" : ""}>auto-approve</option>
+      </select>
+      <input class="key-input pol-recipients" placeholder="allowed recipients (comma, * ok)"
+             value="${esc((p.allow_recipients || []).join(", "))}" />
+      <input class="key-input pol-limit" type="number" min="0" placeholder="daily limit"
+             value="${p.daily_limit || ""}" />
+    </div>`));
+  }
+  $(".pol-save", pol).addEventListener("click", async () => {
+    const policies = {};
+    rows.querySelectorAll(".policy-row").forEach(r => {
+      const mode = $(".pol-mode", r).value;
+      const recipients = $(".pol-recipients", r).value.split(",").map(s => s.trim()).filter(Boolean);
+      const limit = parseInt($(".pol-limit", r).value, 10);
+      if (mode === "auto" || recipients.length || limit) {
+        policies[r.dataset.key] = { mode };
+        if (recipients.length) policies[r.dataset.key].allow_recipients = recipients;
+        if (limit) policies[r.dataset.key].daily_limit = limit;
+      }
+    });
+    const s2 = $(".key-status", pol);
+    try { await api("PUT", "/ui/api/autonomy/policies", { policies }); s2.className = "key-status ok"; s2.textContent = "✓ saved"; }
+    catch (e) { s2.className = "key-status err"; s2.textContent = "✗ " + e.message; }
+  });
+  body.appendChild(pol);
+
+  // Budget
+  body.appendChild(el(`<div class="key-group"><h4>Token budget</h4>
+    <div class="key-row"><div class="key-info"><div class="key-desc">
+      Global default: <b>${st.task_token_budget ? st.task_token_budget.toLocaleString() + " tokens/task" : "unlimited"}</b>
+      (set <code>TASK_TOKEN_BUDGET</code> in <code>.env</code>). Per-run override: the “∞ tokens” box next to
+      the Run button. A run that hits its cap stops with a clear budget error.</div></div></div></div>`));
+
+  // Audit trail
+  const au = el(`<div class="key-group"><h4>Audit trail — every sensitive action, all tasks</h4>
+    <div class="audit-rows"></div></div>`);
+  const ar = $(".audit-rows", au);
+  if (!audit.actions.length)
+    ar.appendChild(el(`<div class="key-desc">Nothing yet — sensitive tool runs (mail sends, calendar writes, shell writes, MCP calls…) will appear here.</div>`));
+  for (const a of audit.actions) {
+    const argsTxt = Object.entries(a.args || {}).map(([k, v]) => `${k}=${v}`).join("  ").slice(0, 180);
+    ar.appendChild(el(`<div class="audit-row ${a.ok ? "" : "audit-fail"}">
+      <span class="audit-ts">${esc(a.ts)}</span>
+      <code>${esc(a.tool)}</code>
+      <span class="key-tag">${esc(a.approved_by)}</span>
+      <span class="audit-args">${esc(argsTxt)}</span>
+      <span>${a.ok ? "✓" : "✗"}</span></div>`));
+  }
+  body.appendChild(au);
+}
+
+/* Open the provider's consent page in a popup, then poll until the callback
+   route has exchanged the code and the connector reports its tools. */
+async function mcpOauthFlow(c, btn, statusEl) {
+  let auth;
+  try { auth = await api("POST", `/ui/api/mcp/servers/${c.id}/authorize`, {}); }
+  catch (e) {
+    statusEl.className = "key-status err"; statusEl.textContent = "✗ " + e.message;
+    return false;
+  }
+  const popup = window.open(auth.auth_url, "mcp-oauth", "width=620,height=760");
+  if (!popup) { window.open(auth.auth_url, "_blank"); }
+  btn.textContent = "Waiting for approval…";
+  statusEl.className = "key-status";
+  statusEl.textContent = `Approve ${c.label} in the window that just opened…`;
+  const deadline = Date.now() + 3 * 60 * 1000;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 2000));
+    let opts;
+    try { opts = await api("GET", "/ui/api/mcp/options"); } catch { continue; }
+    const cur = (opts.connectors || []).find(x => x.id === c.id) || {};
+    if (cur.tools && cur.tools.length) return true;
+    if (cur.error) {
+      statusEl.className = "key-status err"; statusEl.textContent = "✗ " + cur.error;
+      return false;
+    }
+  }
+  statusEl.className = "key-status err";
+  statusEl.textContent = "✗ Timed out waiting for approval — click Connect to try again.";
+  return false;
 }
 
 /* ── Coding-agent backend badge + picker (brain / Claude / Codex / Cursor) ─ */

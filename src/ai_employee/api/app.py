@@ -34,7 +34,20 @@ async def lifespan(app: FastAPI):
             log.info("api.resumed_tasks", count=len(resumed))
     except Exception as exc:  # noqa: BLE001 - startup must not fail on resume issues
         log.warning("api.resume_failed", error=str(exc))
+    # Scheduled tasks & watchers (⏰): fire due schedules through the TaskManager.
+    runner = None
+    try:
+        from ai_employee.api.deps import get_employee
+        from ai_employee.observability import get_task_manager
+        from ai_employee.observability.schedules import SchedulerRunner
+
+        runner = SchedulerRunner(s, get_employee, get_task_manager())
+        runner.start()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("api.scheduler_failed", error=str(exc))
     yield
+    if runner is not None:
+        await runner.stop()
     await shutdown_employee()
     log.info("api.shutdown")
 

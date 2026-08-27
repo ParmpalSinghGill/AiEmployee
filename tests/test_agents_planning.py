@@ -682,3 +682,21 @@ async def test_complete_answer_is_not_retried(settings):
     )
     assert len(calls) == 1
     assert result.output.startswith("A short but complete")
+
+
+async def test_human_approval_agent_honors_granted_approval(brain, settings):
+    """Approve → resume must NOT re-request the same approval (infinite loop)."""
+    from ai_employee.agents.custom import HumanApprovalAgent
+
+    agent = HumanApprovalAgent()
+    op = "Send the launch email to the whole list"
+    ctx = AgentContext(brain=brain, tools=default_registry(settings))
+
+    first = await agent.run(op, ctx)
+    assert not first.success and first.needs_approval == {"operation": op}
+
+    ctx_approved = AgentContext(
+        brain=brain, tools=default_registry(settings), approved_ops={op}
+    )
+    second = await agent.run(op, ctx_approved)
+    assert second.success and not second.needs_approval

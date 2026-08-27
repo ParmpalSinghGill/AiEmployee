@@ -159,10 +159,51 @@ class Settings(BaseSettings):
     smtp_user: str = ""
     smtp_password: str = ""
 
+    # ── MCP connectors (Model Context Protocol servers) ──────────────────────
+    # JSON store of enabled connectors + their cached tool lists (UI-managed).
+    mcp_config_file: Path = Path("./data/mcp_servers.json")
+    # Per-call timeout; also bounds connect/discovery (npx may download on first use).
+    mcp_call_timeout: int = 120
+
+    # ── Google Workspace (Gmail / Calendar with YOUR registered OAuth app) ───
+    # Drop the client_secret.json you download from Google Cloud console here;
+    # every app user can then click "Connect Google account" and approve on
+    # Google's consent page — no keys or setup on their side.
+    google_oauth_client_file: Path = Path("./data/google_oauth_client.json")
+    # Per-account tokens granted by users (chmod 600, refreshed automatically).
+    google_accounts_file: Path = Path("./data/google_accounts.json")
+    # Scopes requested at consent (comma-separated). gmail.readonly/send are
+    # "restricted" scopes — publishing beyond test users needs Google review.
+    google_oauth_scopes: str = (
+        "openid,https://www.googleapis.com/auth/userinfo.email,"
+        "https://www.googleapis.com/auth/gmail.readonly,"
+        "https://www.googleapis.com/auth/gmail.send,"
+        "https://www.googleapis.com/auth/calendar"
+    )
+
     # ── Safety / autonomy ────────────────────────────────────────────────────
     require_approval_for: str = (
-        "shell_write,email_send,git_push,db_write,deploy,resource_download,resource_acquisition"
+        "shell_write,email_send,git_push,db_write,deploy,resource_download,"
+        "resource_acquisition,mcp_tool,calendar_write"
     )
+    # Rule-based auto-approval (per key: mode/recipient patterns/daily quota),
+    # managed from the console (🛡 Autonomy). Enforced in ToolRegistry.execute.
+    approval_policies_file: Path = Path("./data/approval_policies.json")
+    # Append-only trail of every sensitive-tool execution across all tasks.
+    audit_log_file: Path = Path("./data/audit_log.jsonl")
+    # Hard per-task token cap (0 = unlimited); enforced at the Brain choke point.
+    # Overridable per task from the console.
+    task_token_budget: int = 0
+
+    # ── Push notifications (ntfy.sh — approvals reach your phone) ────────────
+    # Pick a long random topic, subscribe to it in the ntfy app, set it here.
+    ntfy_topic: str = ""
+    ntfy_server: str = "https://ntfy.sh"
+
+    # ── Scheduled tasks & watchers (⏰ console tab) ───────────────────────────
+    schedules_file: Path = Path("./data/schedules.json")
+    # Scheduler tick (seconds); also the floor for watcher poll intervals.
+    scheduler_tick_seconds: int = 30
     enable_code_execution: bool = True
     workspace_dir: Path = Path("./data/workspace")
     # YouTube downloads (yt-dlp). Age-restricted videos need logged-in cookies.

@@ -51,6 +51,18 @@ class VerificationError(AIEmployeeError):
     """Output failed verification and could not be repaired within the retry budget."""
 
 
+class BudgetExceeded(AIEmployeeError):
+    """The run hit its token budget — no further LLM calls are allowed."""
+
+    def __init__(self, spent: int, budget: int) -> None:
+        super().__init__(
+            f"Token budget exhausted: {spent} of {budget} tokens used. "
+            "Raise the budget or re-run without one."
+        )
+        self.spent = spent
+        self.budget = budget
+
+
 class ApprovalRequired(AIEmployeeError):
     """Raised when an operation needs human approval before it can proceed.
 

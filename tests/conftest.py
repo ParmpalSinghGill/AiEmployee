@@ -15,6 +15,12 @@ os.environ.setdefault("SESSIONS_DIR", "./data/test_sessions")
 os.environ.setdefault("SECRETS_FILE", "./data/test_secrets.json")
 os.environ.setdefault("USAGE_LEDGER_FILE", "./data/test_usage.jsonl")
 os.environ.setdefault("UI_PREFERENCES_FILE", "./data/test_ui_preferences.json")
+os.environ.setdefault("MCP_CONFIG_FILE", "./data/test_mcp_servers.json")
+os.environ.setdefault("GOOGLE_OAUTH_CLIENT_FILE", "./data/test_google_oauth_client.json")
+os.environ.setdefault("GOOGLE_ACCOUNTS_FILE", "./data/test_google_accounts.json")
+os.environ.setdefault("SCHEDULES_FILE", "./data/test_schedules.json")
+os.environ.setdefault("APPROVAL_POLICIES_FILE", "./data/test_approval_policies.json")
+os.environ.setdefault("AUDIT_LOG_FILE", "./data/test_audit_log.jsonl")
 os.environ.setdefault("LOG_LEVEL", "ERROR")
 
 
@@ -24,7 +30,16 @@ def _clean_secrets():
     import contextlib
     from pathlib import Path
 
-    paths = [Path(os.environ["SECRETS_FILE"]), Path(os.environ["USAGE_LEDGER_FILE"])]
+    paths = [
+        Path(os.environ["SECRETS_FILE"]),
+        Path(os.environ["USAGE_LEDGER_FILE"]),
+        Path(os.environ["MCP_CONFIG_FILE"]),
+        Path(os.environ["GOOGLE_OAUTH_CLIENT_FILE"]),
+        Path(os.environ["GOOGLE_ACCOUNTS_FILE"]),
+        Path(os.environ["SCHEDULES_FILE"]),
+        Path(os.environ["APPROVAL_POLICIES_FILE"]),
+        Path(os.environ["AUDIT_LOG_FILE"]),
+    ]
     for p in paths:
         with contextlib.suppress(FileNotFoundError):
             p.unlink()

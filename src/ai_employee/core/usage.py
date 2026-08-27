@@ -26,8 +26,11 @@ import structlog
 
 from ai_employee.brains.schemas import Usage
 
-_current_meter: contextvars.ContextVar[TokenMeter | None] = contextvars.ContextVar(
-    "token_meter", default=None
+# A *stack* of active meters: nested track_usage blocks (task wrapper around
+# employee.run's own block) all see every call, so an outer budget meter still
+# totals usage recorded while an inner meter is active.
+_current_meters: contextvars.ContextVar[tuple[TokenMeter, ...]] = contextvars.ContextVar(
+    "token_meters", default=()
 )
 #: (provider, model) of the brain making the current call — set by MeteredBrain so
 #: ``record_usage`` can attribute tokens to a specific brain in the persistent ledger.
@@ -61,12 +64,15 @@ def _purpose() -> str:
 class TokenMeter:
     """Accumulates token usage, with a per-purpose (per-agent) breakdown."""
 
-    def __init__(self) -> None:
+    def __init__(self, budget: int = 0) -> None:
         self.prompt_tokens = 0
         self.completion_tokens = 0
         self.total_tokens = 0
         self.calls = 0
         self.by_purpose: dict[str, dict[str, int]] = {}
+        #: Hard cap on total_tokens (0 = unlimited). Enforced at the Brain
+        #: choke point (MeteredBrain) before each call.
+        self.budget = budget
 
     def record(self, usage: Usage, purpose: str = "llm") -> None:
         total = usage.total_tokens or (usage.prompt_tokens + usage.completion_tokens)
@@ -109,16 +115,20 @@ def brain_label(provider: str, model: str) -> Iterator[None]:
         _brain_label.reset(token)
 
 
-def record_usage(usage: Usage, purpose: str | None = None) -> None:
-    """Add ``usage`` to the active meter and the persistent ledger.
+def active_meters() -> tuple[TokenMeter, ...]:
+    """Every meter bound in the current context (outermost first)."""
+    return _current_meters.get()
 
-    The in-context meter is updated only inside a :func:`track_usage` block; the
+
+def record_usage(usage: Usage, purpose: str | None = None) -> None:
+    """Add ``usage`` to every active meter and the persistent ledger.
+
+    In-context meters are updated only inside :func:`track_usage` blocks; the
     ledger sink (if registered) fires for *every* call so cumulative per-brain
     usage is captured regardless of any active meter.
     """
     p = purpose or _purpose()
-    meter = _current_meter.get()
-    if meter is not None:
+    for meter in _current_meters.get():
         meter.record(usage, p)
     if _sink is not None:
         import contextlib
@@ -129,18 +139,19 @@ def record_usage(usage: Usage, purpose: str | None = None) -> None:
 
 
 @contextmanager
-def track_usage() -> Iterator[TokenMeter]:
-    """Bind a fresh :class:`TokenMeter` for the duration of the block."""
-    meter = TokenMeter()
-    token = _current_meter.set(meter)
+def track_usage(budget: int = 0) -> Iterator[TokenMeter]:
+    """Bind a fresh :class:`TokenMeter` (stacked) for the duration of the block."""
+    meter = TokenMeter(budget=budget)
+    token = _current_meters.set((*_current_meters.get(), meter))
     try:
         yield meter
     finally:
-        _current_meter.reset(token)
+        _current_meters.reset(token)
 
 
 __all__ = [
     "TokenMeter",
+    "active_meters",
     "track_usage",
     "record_usage",
     "register_usage_sink",

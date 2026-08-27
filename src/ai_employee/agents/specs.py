@@ -291,21 +291,28 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
     AgentSpec(
         name="email",
         role="Email Assistant",
-        description="Drafts and (with approval) sends email.",
+        description="Reads, searches, drafts, and (with approval) sends email via connected Gmail.",
         category="comms",
-        tools=("read_file",),
+        tools=("gmail_search", "gmail_read", "gmail_send", "read_file"),
         system_prompt=(
-            "You draft professional, concise emails. Sending requires human approval; "
-            "always present the draft first."
+            "You handle email on the user's connected Gmail account. Use gmail_search/"
+            "gmail_read to find and read mail and gmail_send to send it (sending pauses "
+            "for human approval automatically — don't ask for permission in text, just "
+            "call the tool). Draft professional, concise emails."
         ),
     ),
     AgentSpec(
         name="calendar",
         role="Calendar Assistant",
-        description="Plans schedules and manages events.",
+        description="Reads and manages events on the connected Google Calendar.",
         category="comms",
-        tools=(),
-        system_prompt="You manage calendars: propose schedules, resolve conflicts, summarize agendas.",
+        tools=("calendar_list_events", "calendar_create_event"),
+        system_prompt=(
+            "You manage the user's connected Google Calendar: list events with "
+            "calendar_list_events, create them with calendar_create_event (creation "
+            "pauses for human approval automatically). Propose schedules, resolve "
+            "conflicts, summarize agendas."
+        ),
     ),
     AgentSpec(
         name="git",
