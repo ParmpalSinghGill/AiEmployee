@@ -5,6 +5,7 @@
 - [providers.md](providers.md) — switch the brain, change the model, run local models (Ollama/Qwen3, vLLM, LM Studio).
 - [architecture.md](architecture.md) — layers, the Brain abstraction, LangGraph orchestration, agents, tools, verification.
 - [architecture-diagrams.md](architecture-diagrams.md) — the same design as diagrams: module map, execution graph, agent loop, runtime path.
+- [repo-flow.html](repo-flow.html) — **the whole repo on one flow diagram**: every entry point, the task runner, orchestrator, gates, brains, memory, and where state lives. Self-contained page — open it in any browser, fully offline. Standalone images in [images/](images/): [repo-flow-master.png](images/repo-flow-master.png) (11476×6584) / [.svg](images/repo-flow-master.svg), and [repo-flow-scheduler.png](images/repo-flow-scheduler.png) / [.svg](images/repo-flow-scheduler.svg).
 - [memory.md](memory.md) — memory types, backends (pgvector / in-memory / resilient), RAG pipeline.
 - [extending.md](extending.md) — add a provider, tool, agent, endpoint, or loader.
 - [deployment.md](deployment.md) — Conda, Docker Compose, migrations, secrets, health, safety.
