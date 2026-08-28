@@ -376,7 +376,12 @@ async def test_resume_endpoint_resumes_interrupted_task(monkeypatch):
             "approved_ops": ["shell_write"],
         }
     )
-    session = _Session("Resume interrupted task")
+    # Sessions are owner-scoped now — act as the guest who owns this one.
+    from ai_employee.api.users import COOKIE_NAME, encode_cookie, mint_guest
+    from ai_employee.config import get_settings
+
+    guest = mint_guest()
+    session = _Session("Resume interrupted task", user_id=guest.id, user_name=guest.name)
     session.id = "sess-1"
     session.task_ids = [rec.id]
     tm._sessions[session.id] = session
@@ -412,6 +417,7 @@ async def test_resume_endpoint_resumes_interrupted_task(monkeypatch):
     app.dependency_overrides[get_employee] = lambda: _ResumeEmployee()
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
+        client.cookies.set(COOKIE_NAME, encode_cookie(get_settings(), guest))
         r = await client.post(f"/ui/api/tasks/{rec.id}/resume")
         assert r.status_code == 200
         snap = await _wait_done(client, rec.id)

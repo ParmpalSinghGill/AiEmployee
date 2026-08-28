@@ -214,11 +214,25 @@ class TaskRecord:
 
 
 class _Session:
-    def __init__(self, title: str) -> None:
+    def __init__(
+        self,
+        title: str,
+        *,
+        user_id: str | None = None,
+        user_name: str | None = None,
+        persist: bool = True,
+    ) -> None:
         self.id = _uid()
         self.title = title
         self.created_at = _now()
         self.task_ids: list[str] = []
+        # Owner scoping (optional user accounts). ``user_id is None`` marks a
+        # legacy/system session (e.g. scheduler-fired) visible to everyone.
+        self.user_id = user_id
+        self.user_name = user_name
+        # Guest sessions are memory-only: guests are deliberately not remembered,
+        # so nothing of theirs is written to the session store.
+        self.persist = persist
 
 
 class TaskManager:
@@ -244,7 +258,11 @@ class TaskManager:
         for d in snaps.values():
             self._tasks[d["id"]] = TaskRecord.from_snapshot(d)
         for meta in metas:
-            s = _Session(meta.get("title", "Saved task"))
+            s = _Session(
+                meta.get("title", "Saved task"),
+                user_id=meta.get("user_id"),
+                user_name=meta.get("user_name"),
+            )
             s.id = meta["id"]
             s.task_ids = [t for t in meta.get("run_ids", []) if t in self._tasks]
             created = meta.get("created_at")
@@ -288,16 +306,24 @@ class TaskManager:
         mode: str = "task",
         auto_approve: bool = False,
         token_budget: int | None = None,
+        owner: dict[str, Any] | None = None,
     ) -> TaskRecord:
         """Create a task (new session unless ``session_id`` given) and run it in
         the background. Returns immediately. ``mode`` selects the pipeline:
         ``task`` (general), ``research`` (model/dataset discovery), ``plan``
-        (how-to guide with tools), or ``download`` (direct URL downloader)."""
+        (how-to guide with tools), or ``download`` (direct URL downloader).
+        ``owner`` ({id, name, guest}) scopes the new session to a console user;
+        guest-owned sessions are never persisted."""
         if session_id and session_id in self._sessions:
             session = self._sessions[session_id]
             parent_id = session.task_ids[-1] if session.task_ids else None
         else:
-            session = _Session(title=_title(goal))
+            session = _Session(
+                title=_title(goal),
+                user_id=(owner or {}).get("id"),
+                user_name=(owner or {}).get("name"),
+                persist=not (owner or {}).get("guest", False),
+            )
             self._sessions[session.id] = session
             parent_id = None
 
@@ -628,7 +654,7 @@ class TaskManager:
 
     # ── Persistence ──────────────────────────────────────────────────────────
     def _persist_session(self, session: _Session) -> None:
-        if self._store is None:
+        if self._store is None or not session.persist:
             return
         with contextlib.suppress(Exception):
             self._store.save_session(
@@ -637,12 +663,17 @@ class TaskManager:
                     "title": session.title,
                     "created_at": session.created_at.isoformat(),
                     "run_ids": list(session.task_ids),
+                    "user_id": session.user_id,
+                    "user_name": session.user_name,
                 }
             )
 
     def _persist_task(self, task: TaskRecord) -> None:
         if self._store is None:
             return
+        session = self._sessions.get(task.session_id)
+        if session is not None and not session.persist:
+            return  # guest run — deliberately not remembered on disk
         with contextlib.suppress(Exception):
             self._store.save_task(task.session_id, task.snapshot())
 
@@ -672,12 +703,23 @@ class TaskManager:
         self._persist_session(session)
         return True
 
-    def delete_all_sessions(self) -> list[str]:
-        """Remove every saved session/task from memory and disk."""
-        ids = list(self._sessions.keys())
+    def delete_all_sessions(self, owner_id: str | None = None) -> list[str]:
+        """Remove every saved session/task from memory and disk.
+
+        With ``owner_id``, only that user's own sessions are removed."""
+        ids = [
+            sid for sid in self._sessions if owner_id is None or self.owned_by(sid, owner_id)
+        ]
         for sid in ids:
             self.delete_session(sid)
         return ids
+
+    def owned_by(self, session_id: str, owner_id: str) -> bool:
+        """May this user see/manage the session? Strict, ChatGPT-style: only the
+        owner sees a session. Unowned sessions (pre-accounts data, or schedules
+        created before owners were recorded) are visible to no console user."""
+        s = self._sessions.get(session_id)
+        return s is not None and s.user_id == owner_id
 
     # ── Queries ──────────────────────────────────────────────────────────────
     def get_task(self, task_id: str) -> TaskRecord | None:
@@ -708,15 +750,19 @@ class TaskManager:
         log.warning("task.stopped_unexpectedly", task_id=task.id, resumable=task.resumable)
         self._persist_task(task)
 
-    def list_sessions(self) -> list[dict[str, Any]]:
+    def list_sessions(self, owner_id: str | None = None) -> list[dict[str, Any]]:
         out = []
         for s in sorted(self._sessions.values(), key=lambda x: x.created_at):
+            if owner_id is not None and s.user_id != owner_id:
+                continue
             runs = [self._tasks[t] for t in s.task_ids if t in self._tasks]
             out.append(
                 {
                     "id": s.id,
                     "title": s.title,
                     "created_at": s.created_at.isoformat(),
+                    "user_name": s.user_name,
+                    "saved": s.persist,
                     "runs": [
                         {
                             "id": r.id,

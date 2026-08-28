@@ -382,7 +382,7 @@ async function loadSessionList() {
     const item = el(`<div class="sess-item ${state.sessions.has(s.id) ? "open" : ""}">
       <span class="dot ${status}"></span>
       <div class="meta"><div class="t">${esc(s.title)}</div>
-        <div class="sub">${s.runs.length} run${s.runs.length === 1 ? "" : "s"} · ${fmtDate(s.created_at)}</div></div>
+        <div class="sub">${s.runs.length} run${s.runs.length === 1 ? "" : "s"} · ${fmtDate(s.created_at)}${s.saved === false ? " · guest (not saved)" : ""}</div></div>
       <span class="clr-mem" title="Clear this task's memory">🧠</span>
       <span class="del" title="Delete task">🗑</span></div>`);
     item.addEventListener("click", (e) => {
@@ -2982,8 +2982,91 @@ async function openBrainPicker() {
   });
 }
 
-// Populate the saved-tasks panel + brain/coding badges on load.
-loadSessionList();
+/* ── Account (optional — default is a no-account "TestN" guest) ─────────── */
+let _me = null, _accountPop = null;
+
+async function loadAccountBadge() {
+  const badge = $("#account-badge");
+  if (!badge) return null;
+  try { _me = await api("GET", "/ui/api/me"); }
+  catch { badge.textContent = "👤 ?"; return null; }
+  const guest = _me.kind === "guest";
+  badge.classList.toggle("warn", guest);
+  badge.innerHTML = guest
+    ? `<span>👤 ${esc(_me.name)}</span><span class="caret">▾</span>`
+    : `<span>👤 ${esc(_me.name || _me.email)}</span><span class="caret">▾</span>`;
+  badge.title = guest
+    ? `Browsing as guest "${_me.name}" — nothing about you is stored, and your tasks are forgotten when the server restarts. Click to sign in.`
+    : `Signed in as ${_me.email}. Your tasks are saved to your account.`;
+  return _me;
+}
+
+function openAccountPicker() {
+  if (_accountPop) { _accountPop.remove(); _accountPop = null; return; }
+  const me = _me || { kind: "guest", name: "guest", google_signin_available: false };
+  const guest = me.kind === "guest";
+  const pop = el(`<div class="brain-pop account-pop">
+    <h4>Account</h4>
+    ${guest
+      ? `<p class="hint">You're using the console <b>without an account</b> as
+           <b>${esc(me.name)}</b>. Nothing about you is stored, and your tasks
+           disappear when the server restarts.</p>
+         <button class="btn primary acc-signin" style="width:100%"
+                 ${me.google_signin_available ? "" : "disabled"}>Sign in with Google</button>
+         ${me.google_signin_available ? "" :
+           `<p class="hint warn">Google sign-in isn't configured — the operator must add
+              the OAuth client file (data/google_oauth_client.json).</p>`}`
+      : `<p class="hint">Signed in as <b>${esc(me.email)}</b>. Your tasks are saved
+           to this account and survive restarts.</p>
+         <button class="btn acc-signout" style="width:100%">Sign out</button>`}
+    <div class="row"><button class="btn acc-close">Close</button></div></div>`);
+  document.body.appendChild(pop);
+  _accountPop = pop;
+  const close = () => { pop.remove(); _accountPop = null; };
+  $(".acc-close", pop).addEventListener("click", close);
+  const signin = $(".acc-signin", pop);
+  if (signin) signin.addEventListener("click", async () => {
+    signin.disabled = true; signin.textContent = "Opening Google…";
+    try {
+      const res = await api("POST", "/ui/api/auth/google");
+      window.open(res.auth_url, "_blank", "width=520,height=680");
+      // The popup sets the session cookie on success; poll until identity flips.
+      const before = me.id;
+      const timer = setInterval(async () => {
+        const now = await loadAccountBadge();
+        if (now && now.id !== before) {
+          clearInterval(timer);
+          close();
+          loadSessionList();   // the account's saved tasks replace the guest view
+        }
+      }, 1500);
+      setTimeout(() => clearInterval(timer), 180000);
+      signin.textContent = "Waiting for Google…";
+    } catch (e) {
+      signin.disabled = false; signin.textContent = "Sign in with Google";
+      alert("Could not start sign-in: " + e.message);
+    }
+  });
+  const signout = $(".acc-signout", pop);
+  if (signout) signout.addEventListener("click", async () => {
+    try { await api("POST", "/ui/api/auth/logout"); }
+    catch (e) { alert("Sign-out failed: " + e.message); return; }
+    close();
+    location.reload();   // next /me mints a fresh guest (TestN)
+  });
+  const badge = $("#account-badge");
+  const r = badge.getBoundingClientRect();
+  pop.style.position = "absolute";
+  pop.style.top = (r.bottom + 6) + "px";
+  pop.style.right = (window.innerWidth - r.right) + "px";
+}
+
+$("#account-badge").addEventListener("click", openAccountPicker);
+
+// Populate the saved-tasks panel + brain/coding badges on load. The identity
+// call runs first so the very first request mints the guest cookie before the
+// session list (which is scoped to the current user) is fetched.
+loadAccountBadge().finally(loadSessionList);
 loadBrainBadge();
 loadCodingBadge();
 loadMemoryBadge();

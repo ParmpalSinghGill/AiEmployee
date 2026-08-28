@@ -19,6 +19,8 @@ os.environ.setdefault("MCP_CONFIG_FILE", "./data/test_mcp_servers.json")
 os.environ.setdefault("GOOGLE_OAUTH_CLIENT_FILE", "./data/test_google_oauth_client.json")
 os.environ.setdefault("GOOGLE_ACCOUNTS_FILE", "./data/test_google_accounts.json")
 os.environ.setdefault("SCHEDULES_FILE", "./data/test_schedules.json")
+os.environ.setdefault("USERS_FILE", "./data/test_users.json")
+os.environ.setdefault("AUTH_SECRET_FILE", "./data/test_auth_secret.key")
 os.environ.setdefault("APPROVAL_POLICIES_FILE", "./data/test_approval_policies.json")
 os.environ.setdefault("AUDIT_LOG_FILE", "./data/test_audit_log.jsonl")
 os.environ.setdefault("LOG_LEVEL", "ERROR")
@@ -39,6 +41,7 @@ def _clean_secrets():
         Path(os.environ["SCHEDULES_FILE"]),
         Path(os.environ["APPROVAL_POLICIES_FILE"]),
         Path(os.environ["AUDIT_LOG_FILE"]),
+        Path(os.environ["USERS_FILE"]),
     ]
     for p in paths:
         with contextlib.suppress(FileNotFoundError):

@@ -152,7 +152,7 @@ class _FakeTM:
         self.started.append({"goal": goal, **kwargs})
         return _T()
 
-    def get(self, tid):
+    def get_task(self, tid):
         return None
 
 

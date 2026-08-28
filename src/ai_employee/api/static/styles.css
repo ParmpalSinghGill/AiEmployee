@@ -27,13 +27,19 @@ body {
 
 /* ── Topbar ─────────────────────────────────────────────── */
 .topbar {
-  display: flex; align-items: center; gap: 16px;
+  display: flex; align-items: center; gap: 16px; row-gap: 8px;
+  /* Wrap onto a second line when zoom / narrow windows run out of width, so the
+     right-side badges (⏰ 🛡 👤 …) never get pushed off screen. */
+  flex-wrap: wrap;
   padding: 10px 18px; background: var(--bg-2);
   border-bottom: 1px solid var(--line);
 }
 .brand { font-weight: 700; font-size: 16px; white-space: nowrap; }
 .brand .logo { color: var(--accent); margin-right: 4px; }
 .brand-sub { color: var(--muted); font-weight: 500; }
+/* No explicit min-width: the default (min-width:auto) stops the composer from
+   shrinking below its contents, so the Run button can never overflow onto the
+   badges — the whole composer wraps to its own line instead. */
 .composer { display: flex; flex: 1; gap: 8px; max-width: 920px; align-items: center; }
 .composer input[type="text"] {
   flex: 1; background: var(--bg-3); border: 1px solid var(--line);

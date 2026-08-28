@@ -214,6 +214,112 @@ async def complete_authorization(
     return email
 
 
+# ── Sign-in with Google (identity only — no Gmail/Calendar grant) ────────────
+# Reuses the operator's registered client, but asks only for the user's basic
+# profile. Nothing is written to the accounts store: the caller (the console's
+# login flow) receives the profile and manages its own user records.
+_SIGNIN_SCOPES = "openid email profile"
+
+
+def begin_signin(settings: Any, redirect_uri: str) -> str:
+    """Build the Google consent URL for signing IN to the console (profile only)."""
+    config = client_config(settings)
+    if config is None:
+        raise ToolError(
+            "Google sign-in is not set up: put your client_secret.json at "
+            f"{settings.google_oauth_client_file} (see docs/google-oauth-setup.md)"
+        )
+    verifier, challenge = _pkce_pair()
+    state = secrets.token_urlsafe(32)
+    while len(_PENDING) >= _MAX_PENDING:
+        _PENDING.pop(next(iter(_PENDING)))
+    _PENDING[state] = {
+        "verifier": verifier,
+        "redirect_uri": redirect_uri,
+        "started_at": time.time(),
+        "purpose": "signin",
+        **config,
+    }
+    query = {
+        "response_type": "code",
+        "client_id": config["client_id"],
+        "redirect_uri": redirect_uri,
+        "state": state,
+        "scope": _SIGNIN_SCOPES,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    }
+    log.info("google.signin.begin")
+    return f"{config['auth_uri']}?{urlencode(query)}"
+
+
+async def complete_signin(
+    settings: Any, state: str, code: str, *, client: Any = None
+) -> dict[str, str]:
+    """Exchange the sign-in code; return the profile {email, name, picture}.
+
+    Unlike :func:`complete_authorization`, no tokens are persisted — the flow
+    only proves who the user is.
+    """
+    flow = _PENDING.pop(state, None)
+    if flow is None or flow.get("purpose") != "signin":
+        raise ToolError("unknown or expired Google sign-in flow — try signing in again")
+
+    own_client = client is None
+    client = client or _client()
+    try:
+        resp = await client.post(
+            flow["token_uri"],
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": flow["redirect_uri"],
+                "client_id": flow["client_id"],
+                "client_secret": flow["client_secret"],
+                "code_verifier": flow["verifier"],
+            },
+            headers={"Accept": "application/json"},
+        )
+        if resp.status_code != 200:
+            raise ToolError(f"Google token exchange failed ({resp.status_code}): {resp.text[:300]}")
+        tokens = resp.json()
+        profile = _profile_from_id_token(tokens.get("id_token", ""))
+        if not profile.get("email"):
+            info = await client.get(
+                _USERINFO_URL,
+                headers={"Authorization": f"Bearer {tokens['access_token']}"},
+            )
+            if info.status_code == 200:
+                data = info.json() or {}
+                profile = {
+                    "email": str(data.get("email") or ""),
+                    "name": str(data.get("name") or ""),
+                    "picture": str(data.get("picture") or ""),
+                }
+        if not profile.get("email"):
+            raise ToolError("could not determine the Google account's email address")
+    finally:
+        if own_client:
+            await client.aclose()
+    log.info("google.signin.completed", email=profile["email"])
+    return profile
+
+
+def _profile_from_id_token(id_token: str) -> dict[str, str]:
+    """Read profile claims from Google's id_token (came direct over TLS)."""
+    try:
+        payload = id_token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        return {
+            "email": str(claims.get("email") or ""),
+            "name": str(claims.get("name") or ""),
+            "picture": str(claims.get("picture") or ""),
+        }
+    except Exception:  # noqa: BLE001 - fall back to the userinfo endpoint
+        return {"email": "", "name": "", "picture": ""}
+
+
 def _email_from_id_token(id_token: str) -> str:
     """Read the email claim from Google's id_token (came direct over TLS)."""
     try:
@@ -305,8 +411,10 @@ def resolve_account(settings: Any, account: str = "") -> str:
 
 __all__ = [
     "begin_authorization",
+    "begin_signin",
     "client_config",
     "complete_authorization",
+    "complete_signin",
     "ensure_access_token",
     "load_accounts",
     "remove_account",

@@ -9,11 +9,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
 from ai_employee.api.deps import get_employee, rebuild_employee
+from ai_employee.api.users import CurrentUser, get_current_user
 from ai_employee.api.workspace_files import (
     collect_deliverables,
     guess_media_type,
@@ -161,10 +162,91 @@ async def ui_index() -> HTMLResponse:
     return HTMLResponse(html)
 
 
+# ── Accounts (optional — default is a no-account "TestN" guest) ──────────────
+@router.get("/ui/api/me", tags=["ui"])
+async def me(user: CurrentUser = Depends(get_current_user)) -> dict:
+    """Who am I? Mints a guest identity (Test1, Test2, …) on the first visit.
+
+    Guests are never stored server-side; creating a real account happens by
+    signing in with Google (needs the operator's OAuth client file)."""
+    from ai_employee.integrations.google_oauth import client_config
+
+    return {
+        "id": user.id,
+        "name": user.name,
+        "kind": user.kind,
+        "email": user.email,
+        "google_signin_available": client_config(get_settings()) is not None,
+    }
+
+
+@router.post("/ui/api/auth/google", tags=["ui"])
+async def auth_google_begin(request: Request) -> dict:
+    """Begin the sign-in-with-Google flow; returns the consent URL to open."""
+    from ai_employee.integrations.google_oauth import begin_signin
+
+    redirect_uri = str(request.base_url).rstrip("/") + "/ui/api/auth/google/callback"
+    try:
+        return {"auth_url": begin_signin(get_settings(), redirect_uri)}
+    except Exception as exc:  # noqa: BLE001 - surface the reason in the UI
+        raise HTTPException(502, str(exc)) from exc
+
+
+@router.get("/ui/api/auth/google/callback", tags=["ui"], include_in_schema=False)
+async def auth_google_callback(request: Request) -> HTMLResponse:
+    """Google redirect target: prove the identity, create/refresh the account,
+    and set the signed session cookie in this browser."""
+    from ai_employee.api.users import set_user_cookie, upsert_google_user
+    from ai_employee.integrations.google_oauth import complete_signin
+
+    q = request.query_params
+    if q.get("error"):
+        return _oauth_result_page(False, f"Sign-in was denied: {q.get('error')}")
+    code, state = q.get("code"), q.get("state")
+    if not code or not state:
+        return _oauth_result_page(False, "Missing code/state in the callback URL.")
+    s = get_settings()
+    try:
+        profile = await complete_signin(s, state, code)
+        user = upsert_google_user(s, profile)
+    except Exception as exc:  # noqa: BLE001 - show the failure in the popup
+        return _oauth_result_page(False, str(exc))
+    page = _oauth_result_page(True, f"Signed in as {user.email}. Your tasks are now saved.")
+    set_user_cookie(s, page, user)
+    return page
+
+
+@router.post("/ui/api/auth/logout", tags=["ui"])
+async def auth_logout(response: Response) -> dict:
+    """Sign out: drop the session cookie (the next visit becomes a fresh guest)."""
+    from ai_employee.api.users import clear_user_cookie
+
+    clear_user_cookie(response)
+    return {"ok": True}
+
+
+def _require_session(tm, session_id: str, user: CurrentUser):
+    """The session's runs, or 404 when it doesn't exist / belongs to someone else."""
+    if not tm.session_runs(session_id) or not tm.owned_by(session_id, user.id):
+        raise HTTPException(404, "unknown session")
+    return tm.session_runs(session_id)
+
+
+def _require_task(tm, task_id: str, user: CurrentUser):
+    task = tm.get_task(task_id)
+    if task is None or not tm.owned_by(task.session_id, user.id):
+        raise HTTPException(404, "unknown task")
+    return task
+
+
 # ── JSON API ─────────────────────────────────────────────────────────────────
 @router.post("/ui/api/tasks", tags=["ui"])
-async def create_task(req: NewTaskRequest, emp: AIEmployee = Depends(get_employee)) -> dict:
-    """Start a brand-new task (creates a new session/tab)."""
+async def create_task(
+    req: NewTaskRequest,
+    emp: AIEmployee = Depends(get_employee),
+    user: CurrentUser = Depends(get_current_user),
+) -> dict:
+    """Start a brand-new task (creates a new session/tab, owned by the caller)."""
     tm = get_task_manager()
     task = tm.start(
         emp,
@@ -173,18 +255,21 @@ async def create_task(req: NewTaskRequest, emp: AIEmployee = Depends(get_employe
         mode=req.mode,
         auto_approve=req.auto_approve,
         token_budget=req.token_budget,
+        owner={"id": user.id, "name": user.name, "guest": user.is_guest},
     )
     return {"task_id": task.id, "session_id": task.session_id}
 
 
 @router.post("/ui/api/sessions/{session_id}/followup", tags=["ui"])
 async def followup(
-    session_id: str, req: NewTaskRequest, emp: AIEmployee = Depends(get_employee)
+    session_id: str,
+    req: NewTaskRequest,
+    emp: AIEmployee = Depends(get_employee),
+    user: CurrentUser = Depends(get_current_user),
 ) -> dict:
     """Add a follow-up run to an existing session/tab (shares memory & context)."""
     tm = get_task_manager()
-    if not tm.session_runs(session_id):
-        raise HTTPException(404, "unknown session")
+    _require_session(tm, session_id, user)
     task = tm.start(
         emp,
         req.goal,
@@ -209,10 +294,12 @@ async def approve_task(
     task_id: str,
     req: ApproveTaskRequest | None = None,
     emp: AIEmployee = Depends(get_employee),
+    user: CurrentUser = Depends(get_current_user),
 ) -> dict:
     """Approve a paused task and resume it *in place* — the run continues in the
     same tab (no new run), with the approved operation now permitted."""
     tm = get_task_manager()
+    _require_task(tm, task_id, user)
     decision = None
     if req:
         decision = {
@@ -556,11 +643,14 @@ async def list_schedules() -> dict:
 
 
 @router.post("/ui/api/schedules", tags=["ui"])
-async def add_schedule(req: ScheduleRequest) -> dict:
+async def add_schedule(req: ScheduleRequest, user: CurrentUser = Depends(get_current_user)) -> dict:
     from ai_employee.observability.schedules import create_schedule
 
     try:
-        return create_schedule(get_settings(), req.model_dump())
+        return create_schedule(
+            get_settings(),
+            {**req.model_dump(), "user_id": user.id, "user_name": user.name},
+        )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -803,24 +893,28 @@ async def set_coding_backend(req: CodingBackendRequest) -> dict:
 
 
 @router.get("/ui/api/sessions", tags=["ui"])
-async def list_sessions() -> dict:
-    return {"sessions": get_task_manager().list_sessions()}
+async def list_sessions(user: CurrentUser = Depends(get_current_user)) -> dict:
+    return {"sessions": get_task_manager().list_sessions(owner_id=user.id)}
 
 
 @router.get("/ui/api/sessions/{session_id}", tags=["ui"])
-async def get_session(session_id: str) -> dict:
+async def get_session(session_id: str, user: CurrentUser = Depends(get_current_user)) -> dict:
     """Full session (meta + every run's snapshot) — used to open/resume a saved task."""
-    detail = get_task_manager().session_detail(session_id)
-    if detail is None:
+    tm = get_task_manager()
+    detail = tm.session_detail(session_id)
+    if detail is None or not tm.owned_by(session_id, user.id):
         raise HTTPException(404, "unknown session")
     return detail
 
 
 @router.delete("/ui/api/sessions", tags=["ui"])
-async def delete_all_sessions(emp: AIEmployee = Depends(get_employee)) -> dict:
-    """Delete every saved task and its session-scoped recall memory."""
+async def delete_all_sessions(
+    emp: AIEmployee = Depends(get_employee),
+    user: CurrentUser = Depends(get_current_user),
+) -> dict:
+    """Delete every saved task (of the current user) and its recall memory."""
     tm = get_task_manager()
-    ids = [s["id"] for s in tm.list_sessions()]
+    ids = [s["id"] for s in tm.list_sessions(owner_id=user.id)]
     removed_memory = 0
     for sid in ids:
         mem = await emp.clear_session_memory(sid)
@@ -830,19 +924,25 @@ async def delete_all_sessions(emp: AIEmployee = Depends(get_employee)) -> dict:
 
 
 @router.delete("/ui/api/sessions/{session_id}/runs/{task_id}", tags=["ui"])
-async def delete_followup(session_id: str, task_id: str) -> dict:
+async def delete_followup(
+    session_id: str, task_id: str, user: CurrentUser = Depends(get_current_user)
+) -> dict:
     """Delete a single follow-up run. The session's initial task is kept."""
     tm = get_task_manager()
+    _require_session(tm, session_id, user)
     if not tm.delete_run(session_id, task_id):
         raise HTTPException(404, "unknown session, run, or cannot delete the initial task")
     return {"deleted": task_id, "session_id": session_id}
 
 
 @router.delete("/ui/api/sessions/{session_id}", tags=["ui"])
-async def delete_session(session_id: str, emp: AIEmployee = Depends(get_employee)) -> dict:
+async def delete_session(
+    session_id: str,
+    emp: AIEmployee = Depends(get_employee),
+    user: CurrentUser = Depends(get_current_user),
+) -> dict:
     tm = get_task_manager()
-    if not tm.session_runs(session_id):
-        raise HTTPException(404, "unknown session")
+    _require_session(tm, session_id, user)
     mem = await emp.clear_session_memory(session_id)
     tm.delete_session(session_id)
     return {
@@ -852,11 +952,14 @@ async def delete_session(session_id: str, emp: AIEmployee = Depends(get_employee
 
 
 @router.delete("/ui/api/sessions/{session_id}/memory", tags=["ui"])
-async def clear_session_memory(session_id: str, emp: AIEmployee = Depends(get_employee)) -> dict:
+async def clear_session_memory(
+    session_id: str,
+    emp: AIEmployee = Depends(get_employee),
+    user: CurrentUser = Depends(get_current_user),
+) -> dict:
     """Clear recall memory for one task/session. Saved run history is kept."""
     tm = get_task_manager()
-    if not tm.session_runs(session_id):
-        raise HTTPException(404, "unknown session")
+    _require_session(tm, session_id, user)
     return await emp.clear_session_memory(session_id)
 
 
@@ -939,21 +1042,23 @@ async def restore_memories(emp: AIEmployee = Depends(get_employee)) -> dict:
 
 
 @router.post("/ui/api/tasks/{task_id}/cancel", tags=["ui"])
-async def cancel_task(task_id: str) -> dict:
+async def cancel_task(task_id: str, user: CurrentUser = Depends(get_current_user)) -> dict:
     """Stop a running/pending task. Idempotent: cancelling an already-finished
     task just reports ``cancelled: false``."""
     tm = get_task_manager()
-    if tm.get_task(task_id) is None:
-        raise HTTPException(404, "unknown task")
+    _require_task(tm, task_id, user)
     return {"task_id": task_id, "cancelled": tm.cancel(task_id)}
 
 
 @router.post("/ui/api/tasks/{task_id}/resume", tags=["ui"])
-async def resume_task(task_id: str, emp: AIEmployee = Depends(get_employee)) -> dict:
+async def resume_task(
+    task_id: str,
+    emp: AIEmployee = Depends(get_employee),
+    user: CurrentUser = Depends(get_current_user),
+) -> dict:
     """Resume an interrupted run from its last saved workflow checkpoint."""
     tm = get_task_manager()
-    if tm.get_task(task_id) is None:
-        raise HTTPException(404, "unknown task")
+    _require_task(tm, task_id, user)
     task = tm.resume(emp, task_id)
     if task is None:
         raise HTTPException(409, "task is not resumable")
@@ -961,11 +1066,11 @@ async def resume_task(task_id: str, emp: AIEmployee = Depends(get_employee)) -> 
 
 
 @router.get("/ui/api/tasks/{task_id}", tags=["ui"])
-async def get_task(task_id: str, since: int = 0) -> dict:
+async def get_task(
+    task_id: str, since: int = 0, user: CurrentUser = Depends(get_current_user)
+) -> dict:
     tm = get_task_manager()
-    task = tm.get_task(task_id)
-    if task is None:
-        raise HTTPException(404, "unknown task")
+    task = _require_task(tm, task_id, user)
     snap = task.snapshot(since=since)
     snap["session_title"] = tm.session_title(task.session_id)
     return snap

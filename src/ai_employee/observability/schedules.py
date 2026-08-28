@@ -75,6 +75,9 @@ def create_schedule(settings: Any, spec: dict[str, Any]) -> dict[str, Any]:
         "type": kind,
         "goal": goal,
         "auto_approve": bool(spec.get("auto_approve")),
+        # Who created it — fired tasks land in this user's saved-task list.
+        "user_id": spec.get("user_id"),
+        "user_name": spec.get("user_name"),
         "enabled": True,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "last_run": None,
@@ -240,15 +243,25 @@ class SchedulerRunner:
         last = entry.get("last_task_id")
         if not last:
             return False
-        task = self._tm.get(last)
+        task = self._tm.get_task(last)
         return bool(task) and task.status.value in _ACTIVE_STATUSES
 
     def _fire(self, entry: dict[str, Any], goal: str, now: datetime) -> None:
         emp = self._get_employee()
+        owner = None
+        if entry.get("user_id"):
+            owner = {
+                "id": entry["user_id"],
+                "name": entry.get("user_name"),
+                # Guest-created schedules keep firing, but their runs stay
+                # memory-only like every other guest session.
+                "guest": str(entry["user_id"]).startswith("guest:"),
+            }
         task = self._tm.start(
             emp,
             goal,
             auto_approve=bool(entry.get("auto_approve")),
+            owner=owner,
         )
         entry["last_run"] = now.isoformat(timespec="seconds")
         entry["last_task_id"] = task.id

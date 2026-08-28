@@ -181,6 +181,15 @@ class Settings(BaseSettings):
         "https://www.googleapis.com/auth/calendar"
     )
 
+    # ── User accounts (optional — the console works without signing in) ──────
+    # Signed-in users are stored here; guests ("Test1", "Test2", …) are never
+    # written anywhere — their identity lives only in a signed browser cookie.
+    users_file: Path = Path("./data/users.json")
+    # HMAC secret for the session cookie (generated on first use, chmod 600).
+    auth_secret_file: Path = Path("./data/auth_secret.key")
+    # How long a login/guest cookie stays valid.
+    auth_session_days: int = 30
+
     # ── Safety / autonomy ────────────────────────────────────────────────────
     require_approval_for: str = (
         "shell_write,email_send,git_push,db_write,deploy,resource_download,"

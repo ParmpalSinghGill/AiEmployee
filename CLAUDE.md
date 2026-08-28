@@ -56,6 +56,7 @@ Tests force offline config via `tests/conftest.py` (sets `LLM_PROVIDER=mock` etc
 | Memory | `memory/` (`in_memory`, `pg_store`, `resilient`, `manager`) |
 | RAG | `knowledge/` (`loaders`, `chunking`, `rag`) |
 | API | `api/` (`app`, `routes`, `schemas`, `deps`) |
+| User accounts (👤) | `api/users.py` (guest-by-default "TestN" identities in a signed cookie — never stored; Google sign-in creates accounts in `data/users.json`; sessions are owner-scoped, guest sessions memory-only) |
 | Web UI | `api/ui.py` + `api/static/` (SPA); task runner in `observability/tasks.py` |
 | Persistence (save/resume) | `observability/store.py` (`SessionStore`); memory dump/restore in `core/employee.py` |
 | Schedules & watchers (⏰) | `observability/schedules.py` (store + `SchedulerRunner`, started in `api/app.py` lifespan) |
