@@ -42,6 +42,67 @@ async def _run_subprocess(cmd: list[str], cwd: Path, timeout: int, stdin: str | 
     return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
 
 
+# ── Shell output caps & redirection parsing ──────────────────────────────────
+# Unbounded commands (recursive ``find``, huge directory walks) can dump thousands
+# of lines into the agent's context window. Cap stdout/stderr deterministically so
+# the model is told to narrow its query instead of drowning in tokens.
+_SHELL_MAX_LINES = 200
+_SHELL_HEAD_LINES = 150
+_SHELL_TAIL_LINES = 50
+_SHELL_MAX_CHARS = 12000
+
+_TRUNCATION_NOTE = (
+    "\n...[output truncated: {lines} lines / {chars} chars omitted. Narrow your "
+    "query using head, tail, grep, or maxdepth flags]..."
+)
+
+# Standard descriptor redirections are read-only plumbing, not file writes:
+#   `2>&1`, `1>&2`, `>&2`, `2>/dev/null`, `>/dev/null`
+_STREAM_REDIRECT_RE = re.compile(r"(?:[12])?>&[12]\b|(?:[12])?>\s*/dev/null\b")
+
+
+def _strip_stream_redirections(command: str) -> str:
+    """Remove safe descriptor redirections so they aren't mistaken for writes."""
+    return _STREAM_REDIRECT_RE.sub("", command)
+
+
+def _truncate_output(text: str) -> str:
+    """Deterministically cap shell output (lines, then chars) with a clear note."""
+    if not text:
+        return text
+    omitted_lines = 0
+    lines = text.split("\n")
+    if len(lines) > _SHELL_MAX_LINES:
+        omitted_lines = len(lines) - _SHELL_MAX_LINES
+        lines = lines[:_SHELL_HEAD_LINES] + lines[-_SHELL_TAIL_LINES:]
+    result = "\n".join(lines)
+    omitted_chars = 0
+    if len(result) > _SHELL_MAX_CHARS:
+        omitted_chars = len(result) - _SHELL_MAX_CHARS
+        result = result[:_SHELL_MAX_CHARS]
+    if omitted_lines or omitted_chars:
+        result += _TRUNCATION_NOTE.format(lines=omitted_lines, chars=omitted_chars)
+    return result
+
+
+# ``find / `` or ``find /home`` without ``-maxdepth`` scans an unbounded tree.
+_UNBOUNDED_FIND_RE = re.compile(r"\bfind\s+/(?:\s|\b(?:home|root)\b)", re.I)
+
+
+def _block_unbounded_traversal(command: str) -> str | None:
+    """Reject unbounded root/home recursive scans before they run."""
+    if "-maxdepth" in command or "find" not in command.lower():
+        return None
+    if _UNBOUNDED_FIND_RE.search(command):
+        return (
+            "Blocked unbounded traversal: `find` on the filesystem root or home "
+            "directory without `-maxdepth` would scan a huge tree. Scope the search "
+            "to a specific directory and add `-maxdepth` "
+            "(e.g. `find ./data -maxdepth 3 -name '*.csv'`)."
+        )
+    return None
+
+
 class PythonExecTool(Tool):
     name = "python_exec"
     description = (
@@ -160,9 +221,10 @@ class ShellTool(Tool):
         self._ws = workspace
 
     def _is_read_only(self, command: str) -> bool:
-        first = command.strip().split()[0] if command.strip() else ""
+        stripped = _strip_stream_redirections(command)
+        first = stripped.strip().split()[0] if stripped.strip() else ""
         return first in self._READ_ONLY and not any(
-            tok in command for tok in (">", ">>", "|", "&", ";", "rm ", "mv ", "sudo")
+            tok in stripped for tok in (">", ">>", "|", "&", ";", "rm ", "mv ", "sudo")
         )
 
     def requires_approval(self, arguments: dict) -> str | None:  # type: ignore[override]
@@ -172,8 +234,13 @@ class ShellTool(Tool):
         return "shell_write"
 
     async def _run(self, args: ShellTool.Args) -> ToolResult:
+        guard = _block_unbounded_traversal(args.command)
+        if guard:
+            return ToolResult(ok=False, error=guard)
         ws = ensure_workspace(self._ws)
         code, out, err = await _run_subprocess(["bash", "-lc", args.command], ws, args.timeout)
+        out = _truncate_output(out)
+        err = _truncate_output(err)
         return ToolResult(
             ok=(code == 0),
             output={"stdout": out, "stderr": err, "returncode": code},

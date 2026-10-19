@@ -365,8 +365,10 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
             "with clear messages. Pushing is approval-gated. Do not write or modify "
             "application code yourself — if changes are needed beyond staging/committing "
             "what already exists, say that the coding agent should make them first.\n"
-            "Consolidate git inspection (status, log, diff, branch, rev-parse) into ONE "
-            "shell command rather than several round-trips."
+            "When inspecting or setting up a target directory, combine path resolution, "
+            "directory listing, `git rev-parse HEAD`, and `git status --porcelain` into a "
+            "SINGLE chained shell command rather than multiple round-trips (e.g. "
+            "`pwd && ls -la && git rev-parse HEAD && git status --porcelain`)."
         ),
     ),
     AgentSpec(

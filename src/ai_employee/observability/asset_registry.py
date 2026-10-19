@@ -128,6 +128,11 @@ class AssetRegistry:
         self._ws = Path(workspace).resolve()
         self._ledger = self._ws / _LEDGER_NAME
 
+    @property
+    def workspace(self) -> Path:
+        """The canonical workspace directory assets are stored relative to."""
+        return self._ws
+
     # ── persistence ──────────────────────────────────────────────────────────
     def _load_raw(self) -> list[dict[str, Any]]:
         if not self._ledger.exists():
@@ -352,7 +357,11 @@ def build_local_inventory_context(
         lines.append(f"{kind.upper()}S already on disk:")
         for rec in group:
             size = _fmt_bytes(rec.bytes)
-            bits = [f"- {rec.identifier}", f"path: {rec.path}"]
+            # Resolve each ledger path to its canonical absolute form so agents can
+            # use it directly — the shell tool runs inside the nested workspace, so a
+            # relative ``data/...`` path is ambiguous between the repo root and cwd.
+            abs_path = (registry.workspace / rec.path).resolve()
+            bits = [f"- {rec.identifier}", f"path: {abs_path}"]
             if size:
                 bits.append(size)
             if rec.url:

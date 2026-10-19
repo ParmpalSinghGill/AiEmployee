@@ -165,6 +165,10 @@ class Settings(BaseSettings):
     # When False, agents skip long-term/skill recall and the reflect node does not
     # persist new memories (useful after bad recall or when you want a fresh run).
     use_stored_memory: bool = True
+    # When True, bypass loading learned `SKILL:` memories from prior sessions during
+    # agent recall — used for clean zero-shot evaluations where cross-session skill
+    # leakage would pollute the result. Long-term recall is unaffected.
+    disable_skill_recall: bool = False
 
     # ── PostgreSQL ───────────────────────────────────────────────────────────
     postgres_host: str = "localhost"

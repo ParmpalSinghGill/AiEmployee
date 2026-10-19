@@ -7,7 +7,9 @@ validated Pydantic object regardless of provider.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from typing import Literal
+
+from pydantic import BaseModel, Field, create_model
 
 from ai_employee.brains.base import Brain
 from ai_employee.brains.schemas import Message
@@ -153,6 +155,47 @@ def _correct_generic_assignment(description: str, agent: str, valid: set[str]) -
         if target in valid and any(k in d for k in keywords):
             return target
     return agent
+
+
+def _plan_schema_for(valid_names: list[str]) -> type[BaseModel]:
+    """Build a ``Plan`` model whose step ``agent`` field is constrained to the roster.
+
+    The JSON schema advertises ``agent`` as ``{"enum": [<roster names>]}`` so the
+    model cannot emit a hallucinated identifier like ``workspace_agent``. When the
+    roster is somehow empty we fall back to the unconstrained :class:`Plan`.
+    """
+    names = tuple(sorted(set(valid_names)))
+    if not names:
+        return Plan
+
+    AgentLiteral = Literal[names]  # type: ignore[valid-type]
+
+    dynamic_step = create_model(
+        "PlanStep",
+        id=(int, Field(description="1-based step number.")),
+        description=(str, Field(description="What to do in this step.")),
+        agent=(
+            AgentLiteral,
+            Field(description="Name of the agent best suited to execute this step."),
+        ),
+        depends_on=(
+            list[int],
+            Field(default_factory=list, description="Step ids that must finish first."),
+        ),
+        success_criteria=(
+            str,
+            Field(default="", description="How to tell this step succeeded."),
+        ),
+    )
+    return create_model(
+        "Plan",
+        goal=(str, ...),
+        reasoning=(
+            str,
+            Field(default="", description="Brief rationale for the decomposition."),
+        ),
+        steps=(list[dynamic_step], Field(default_factory=list)),
+    )
 
 
 class Planner:
@@ -312,37 +355,40 @@ class Planner:
                 f"step to a different agent. Describe each step as work `{pinned}` "
                 f"itself will carry out, and keep the plan within its tools."
             )
-        plan = await self._brain.structured_output(
+        plan_schema = _plan_schema_for(sorted(valid_names))
+        raw_plan = await self._brain.structured_output(
             [Message.system(system), Message.user(f"GOAL: {goal}")],
-            Plan,
+            plan_schema,
         )
+        # Constrained decoding produced the dynamic model; convert back to the plain
+        # Plan the rest of the pipeline expects (steps re-validate against PlanStep).
+        plan = Plan.model_validate(raw_plan.model_dump())
         plan.goal = goal
-        # Repair any invalid agent assignments by routing to a sensible default.
+        # Repair invalid agent names (the enum prevents most, but JSON-mode
+        # providers can still slip one through) — log the RAW string, then route to
+        # a sensible default.
         for step in plan.steps:
-            if step.agent not in valid_names:
-                log.debug("planner.invalid_agent", agent=step.agent)
-                step.agent = "research" if "research" in valid_names else sorted(valid_names)[0]
-        # A pinned run is authoritative: force every step onto the base agent even
-        # if the model ignored the instruction above.
-        if pinned:
-            for step in plan.steps:
-                step.agent = pinned
-        else:
-            # Multi-agent safety net: a weak model often leaves every step on
-            # `research` (the first roster agent). Re-route obvious code/test/git
-            # steps to their specialist.
-            for step in plan.steps:
-                corrected = _correct_generic_assignment(
-                    step.description, step.agent, valid_names
-                )
-                if corrected != step.agent:
+            raw = step.agent
+            resolved = raw
+            if raw not in valid_names:
+                log.info("planner.invalid_agent", step=step.id, from_agent=raw)
+                resolved = "research" if "research" in valid_names else sorted(valid_names)[0]
+            # A pinned run is authoritative: force every step onto the base agent.
+            # Otherwise apply the multi-agent safety net (correct a generic
+            # `research` to the specialist the step's wording names).
+            if pinned:
+                resolved = pinned
+            else:
+                corrected = _correct_generic_assignment(step.description, resolved, valid_names)
+                if corrected != resolved:
                     log.info(
                         "planner.corrected_agent",
                         step=step.id,
-                        from_agent=step.agent,
+                        from_agent=raw,
                         to_agent=corrected,
                     )
-                    step.agent = corrected
+                    resolved = corrected
+            step.agent = resolved
         if not plan.steps:
             default_agent = pinned or (
                 "research" if "research" in valid_names else sorted(valid_names)[0]

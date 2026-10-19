@@ -641,7 +641,12 @@ class ToolUsingAgent(BaseAgent):
                 k=4,
                 session_id=ctx.session_id,
             )
-            skills = await ctx.memory.find_skill(task, k=2)
+            # Zero-shot evaluations want no cross-session skill leakage.
+            skills = (
+                await ctx.memory.find_skill(task, k=2)
+                if not get_settings().disable_skill_recall
+                else []
+            )
             context_blobs.extend(r.content for r in (*relevant, *skills))
         if context_blobs:
             messages.append(

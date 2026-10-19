@@ -288,6 +288,9 @@ class _Session:
         self.title = title
         self.created_at = _now()
         self.task_ids: list[str] = []
+        # Whether the LLM title generator has already named this session, so a
+        # resume doesn't fire a redundant naming call.
+        self.named = False
         # Owner scoping (optional user accounts). ``user_id is None`` marks a
         # legacy/system session (e.g. scheduler-fired) visible to everyone.
         self.user_id = user_id
@@ -327,6 +330,7 @@ class TaskManager:
             )
             s.id = meta["id"]
             s.task_ids = [t for t in meta.get("run_ids", []) if t in self._tasks]
+            s.named = bool(meta.get("named", False))
             created = meta.get("created_at")
             if created:
                 with contextlib.suppress(Exception):
@@ -582,8 +586,10 @@ class TaskManager:
                 tool=approval.get("tool"),
                 args=approval.get("args"),
             )
-        # Generate a nicer session title in the background (initial task only).
-        if task.parent_id is None:
+        # Generate a nicer session title in the background (initial task only, and
+        # only if it hasn't already been named — a resume must not re-fire it).
+        session = self._sessions.get(task.session_id)
+        if task.parent_id is None and session is not None and not session.named:
             self._spawn_name(employee, task)
         try:
             # Auto-approve can grant mid-run and need another pipeline pass.
@@ -749,6 +755,7 @@ class TaskManager:
         session = self._sessions.get(task.session_id)
         if session is not None and title:
             session.title = title
+            session.named = True
             self._persist_session(session)
             log.info("task.named", title=title, task_id=task.id)
 
@@ -787,6 +794,7 @@ class TaskManager:
                     "run_ids": list(session.task_ids),
                     "user_id": session.user_id,
                     "user_name": session.user_name,
+                    "named": bool(session.named),
                 }
             )
 

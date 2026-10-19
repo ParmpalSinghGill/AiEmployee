@@ -136,7 +136,9 @@ def test_inventory_context_instructs_reuse(tmp_path: Path) -> None:
 
     ctx = build_local_inventory_context(reg)
     assert "google/vit-base" in ctx
-    assert "models/vit.safetensors" in ctx
+    # Paths are rendered as canonical absolute paths so the nested shell cwd can't
+    # misinterpret a relative ``models/...`` anchor.
+    assert f"path: {m.resolve()}" in ctx
     # The instruction is the point — a bare list gets ignored by the model.
     assert "BEFORE searching" in ctx
     assert "do NOT download it again" in ctx

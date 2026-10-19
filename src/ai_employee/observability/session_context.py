@@ -21,6 +21,21 @@ _PATH_RE = re.compile(
     re.I,
 )
 
+# The repository root (where ``.env`` and the top-level ``data/`` dir live). In the
+# source layout this module is at ``<root>/src/ai_employee/observability/``, so the
+# root is three parents up; fall back to the workspace's grandparent (the
+# conventional ``./data/workspace`` layout) and finally the process cwd.
+def _application_root(workspace: Path) -> Path:
+    candidates = [
+        Path(__file__).resolve().parents[3],
+        workspace.parents[1],
+        Path.cwd().resolve(),
+    ]
+    for candidate in candidates:
+        if (candidate / "src").is_dir() or (candidate / "data").is_dir() or (candidate / ".env").exists():
+            return candidate
+    return candidates[0]
+
 
 def _clean_url(url: str) -> str:
     u = (url or "").strip().rstrip("`")
@@ -189,7 +204,13 @@ def build_environment_context(settings: Any | None = None, *, max_siblings: int 
 
     s = settings or get_settings()
     ws = Path(s.workspace_dir).expanduser().resolve()
-    lines = [f"- Workspace: {ws}", f"- Python: {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"]
+    app_root = _application_root(ws)
+    lines = [
+        f"- Application Root: {app_root}",
+        f"- Shell Working Directory (cwd): {ws}",
+        f"- Workspace: {ws}",
+        f"- Python: {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+    ]
     parent = ws.parent
     try:
         siblings = sorted(p.name for p in parent.iterdir() if p.is_dir())[:max_siblings]

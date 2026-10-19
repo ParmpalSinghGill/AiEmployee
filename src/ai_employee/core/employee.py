@@ -331,7 +331,10 @@ class AIEmployee:
             f"Task: {goal}"
         )
         try:
-            text = await self.brain.complete(prompt, max_tokens=24, temperature=0.3)
+            # 256 output tokens: on reasoning-enabled models the chain-of-thought is
+            # billed against this same budget, so a small ceiling leaves nothing for
+            # the visible title and returns finish_reason="length" with empty text.
+            text = await self.brain.complete(prompt, max_tokens=256, temperature=0.3)
         except Exception as exc:  # noqa: BLE001
             log.debug("name_task.failed", error=str(exc))
             return fallback
