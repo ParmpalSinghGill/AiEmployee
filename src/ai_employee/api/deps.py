@@ -20,6 +20,11 @@ async def rebuild_employee() -> AIEmployee:
 
     Memory is flushed to disk first and reloaded by the new instance, so accumulated
     context survives the swap. The new brain reflects the updated configuration.
+
+    The retired employee is **not** closed eagerly: a run that started before the
+    switch must keep using the model that was selected when it was launched. It is
+    marked retired and closed once its last running task finishes (see
+    ``AIEmployee.mark_retired`` / ``release``).
     """
     from ai_employee.brains.factory import reset_brain_cache
 
@@ -30,10 +35,7 @@ async def rebuild_employee() -> AIEmployee:
     reset_brain_cache()
     _employee = AIEmployee()
     if old is not None:
-        import contextlib
-
-        with contextlib.suppress(Exception):
-            await old.aclose()
+        old.mark_retired()
     return _employee
 
 

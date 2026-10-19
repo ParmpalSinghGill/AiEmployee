@@ -37,11 +37,15 @@
     <button id="memory-badge" class="brain-badge" title="Stored memory recall on/off">🧠 Memory</button>
     <button id="parallel-badge" class="brain-badge"
             title="Run independent plan steps at the same time (multi-agent)">⚡ Parallel</button>
+    <button id="limits-badge" class="brain-badge"
+            title="Agent limits — how many tool rounds and loop extensions each agent gets">🎚 Limits</button>
     <button id="usage-badge" class="brain-badge" title="Token usage per brain, by date">📊 Usage</button>
     <button id="keys-badge" class="brain-badge" title="Manage API keys (Roboflow, Kaggle, GitHub, LLM…)">🔑 Keys</button>
     <button id="mcp-badge" class="brain-badge" title="MCP connectors — plug in GitHub, Slack, Postgres, a browser…">🔌 MCP</button>
     <button id="schedules-badge" class="brain-badge" title="Scheduled tasks & email watchers — the employee works while you're away">⏰ Schedules</button>
     <button id="autonomy-badge" class="brain-badge" title="Autonomy & safety — approval policies, push notifications, budget, audit trail">🛡 Autonomy</button>
+    <button id="resources-badge" class="brain-badge" title="Resources — task-isolated sources, shared sources, and the Isolate action">🗂 Resources</button>
+    <button id="orgchart-badge" class="brain-badge" title="Org chart — the CEO and every employee, live">🗺 Org Chart</button>
     <button id="account-badge" class="brain-badge" title="Account — you browse as a guest by default; sign in with Google to keep your tasks">👤 …</button>
     <a class="docs-link" href="/docs" target="_blank">API docs ↗</a>
   </header>
@@ -52,6 +56,7 @@
         <span>Saved tasks</span>
         <div class="sidebar-actions">
           <button id="delete-all-sessions" class="icon-btn" title="Delete all saved tasks">🗑</button>
+          <button id="recover-runs" class="icon-btn" title="Recover runs from the server log (e.g. after a restart) into Saved tasks">📥</button>
           <button id="restore-memories" class="icon-btn" title="Restore memory from before last clear" disabled>↩</button>
           <button id="clear-memories" class="icon-btn" title="Clear all stored memories (keeps saved tasks)">🧹</button>
           <button id="refresh-sessions" class="icon-btn" title="Refresh">⟳</button>

@@ -33,7 +33,13 @@ from ai_employee.core.logging import get_logger
 
 log = get_logger("schedules")
 
-_ACTIVE_STATUSES = {"pending", "running", "awaiting_approval", "waiting_for_user"}
+_ACTIVE_STATUSES = {
+    "pending",
+    "running",
+    "cooling",
+    "awaiting_approval",
+    "waiting_for_user",
+}
 _SEEN_CAP = 500
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -16,7 +17,9 @@ from ai_employee.observability.resource_ctx import (
     get_approved_ops,
     get_resource_decision,
     get_resource_session,
+    get_resource_task_id,
 )
+from ai_employee.resources import ResourceManager, Visibility
 from ai_employee.tools.base import Tool, ToolResult
 from ai_employee.tools.builtins._sandbox import ensure_workspace
 from ai_employee.tools.builtins.resource_download import (
@@ -46,6 +49,59 @@ _HUB_TOOLS = (
     "youtube_search",
     "web_search",
 )
+
+
+def visibility_for_path(rel_path: str) -> str:
+    """Datasets/models are shared & reusable; session files are task-private."""
+    parts = Path(rel_path.replace("\\", "/")).parts
+    return Visibility.private.value if parts[:1] == ("sessions",) else Visibility.shared.value
+
+
+def index_download(
+    workspace: Path,
+    settings: Settings,
+    *,
+    path: str | Path,
+    url: str,
+    source: str,
+    session_id: str | None,
+) -> Any:
+    """Register a downloaded artifact in the resource catalog (best effort).
+
+    Never let bookkeeping break a successful download — a failure here is logged
+    and swallowed.
+    """
+    try:
+        mgr = ResourceManager(workspace, audit_file=getattr(settings, "audit_log_file", None))
+        try:
+            rel = mgr_relative(workspace, Path(path))
+        except Exception:  # noqa: BLE001
+            rel = Path(str(path)).name
+        visibility = visibility_for_path(rel)
+        # Always attach a link to the downloading task: for a shared resource this
+        # is a consumer edge (so several tasks can share one source), for a private
+        # one it is the owner edge.
+        task_key = mgr.task_identity(session_id) if session_id else ""
+        return mgr.register(
+            path,
+            visibility=visibility,
+            task=task_key or None,
+            task_id=get_resource_task_id(),
+            source=source,
+            url=url,
+            session_id=session_id or "",
+            tool="download_resource",
+        )
+    except Exception as exc:  # noqa: BLE001 - never break a download
+        log.warning("resource.index_failed", error=str(exc), path=str(path))
+        return None
+
+
+def mgr_relative(workspace: Path, path: Path) -> str:
+    try:
+        return path.resolve().relative_to(Path(workspace).resolve()).as_posix()
+    except ValueError:
+        return path.name
 
 
 class YoutubeSearchTool(Tool):
@@ -214,6 +270,14 @@ class DownloadResourceTool(Tool):
             local = ws / cached.path
             registry.touch(cached.path)
             log.info("download_skipped_cached", url=url, path=cached.path)
+            index_download(
+                ws,
+                self._settings,
+                path=local,
+                url=url,
+                source=cached.source,
+                session_id=session_id,
+            )
             return ToolResult(
                 ok=True,
                 output={
@@ -292,6 +356,14 @@ class DownloadResourceTool(Tool):
                 source=kind,
                 url=url,
                 session_id=session_id or "",
+            )
+            index_download(
+                ws,
+                self._settings,
+                path=info.get("path") or dest,
+                url=url,
+                source=kind,
+                session_id=session_id,
             )
             return ToolResult(
                 ok=True,

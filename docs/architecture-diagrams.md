@@ -8,8 +8,9 @@ Diagrams describe the code **as committed** (`src/ai_employee/`), not an aspirat
 design. A richer, styled version of the same four diagrams is in
 [architecture-diagrams.html](architecture-diagrams.html) — open it in a browser.
 
-Counts as of this writing: **29 agents**, **23 tools**, **7 providers**,
-**3 orchestrators**, **7 memory namespaces**.
+Counts as of this writing: **29 agents**, **24 tools** (29 with Google Workspace
+connected), **7 providers**, **3 orchestrators**, **7 memory namespaces**, **25 MCP
+connector presets**.
 
 ---
 
@@ -216,4 +217,4 @@ property the rest of the architecture assumes.
 | **Sensitive ops are gated** | A tool with an `approval_key` in `approval_required` cannot execute without `approved=True` — the gate is in the registry, not in any agent's prompt. |
 
 Approval keys currently enforced: `db_write`, `deploy`, `email_send`, `git_push`,
-`resource_acquisition`, `resource_download`, `shell_write`.
+`resource_acquisition`, `resource_download`, `shell_write`, `calendar_write`, `mcp_tool`.

@@ -6,7 +6,7 @@ from ai_employee.agents.base import AgentContext, AgentResult, BaseAgent, ToolUs
 from ai_employee.agents.specs import AgentSpec
 from ai_employee.brains.schemas import Message
 from ai_employee.core.logging import get_logger
-from ai_employee.core.trace import clip
+from ai_employee.core.trace import clip, tool_clip
 from ai_employee.verification.resources import format_resource_block, is_resource_task
 
 log = get_logger("agent.custom")
@@ -48,13 +48,13 @@ class CodingAgent(ToolUsingAgent):
             agent=self.name,
             system=f"Delegated to external coding agent: {backend} CLI (writes & runs code).",
             memories=[],
-            task=clip(task, 1200),
+            task=clip(task),
         )
         res = await run_external_code_agent(backend, task)
         log.info(
             "agent.answer",
             agent=self.name,
-            output=clip(res["output"], 4000),
+            output=clip(res["output"]),
             note=f"backend={backend}",
         )
         return AgentResult(
@@ -66,9 +66,9 @@ class CodingAgent(ToolUsingAgent):
             tool_trace=[
                 {
                     "tool": f"{backend}_cli",
-                    "args": {"task": clip(task, 300)},
+                    "args": {"task": clip(task)},
                     "ok": res["ok"],
-                    "output": clip(res["output"], 2000),
+                    "output": tool_clip(res["output"]),
                     "error": res.get("error"),
                 }
             ],
@@ -88,7 +88,11 @@ class PlannerAgent(BaseAgent):
 
         catalog = ctx.scratch.get("agent_catalog", [])
         planner = Planner(ctx.brain)
-        plan = await planner.make_plan(task, agent_catalog=catalog)
+        plan = await planner.make_plan(
+            task,
+            agent_catalog=catalog,
+            base_agent=ctx.scratch.get("base_agent"),
+        )
         return AgentResult(
             agent=self.name,
             success=True,
@@ -119,10 +123,37 @@ class CEOAgent(BaseAgent):
             )
             return AgentResult(agent=self.name, output=answer, confidence=0.7)
 
-        digest = "\n\n".join(
-            f"### Step {r.get('id')}: {r.get('description')}\n{r.get('output')}"
-            for r in step_results
-        )
+        # Label each step's status explicitly. Skipped/unverified steps still carry
+        # a placeholder "output" string (so the digest reads coherently), but if the
+        # CEO can't tell a skipped step from a completed one, it will happily
+        # reconstruct that step's deliverable itself from *other* steps' raw text —
+        # e.g. inventing the CSV a skipped "coding" step never wrote. The label is
+        # the only thing standing between "the team built X" and "I guessed at X".
+        skipped_ids: list[int] = []
+        digest_parts = []
+        for r in step_results:
+            if r.get("skipped"):
+                status = "[SKIPPED — do not treat this step's deliverable as produced]"
+                skipped_ids.append(r.get("id"))
+            elif not r.get("verified", True):
+                status = "[UNVERIFIED — reviewer did not confirm this output]"
+            else:
+                status = "[COMPLETED]"
+            digest_parts.append(
+                f"### Step {r.get('id')} {status}: {r.get('description')}\n{r.get('output')}"
+            )
+        digest = "\n\n".join(digest_parts)
+        skip_hint = ""
+        if skipped_ids:
+            skip_hint = (
+                f"\n\nSteps {skipped_ids} were SKIPPED (an unmet prerequisite left them "
+                "nothing to act on) — they produced NO deliverable. Do not synthesize, "
+                "reconstruct, or approximate what a skipped step would have produced "
+                "(e.g. do not hand-assemble a file/table a skipped step was supposed to "
+                "build, even from other steps' raw data). State plainly that it is "
+                "missing and why, so the user knows to re-run or fix the blocker rather "
+                "than mistake your prose for the real deliverable."
+            )
         model_label = ctx.scratch.get("brain_model") or getattr(ctx.brain, "model_name", "")
         provider_label = ctx.scratch.get("brain_provider") or getattr(ctx.brain, "name", "")
         brain_label = f"{provider_label} / {model_label}".strip(" /")
@@ -159,7 +190,7 @@ class CEOAgent(BaseAgent):
             "contradictions, and present a clear final answer. Do not mention internal "
             "step mechanics unless useful. Be honest when the team did NOT actually obtain "
             "a requested resource — never embellish search snippets into confirmed downloads."
-            f"{resource_hint}"
+            f"{skip_hint}{resource_hint}"
         )
         answer = await ctx.brain.chat(
             [Message.system(system), Message.user(f"GOAL: {task}\n\nTEAM OUTPUT:\n{digest}")]

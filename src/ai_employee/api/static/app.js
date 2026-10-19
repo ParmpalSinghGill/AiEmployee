@@ -3,6 +3,9 @@
  * running task and render a live n8n-style flow, logs, and the final result. */
 
 const TERMINAL = new Set(["completed", "failed", "awaiting_approval", "waiting_for_user", "cancelled"]);
+// Live statuses keep polling. "cooling" means a provider rate limit made the
+// agent sleep before its automatic retry — still live, just visibly paused.
+const LIVE = new Set(["running", "pending", "cooling"]);
 const state = {
   sessions: new Map(),        // sid -> session object
   order: [],                  // tab order of sids
@@ -377,8 +380,9 @@ async function loadSessionList() {
   }
   for (const s of sessions) {
     const last = s.runs[s.runs.length - 1] || {};
-    const status = s.runs.some(r => r.status === "running" || r.status === "pending")
-      ? "running" : (last.status || "completed");
+    const live = s.runs.filter(r => LIVE.has(r.status));
+    const status = live.some(r => r.status === "cooling")
+      ? "cooling" : (live.length ? "running" : (last.status || "completed"));
     const item = el(`<div class="sess-item ${state.sessions.has(s.id) ? "open" : ""}">
       <span class="dot ${status}"></span>
       <div class="meta"><div class="t">${esc(s.title)}</div>
@@ -455,6 +459,32 @@ async function deleteAllSessions() {
     alert("Failed to delete tasks: " + e.message);
   }
   btn.disabled = false;
+}
+
+/* Re-import runs still present in the server log (lost to a restart/crash). */
+async function recoverRuns() {
+  if (!confirm(
+    "Recover runs from the server log into Saved tasks?\n\n" +
+    "Use this after a restart (or crash) to reopen a run that wasn't saved — " +
+    "the console rebuilds it from the structured log so you can inspect its " +
+    "Explain/Logs/Result views again. No task is re-executed."
+  )) return;
+  const btn = $("#recover-runs");
+  btn.disabled = true;
+  const old = btn.textContent;
+  btn.textContent = "…";
+  try {
+    const res = await api("POST", "/ui/api/sessions/recover");
+    alert(res.count
+      ? `Recovered ${res.count} run(s) from the log:\n` + res.imported.map(i => `• ${i.title}`).join("\n")
+      : `Nothing new to recover (${res.note || "all log runs are already saved"}).`);
+    await loadSessionList();
+  } catch (e) {
+    alert("Recover failed: " + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = old;
+  }
 }
 
 /* Open (or resume) a saved session as a tab. */
@@ -737,7 +767,9 @@ function poll(taskId, sid) {
 
 /* ── Tabs ──────────────────────────────────────────────────────────────── */
 function sessionStatus(s) {
-  if (s.runs.some(r => r.status === "running" || r.status === "pending")) return "running";
+  const live = s.runs.filter(r => LIVE.has(r.status));
+  if (live.some(r => r.status === "cooling")) return "cooling";
+  if (live.length) return "running";
   return s.runs[s.runs.length - 1]?.status || "pending";
 }
 
@@ -953,6 +985,19 @@ function wireExplainControls(explain, session) {
       renderSession(session);
     });
   });
+  // Expand all / collapse all every nested <details> (LLM calls, tools, verification)
+  // and remember the choice so a re-render (live polling) keeps it.
+  explain.querySelectorAll("[data-explain-expand]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const open = btn.dataset.explainExpand === "all";
+      let m = state.explainOpen.get(session.activeRun);
+      if (!m) { m = new Map(); state.explainOpen.set(session.activeRun, m); }
+      explain.querySelectorAll("details[data-xk]").forEach(d => {
+        d.open = open;
+        m.set(d.getAttribute("data-xk"), open);
+      });
+    });
+  });
 }
 
 function renderActiveView(s) {
@@ -1017,7 +1062,7 @@ function deriveFlow(task) {
   let schedule = null;
   const steps = new Map();
   const ensure = (n, agent) => {
-    if (!steps.has(n)) steps.set(n, { step: n, agent: agent || "?", tools: new Map(), verified: null, confidence: null, retries: 0, running: false, started: false });
+    if (!steps.has(n)) steps.set(n, { step: n, agent: agent || "?", tools: new Map(), verified: null, confidence: null, retries: 0, tokens: 0, running: false, started: false });
     const s = steps.get(n); if (agent) s.agent = agent; return s;
   };
   for (const e of (task.events || [])) {
@@ -1030,6 +1075,16 @@ function deriveFlow(task) {
       case "tool.result": if (f.step != null && f.tool) { const s = ensure(f.step); s.tools.set(f.tool, { name: f.tool, status: f.ok ? "ok" : "fail", latency: f.latency_ms }); } break;
       case "tool.approval_required": if (f.step != null && f.tool) { ensure(f.step).tools.set(f.tool, { name: f.tool, status: "approval" }); } approval = { ...(approval || {}), tool: f.tool, args: f.args, key: f.key, step: f.step }; break;
       case "verifier.verdict": if (f.step != null) { const s = ensure(f.step); s.verified = f.passed; s.confidence = f.confidence; } break;
+      case "brain.response": {
+        // Attribute the agent's own LLM tokens (purpose "agent:<name>") to its step,
+        // so the flow can show how much each agent's reasoning cost.
+        const purpose = f.purpose || "";
+        if (f.step != null && purpose.startsWith("agent:")) {
+          const s = ensure(f.step);
+          s.tokens = (s.tokens || 0) + (((f.usage || {}).total_tokens) || 0);
+        }
+        break;
+      }
       case "workflow.retry": if (f.step != null) ensure(f.step).retries = f.attempt || 0; break;
       // Parallel mode: these are the only events that say a step is *in flight*
       // right now — a step with no tool calls yet is otherwise invisible.
@@ -1176,10 +1231,35 @@ function renderFlow(task, session) {
     ? `<div class="stat"><div class="v">${liveSteps.length}</div><div class="k">Running now</div></div>`
     : "";
 
+  const totalRetries = fl.steps.reduce((n, s) => n + (s.retries || 0), 0);
+  const totalTokens = fl.steps.reduce((n, s) => n + (s.tokens || 0), 0);
+
+  // Provider rate limit: the agent is not stuck, it is sleeping out the
+  // provider's cooldown and will retry automatically. Show when it resumes.
+  const cool = task.cooling || null;
+  let coolingBar = "";
+  if (cool) {
+    const until = cool.until ? new Date(cool.until) : null;
+    const valid = until && !Number.isNaN(until.getTime());
+    const secs = valid ? Math.max(0, Math.round((until.getTime() - Date.now()) / 1000)) : null;
+    const when = valid ? until.toLocaleTimeString() : "shortly";
+    const who = [cool.provider, cool.agent, cool.step != null ? `step ${cool.step}` : ""]
+      .filter(Boolean).join(" · ");
+    coolingBar = `<div class="cooling-bar">
+      <span class="cooling-spinner"></span>
+      <div class="cooling-text">
+        <b>Cooling down — rate limit</b>
+        <span class="muted">${who ? esc(who) + " · " : ""}retrying at ${esc(when)}${secs != null ? ` (${secs}s)` : ""}</span>
+      </div>
+    </div>`;
+  }
+
   const summary = `<div class="flow-summary">
     <div class="stat"><div class="v">${fl.steps.length || (fl.plan?.steps || 0)}</div><div class="k">Steps</div></div>
     <div class="stat"><div class="v">${agents.size}</div><div class="k">Agents</div></div>
+    <div class="stat" title="Verifier-driven re-runs across all steps"><div class="v">${totalRetries}</div><div class="k">Retries</div></div>
     ${liveStat}
+    <div class="stat" title="Tokens spent by the agents' reasoning (excludes planner/verifier/synthesis)"><div class="v">${fmtTok(totalTokens)}</div><div class="k">Tokens</div></div>
     <div class="stat"><div class="v">${tools.size}</div><div class="k">Tools used</div></div>
     <div class="stat"><div class="v">${esc(statusLabel(task.status))}</div><div class="k">Status</div></div>
   </div>`;
@@ -1217,11 +1297,18 @@ function renderFlow(task, session) {
     else if (s.verified === false) badge = `<div class="badge fail">✗ needs work</div>`;
     // In parallel mode several agents are live at once — mark which, so the flow
     // shows concurrency rather than looking like a sequential list.
-    const live = s.running && !TERMINAL.has(task.status)
-      ? `<div class="badge running"><span class="pulse"></span>running now</div>` : "";
-    const retry = s.retries ? `<div class="node-sub">retried ×${s.retries}</div>` : "";
+    const coolingHere = cool && task.status === "cooling" && cool.step != null
+      && Number(cool.step) === Number(s.step);
+    const live = coolingHere
+      ? `<div class="badge cooling"><span class="pulse"></span>cooling down</div>`
+      : (s.running && !TERMINAL.has(task.status)
+        ? `<div class="badge running"><span class="pulse"></span>running now</div>` : "");
+    const metaBits = [];
+    if (s.retries) metaBits.push(`retried ×${s.retries}`);
+    if (s.tokens) metaBits.push(`🧮 ${fmtTok(s.tokens)} tok`);
+    const meta = metaBits.length ? `<div class="node-sub tok">${metaBits.join(" · ")}</div>` : "";
     nodes.push(nodeHtml("step" + (s.running ? " is-running" : ""), `Step ${s.step} · agent`, "▣",
-      s.agent, live + chips + badge + retry, "comp:step:" + s.step));
+      s.agent, live + chips + badge + meta, "comp:step:" + s.step));
   }
   // Always offer the approve control in-flow while paused — fall back to the
   // result payload (or a generic card) when the approval events were trimmed.
@@ -1248,11 +1335,19 @@ function renderFlow(task, session) {
     }, 0);
   }
 
-  return summary + parallelBar + `<div class="flow">` + nodes.join(conn()) + `</div>`;
+  return coolingBar + summary + parallelBar + `<div class="flow">` + nodes.join(conn()) + `</div>`;
 }
 
 function statusLabel(s) {
-  return { running: "Running", pending: "Starting", completed: "Done", failed: "Failed", awaiting_approval: "Needs approval", waiting_for_user: "Waiting for you", cancelled: "Cancelled" }[s] || s;
+  return { running: "Running", pending: "Starting", cooling: "Cooling down", completed: "Done", failed: "Failed", awaiting_approval: "Needs approval", waiting_for_user: "Waiting for you", cancelled: "Cancelled" }[s] || s;
+}
+
+/* Compact token count: 12400 → "12.4k", 1_500_000 → "1.5M". */
+function fmtTok(n) {
+  if (n == null || !Number.isFinite(n)) return "0";
+  if (n >= 1e6) return (n / 1e6).toFixed(1).replace(/\.0$/, "") + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1).replace(/\.0$/, "") + "k";
+  return String(n);
 }
 
 /* ── Explain (input → reasoning → output, per component) ───────────────── */
@@ -1267,8 +1362,20 @@ function buildTrace(task) {
 
   const mkPlanner = () => planner || (comps.push(planner = { kind: "planner", title: "Planner", icon: "◇", input: null, output: null, llm: [], timeline: [] }), planner);
   const mkStep = (n) => {
-    if (!steps.has(n)) { const c = { kind: "step", step: n, agent: "?", title: "Step " + n, icon: "▣", input: null, answer: null, llm: [], tools: [], timeline: [], verify: { input: null, verdict: null, llm: [], timeline: [] } }; steps.set(n, c); comps.push(c); }
+    if (!steps.has(n)) { const c = { kind: "step", step: n, agent: "?", title: "Step " + n, icon: "▣", attempts: [], retries: 0 }; steps.set(n, c); comps.push(c); }
     return steps.get(n);
+  };
+  // One attempt = one agent.run() for this step. retry 0 is the initial attempt;
+  // retry N (1,2,…) is the Nth verifier-driven retry. Each keeps its own input,
+  // LLM calls, tools and verification so the Explain view can show them separately.
+  const mkAttempt = (s, retry) => {
+    let a = s.attempts.find(x => x.retry === retry);
+    if (!a) {
+      a = { retry, input: null, answer: null, llm: [], tools: [], timeline: [], verify: { input: null, verdict: null, llm: [], timeline: [] } };
+      s.attempts.push(a);
+      s.attempts.sort((p, q) => p.retry - q.retry);
+    }
+    return a;
   };
   const mkSynth = () => synth || (comps.push(synth = { kind: "synthesize", title: "Synthesize", icon: "★", agent: "ceo", input: null, output: null, llm: [], timeline: [] }), synth);
   const mkReflect = () => reflect || (comps.push(reflect = { kind: "reflect", title: "Reflect", icon: "↻", llm: [], timeline: [], notes: "Persist the outcome to long-term memory and distill a reusable skill." }), reflect);
@@ -1276,7 +1383,8 @@ function buildTrace(task) {
   const traceTarget = (f) => {
     if (f.step != null) {
       const s = mkStep(f.step);
-      return f.phase === "verify" ? { box: s.verify, comp: s } : { box: s, comp: s };
+      const a = mkAttempt(s, Number(f.retry) || 0);
+      return f.phase === "verify" ? { box: a.verify, comp: s } : { box: a, comp: s };
     }
     if (f.node === "plan" || f.purpose === "planner") return { box: mkPlanner(), comp: mkPlanner() };
     if (f.node === "synthesize" || f.purpose === "synthesize") return { box: mkSynth(), comp: mkSynth() };
@@ -1291,11 +1399,11 @@ function buildTrace(task) {
       case "planner.plan_ready": mkPlanner().output = { steps: f.steps, reasoning: f.reasoning, plan: f.plan || [] }; break;
       case "agent.start": if (f.step != null) mkStep(f.step).agent = f.agent || "?"; break;
       case "agent.context":
-        if (f.step != null) { const s = mkStep(f.step); s.agent = f.agent || s.agent; s.input = { system: f.system, memories: f.memories || [], task: f.task }; }
+        if (f.step != null) { const s = mkStep(f.step); s.agent = f.agent || s.agent; mkAttempt(s, Number(f.retry) || 0).input = { system: f.system, memories: f.memories || [], task: f.task }; }
         else if (f.node === "synthesize") mkSynth().input = { system: f.system, memories: f.memories || [], task: f.task };
         break;
       case "agent.answer":
-        if (f.step != null) { mkStep(f.step).answer = { output: f.output, note: f.note }; }
+        if (f.step != null) { mkAttempt(mkStep(f.step), Number(f.retry) || 0).answer = { output: f.output, note: f.note }; }
         else if (f.node === "synthesize") mkSynth().output = { output: f.output };
         break;
       case "brain.request": {
@@ -1312,15 +1420,15 @@ function buildTrace(task) {
       }
       case "tool.execute":
         if (f.step != null) {
-          const s = mkStep(f.step);
+          const a = mkAttempt(mkStep(f.step), Number(f.retry) || 0);
           const tool = { name: f.tool, args: f.args, status: "running" };
-          s.tools.push(tool);
-          s.timeline.push({ type: "tool", ref: tool });
+          a.tools.push(tool);
+          a.timeline.push({ type: "tool", ref: tool });
         }
         break;
-      case "tool.result": if (f.step != null) { const ts = mkStep(f.step).tools; for (let i = ts.length - 1; i >= 0; i--) if (ts[i].name === f.tool && ts[i].status === "running") { Object.assign(ts[i], { status: f.ok ? "ok" : "fail", output: f.output, error: f.error, latency: f.latency_ms }); break; } } break;
-      case "verifier.input": if (f.step != null) mkStep(f.step).verify.input = { task: f.task, criteria: f.criteria, output: f.output }; break;
-      case "verifier.verdict": if (f.step != null) mkStep(f.step).verify.verdict = { passed: f.passed, confidence: f.confidence, issues: f.issues || [], suggestion: f.suggestion }; break;
+      case "tool.result": if (f.step != null) { const ts = mkAttempt(mkStep(f.step), Number(f.retry) || 0).tools; for (let i = ts.length - 1; i >= 0; i--) if (ts[i].name === f.tool && ts[i].status === "running") { Object.assign(ts[i], { status: f.ok ? "ok" : "fail", output: f.output, error: f.error, latency: f.latency_ms }); break; } } break;
+      case "verifier.input": if (f.step != null) mkAttempt(mkStep(f.step), Number(f.retry) || 0).verify.input = { task: f.task, criteria: f.criteria, output: f.output }; break;
+      case "verifier.verdict": if (f.step != null) mkAttempt(mkStep(f.step), Number(f.retry) || 0).verify.verdict = { passed: f.passed, confidence: f.confidence, issues: f.issues || [], suggestion: f.suggestion }; break;
       case "workflow.node": if (f.node === "synthesize") mkSynth(); if (f.node === "reflect") mkReflect(); break;
       case "approval.granted": comps.push({ kind: "approval", idx: comps.length, title: "Approved", icon: "✅", op: f.op, tool: f.tool, args: f.args }); break;
     }
@@ -1330,7 +1438,9 @@ function buildTrace(task) {
   // rather than leaving the card labelled "?".
   for (const r of (task.result?.steps || [])) {
     const c = steps.get(r.id);
-    if (c && (!c.agent || c.agent === "?") && r.agent) c.agent = r.agent;
+    if (!c) continue;
+    if ((!c.agent || c.agent === "?") && r.agent) c.agent = r.agent;
+    c.retries = Math.max(c.retries || 0, r.retries || 0);
   }
   return comps;
 }
@@ -1491,20 +1601,32 @@ function compCard(c, explainOrder = "grouped") {
         : _text("(planning…)"));
     }
   } else if (c.kind === "step") {
-    if (c.input) {
-      body += _field("Input (task given to agent)", _text(c.input.task));
-      if (c.input.system) body += _field("Agent role (system prompt)", _text(c.input.system));
-      if (c.input.memories && c.input.memories.length) body += _field("Recalled knowledge", `<ul class="x-list">${c.input.memories.map(m => `<li>${linkify(m)}</li>`).join("")}</ul>`);
-    }
-    if (c.llm.length || c.tools.length) {
-      body += `<div class="x-label">Reasoning & actions</div><div class="x-proc">`;
-      body += explainOrder === "timeline"
-        ? procBlocksTimeline(c.timeline, ck)
-        : procBlocksGrouped(c.llm, c.tools, ck);
-      body += `</div>`;
-    }
-    if (c.answer) body += _field("Output (agent's answer)", _text(c.answer.output) + (c.answer.note ? `<div class="x-muted">⚠ ${linkify(c.answer.note)}</div>` : ""));
-    if (c.verify.input || c.verify.verdict || c.verify.llm.length) body += verifyBlock(c.verify, ck);
+    const attempts = c.attempts || [];
+    if (!attempts.length) body += _text("…");
+    attempts.forEach(a => {
+      const ak = ck + ":att:" + a.retry;
+      const label = a.retry === 0
+        ? `<span class="x-att-tag initial">Attempt 1</span>`
+        : `<span class="x-att-tag retry">↺ Attempt ${a.retry + 1} — retry ${a.retry}</span>`;
+      let ab = "";
+      if (a.input) {
+        ab += _field(
+          a.retry === 0 ? "Input (task given to agent)" : "Input (retry — continues from previous attempt)",
+          _text(a.input.task));
+        if (a.input.system) ab += _field("Agent role (system prompt)", _text(a.input.system));
+        if (a.input.memories && a.input.memories.length) ab += _field("Recalled knowledge", `<ul class="x-list">${a.input.memories.map(m => `<li>${linkify(m)}</li>`).join("")}</ul>`);
+      }
+      if (a.llm.length || a.tools.length) {
+        ab += `<div class="x-label">Reasoning & actions</div><div class="x-proc">`;
+        ab += explainOrder === "timeline"
+          ? procBlocksTimeline(a.timeline, ak)
+          : procBlocksGrouped(a.llm, a.tools, ak);
+        ab += `</div>`;
+      }
+      if (a.answer) ab += _field("Output (agent's answer)", _text(a.answer.output) + (a.answer.note ? `<div class="x-muted">⚠ ${linkify(a.answer.note)}</div>` : ""));
+      if (a.verify.input || a.verify.verdict || a.verify.llm.length) ab += verifyBlock(a.verify, ak);
+      body += `<details class="x-attempt${a.retry > 0 ? " retry" : ""}" data-xk="${esc(ak)}" open><summary>${label}</summary><div class="x-attempt-body">${ab || _text("…")}</div></details>`;
+    });
   } else if (c.kind === "synthesize") {
     if (c.input) body += _field("Input (team's step outputs)", _text(c.input.task));
     body += explainOrder === "timeline" ? procBlocksTimeline(c.timeline, ck) : procBlocksGrouped(c.llm, [], ck);
@@ -1515,7 +1637,12 @@ function compCard(c, explainOrder = "grouped") {
   }
 
   let sub = "";
-  if (c.kind === "step") sub = `agent: ${esc(c.agent)}`;
+  if (c.kind === "step") {
+    const retried = Math.max(c.retries || 0, (c.attempts?.length || 1) - 1);
+    sub = `agent: ${esc(c.agent)}` + (retried > 0
+      ? ` <span class="x-retry-badge" title="This step was retried by the verifier — ${retried + 1} attempts">↺ retried ${retried}×</span>`
+      : "");
+  }
   else if (c.kind === "synthesize") sub = "CEO integrates the work";
   return `<details class="x-comp ${c.kind}" data-xk="${esc(ck)}" open><summary><span class="x-icon">${c.icon || "•"}</span><b>${esc(c.title)}</b>${sub ? `<span class="x-sub">${sub}</span>` : ""}</summary><div class="x-comp-body">${body || _text("…")}</div></details>`;
 }
@@ -1530,6 +1657,11 @@ function renderExplain(task, session) {
     <div class="x-seg">
       <button type="button" class="x-seg-btn ${order === "grouped" ? "active" : ""}" data-explain-order="grouped">Grouped</button>
       <button type="button" class="x-seg-btn ${order === "timeline" ? "active" : ""}" data-explain-order="timeline">Execution Order</button>
+    </div>
+    <div class="x-explain-toolbar-label" style="margin-left:auto">Details</div>
+    <div class="x-seg">
+      <button type="button" class="x-seg-btn" data-explain-expand="all">⤢ Expand all</button>
+      <button type="button" class="x-seg-btn" data-explain-expand="none">⤡ Collapse all</button>
     </div>
   </div>`;
   return intro + toolbar + `<div class="x-trace">` + comps.map(c => compCard(c, order)).join(`<div class="x-conn"></div>`) + `</div>`;
@@ -1611,6 +1743,17 @@ function renderPartialResult(task) {
   return html;
 }
 
+function lastVerdict(task, stepId) {
+  // The verifier's final verdict for a step (its last attempt) — carries the
+  // issues + suggestion when the step did not pass review.
+  let verdict = null;
+  for (const e of (task.events || [])) {
+    const f = e.fields || {};
+    if (e.event === "verifier.verdict" && f.step === stepId) verdict = f;
+  }
+  return verdict || {};
+}
+
 function renderResult(task, session) {
   if (task.resumable) {
     const reason = task.error || "This run was interrupted before it finished.";
@@ -1689,14 +1832,49 @@ function renderResult(task, session) {
       <span>${(conf * 100).toFixed(0)}%</span>
     </div>`;
 
+  // At-a-glance run stats: how many steps, how many retries, verification split.
+  const steps = r.steps || [];
+  const totalRetries = steps.reduce((n, s) => n + (s.retries || 0), 0);
+  const unverified = steps.filter(s => !s.verified);
+  const verifiedCount = steps.length - unverified.length;
+  if (steps.length) {
+    html += `<div class="result-stats">
+      <span class="stat" title="Steps in the plan">📋 <b>${steps.length}</b> step${steps.length === 1 ? "" : "s"}</span>
+      <span class="stat" title="Verifier-driven re-runs across all steps">↺ <b>${totalRetries}</b> retr${totalRetries === 1 ? "y" : "ies"}</span>
+      <span class="stat ${unverified.length ? "warn" : "ok"}" title="Steps that passed review">
+        ✓ <b>${verifiedCount}</b> verified${unverified.length ? ` · <b>${unverified.length}</b> needs work` : ""}</span>
+    </div>`;
+  }
+
+  // Needs-work explainer: name the unverified steps and what the reviewer found.
+  if (unverified.length) {
+    const items = unverified.map(st => {
+      const v = lastVerdict(task, st.id);
+      const issues = (v.issues || []).filter(Boolean);
+      const sug = v.suggestion;
+      return `<li><b>Step ${esc(st.id)} · ${esc(st.agent || "?")}</b> — ${esc(st.description || "")}
+        ${issues.length ? `<ul class="x-list">${issues.map(i => `<li>${linkify(i)}</li>`).join("")}</ul>` : ""}
+        ${sug ? `<div class="x-muted">Suggested fix: ${linkify(sug)}</div>` : ""}</li>`;
+    }).join("");
+    html += `<div class="needs-work-banner">
+      <div class="nw-head">⚠ ${unverified.length} step${unverified.length === 1 ? "" : "s"} not verified — needs work</div>
+      <ul class="nw-list">${items}</ul>
+    </div>`;
+  }
+
   html += `<div id="media-gallery-${esc(task.id)}" class="media-gallery"></div>`;
   html += `<div id="deliverables-${esc(task.id)}"></div>`;
 
-  const steps = r.steps || [];
   if (steps.length) {
-    html += `<div class="steps-list"><h3>Step outputs</h3>` + steps.map(st =>
-      `<div class="step-card"><h4>Step ${esc(st.id)} · ${esc(st.agent)} ${st.verified ? "✓" : ""}</h4>
-        <div class="out md">${renderMarkdown((st.output || "").slice(0, 1200))}</div></div>`).join("") + `</div>`;
+    html += `<div class="steps-list"><h3>Step outputs</h3>` + steps.map(st => {
+      const retried = st.retries || 0;
+      const badge = st.verified
+        ? `<span class="x-mark ok">✓ verified</span>`
+        : `<span class="x-mark fail">⚠ needs work</span>`;
+      const retryBadge = retried > 0 ? `<span class="x-retry-badge" title="${retried} verifier-driven re-run(s)">↺ retried ${retried}×</span>` : "";
+      return `<div class="step-card"><h4>Step ${esc(st.id)} · ${esc(st.agent)} ${badge} ${retryBadge}</h4>
+        <div class="out md">${renderMarkdown((st.output || "").slice(0, 1200))}</div></div>`;
+    }).join("") + `</div>`;
   }
 
   html += tokensBlock(r.tokens);
@@ -1897,6 +2075,7 @@ if ($("#auto-approve")) {
 
 $("#refresh-sessions").addEventListener("click", loadSessionList);
 $("#delete-all-sessions").addEventListener("click", deleteAllSessions);
+$("#recover-runs").addEventListener("click", recoverRuns);
 
 async function clearAllMemories() {
   if (!confirm(
@@ -2073,6 +2252,126 @@ async function toggleParallel() {
 
 $("#parallel-badge").addEventListener("click", toggleParallel);
 
+/* ── 🎚 Agent limits modal (iterations & loop extensions per agent) ───────── */
+let _limitsModal = null;
+
+async function loadLimitsBadge() {
+  const badge = $("#limits-badge");
+  if (!badge) return;
+  try {
+    const st = await api("GET", "/ui/api/agents/limits");
+    const overrides = [st.max_iterations_by_name, st.loop_extensions_by_name]
+      .filter(v => (v || "").trim()).length;
+    badge.innerHTML = `<span class="b-led"></span><span>🎚 Limits${overrides ? ` (${overrides})` : ""}</span>`;
+    badge.title = (st.max_iterations
+      ? `Every agent gets ${st.max_iterations} tool rounds + ${st.loop_extensions_max} loop window(s).`
+      : "Agents use their built-in iteration budgets.")
+      + (overrides ? ` ${overrides} per-agent override(s).` : "")
+      + " Click to edit.";
+  } catch { badge.textContent = "limits: ?"; }
+}
+
+async function openLimitsModal() {
+  if (_limitsModal) return;
+  const overlay = el(`<div class="modal-overlay"><div class="modal limits-modal">
+    <div class="modal-head"><h3>🎚 Agent limits</h3><button class="icon-btn modal-close" title="Close">✕</button></div>
+    <p class="modal-sub">How many tool rounds (<b>iterations</b>) each agent may run before its
+      loop check fires, and how many extra <b>loop windows</b> it may be granted when the check
+      judges it still progressing. A per-agent override wins over the global value, which wins
+      over each agent's built-in default. Format: <code>coding=24,research=16</code></p>
+    <div class="limits-form">
+      <label>Global max iterations
+        <input type="number" class="l-max" min="0" step="1" />
+        <span class="muted">0 = use each agent's built-in default</span></label>
+      <label>Per-agent iterations
+        <input type="text" class="l-max-by" placeholder="coding=24,research=16" /></label>
+      <label>Loop extensions (global)
+        <input type="number" class="l-loops" min="0" step="1" /></label>
+      <label>Per-agent loops
+        <input type="text" class="l-loops-by" placeholder="coding=4" /></label>
+      <label class="limits-check"><input type="checkbox" class="l-loopcheck" />
+        <span>Enable loop check (grant extra windows while the agent is still progressing)</span></label>
+      <div class="limits-sep">Explain view — how much input/output text is kept (0 = everything)</div>
+      <label>Task &amp; LLM text — max chars
+        <input type="number" class="l-explain" min="0" step="1000" />
+        <span class="muted">0 = keep everything (no “… more chars”)</span></label>
+      <label>Tool text — max chars
+        <input type="number" class="l-explain-tool" min="0" step="1000" />
+        <span class="muted">0 = keep all tool args/output</span></label>
+    </div>
+    <div class="limits-body"></div>
+    <div class="row limits-actions">
+      <span class="key-status l-status"></span>
+      <button class="btn l-cancel">Close</button>
+      <button class="btn primary l-save">Save</button>
+    </div>
+  </div></div>`);
+  document.body.appendChild(overlay);
+  _limitsModal = overlay;
+  const close = () => { overlay.remove(); _limitsModal = null; };
+  $(".modal-close", overlay).addEventListener("click", close);
+  overlay.addEventListener("click", e => { if (e.target === overlay) close(); });
+  $(".l-cancel", overlay).addEventListener("click", close);
+  $(".l-save", overlay).addEventListener("click", () => saveLimits(overlay));
+  await renderLimits(overlay);
+}
+
+async function renderLimits(overlay) {
+  const body = $(".limits-body", overlay);
+  let st;
+  try { st = await api("GET", "/ui/api/agents/limits"); }
+  catch (e) { body.innerHTML = `<div class="key-status err">✗ ${esc(e.message)}</div>`; return; }
+  $(".l-max", overlay).value = st.max_iterations;
+  $(".l-max-by", overlay).value = st.max_iterations_by_name || "";
+  $(".l-loops", overlay).value = st.loop_extensions_max;
+  $(".l-loops-by", overlay).value = st.loop_extensions_by_name || "";
+  $(".l-loopcheck", overlay).checked = !!st.loop_check_enabled;
+  $(".l-explain", overlay).value = st.explain_max_chars ?? 0;
+  $(".l-explain-tool", overlay).value = st.explain_tool_max_chars ?? 0;
+  renderLimitsTable(overlay, st);
+}
+
+function renderLimitsTable(overlay, st) {
+  const rows = (st.agents || []).map(a => `<tr>
+    <td>${esc(a.name)}</td>
+    <td>${esc(a.role || "")}</td>
+    <td>${a.iterations}</td>
+    <td>${a.loops}</td>
+    <td>${a.max_rounds}</td></tr>`).join("");
+  $(".limits-body", overlay).innerHTML = `
+    <div class="key-desc" style="margin:8px 0 6px">Effective budgets — total rounds = iterations × (1 + loops).</div>
+    <table class="res-table">
+      <thead><tr><th>Agent</th><th>Role</th><th>Iterations</th><th>Loops</th><th>Max rounds</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+async function saveLimits(overlay) {
+  const st = $(".l-status", overlay);
+  const btn = $(".l-save", overlay);
+  btn.disabled = true; st.className = "key-status"; st.textContent = "saving…";
+  try {
+    const res = await api("POST", "/ui/api/agents/limits", {
+      max_iterations: parseInt($(".l-max", overlay).value || "0", 10) || 0,
+      max_iterations_by_name: $(".l-max-by", overlay).value,
+      loop_extensions_max: parseInt($(".l-loops", overlay).value || "0", 10) || 0,
+      loop_extensions_by_name: $(".l-loops-by", overlay).value,
+      loop_check_enabled: $(".l-loopcheck", overlay).checked,
+      explain_max_chars: parseInt($(".l-explain", overlay).value || "0", 10) || 0,
+      explain_tool_max_chars: parseInt($(".l-explain-tool", overlay).value || "0", 10) || 0,
+      save_default: true,
+    });
+    st.className = "key-status ok"; st.textContent = "✓ saved";
+    $(".l-max-by", overlay).value = res.max_iterations_by_name || "";
+    $(".l-loops-by", overlay).value = res.loop_extensions_by_name || "";
+    renderLimitsTable(overlay, res);
+    await loadLimitsBadge();
+  } catch (e) {
+    st.className = "key-status err"; st.textContent = "✗ " + e.message;
+  } finally { btn.disabled = false; }
+}
+
+
 $("#clear-memories").addEventListener("click", clearAllMemories);
 $("#restore-memories").addEventListener("click", restoreArchivedMemories);
 $("#memory-badge").addEventListener("click", openMemoryPicker);
@@ -2083,6 +2382,99 @@ $("#mcp-badge").addEventListener("click", openMcpModal);
 $("#schedules-badge").addEventListener("click", openSchedulesModal);
 $("#autonomy-badge").addEventListener("click", openAutonomyModal);
 $("#usage-badge").addEventListener("click", openUsageModal);
+$("#resources-badge").addEventListener("click", openResourcesModal);
+$("#limits-badge").addEventListener("click", openLimitsModal);
+
+/* ── 🗂 Resources modal (task <-> source links + Isolate) ─────────────────── */
+let _resModal = null;
+
+async function openResourcesModal() {
+  if (_resModal) return;
+  const overlay = el(`<div class="modal-overlay"><div class="modal resources-modal">
+    <div class="modal-head"><h3>🗂 Resources</h3><button class="icon-btn modal-close" title="Close">✕</button></div>
+    <p class="modal-sub">Every source the employee has, with the tasks linked to it.
+      <b>Shared</b> sources are reusable by any task; <b>private</b> ones belong to one task.
+      <b>Isolate all tasks</b> copies each shared source into that task's private area — re-downloading
+      from the internet when the shared copy is gone — so nothing stays shared afterwards.</p>
+    <div class="key-actions" style="margin:0 0 8px">
+      <button class="btn primary res-isolate-all" title="Copy every shared source into each task's private area">🔒 Isolate all tasks</button>
+      <button class="btn res-purge-all" title="Delete every catalogued resource (catalog + files)">🗑 Delete all</button>
+      <button class="btn res-wipe-all" title="Delete EVERYTHING in the workspace, tracked or not (models/, data/, sessions/, …) — full reset">🧨 Wipe workspace</button>
+      <button class="btn res-refresh">⟳ Refresh</button>
+      <span class="key-status res-status"></span>
+    </div>
+    <div class="res-body"></div>
+  </div></div>`);
+  document.body.appendChild(overlay);
+  _resModal = overlay;
+  const close = () => { overlay.remove(); _resModal = null; };
+  $(".modal-close", overlay).addEventListener("click", close);
+  overlay.addEventListener("click", e => { if (e.target === overlay) close(); });
+  $(".res-refresh", overlay).addEventListener("click", () => renderResources(overlay));
+  $(".res-isolate-all", overlay).addEventListener("click", async () => {
+    const st = $(".res-status", overlay);
+    st.className = "key-status"; st.textContent = "isolating… (may re-download)";
+    try {
+      const r = await api("POST", "/ui/api/resources/isolate", { all: true, allow_redownload: true });
+      st.className = "key-status ok";
+      st.textContent = `✓ isolated ${r.isolated.length} · purged ${(r.purged || []).length} · pending ${r.needs_redownload.length}`;
+      renderResources(overlay);
+    } catch (e) { st.className = "key-status err"; st.textContent = "✗ " + e.message; }
+  });
+  $(".res-purge-all", overlay).addEventListener("click", async () => {
+    if (!confirm("Delete ALL resources — every catalog entry AND the files on disk — for a fresh start?\n\nThis cannot be undone.")) return;
+    const st = $(".res-status", overlay);
+    st.className = "key-status"; st.textContent = "deleting…";
+    try {
+      const r = await api("POST", "/ui/api/resources/purge", { purge_bytes: true });
+      st.className = "key-status ok";
+      st.textContent = `✓ deleted ${r.deleted} resources · ${r.bytes_freed} bytes freed`;
+      renderResources(overlay);
+    } catch (e) { st.className = "key-status err"; st.textContent = "✗ " + e.message; }
+  });
+  $(".res-wipe-all", overlay).addEventListener("click", async () => {
+    if (!confirm("WIPE THE WORKSPACE?\n\nThis deletes EVERYTHING in the workspace — every downloaded model/dataset, every file a task produced (models/, data/, sessions/, …), tracked or not.\n\nThis cannot be undone.")) return;
+    const st = $(".res-status", overlay);
+    st.className = "key-status"; st.textContent = "wiping workspace…";
+    try {
+      const r = await api("POST", "/ui/api/resources/purge", { purge_bytes: true, wipe_workspace: true });
+      st.className = "key-status ok";
+      st.textContent = `✓ purged ${r.deleted} resources · wiped ${r.workspace?.removed_count ?? 0} entries · ${r.workspace?.bytes_freed ?? 0} bytes`;
+      renderResources(overlay);
+    } catch (e) { st.className = "key-status err"; st.textContent = "✗ " + e.message; }
+  });
+  renderResources(overlay);
+}
+
+async function renderResources(overlay) {
+  const body = $(".res-body", overlay);
+  let data;
+  try { data = await api("GET", "/ui/api/resources"); }
+  catch (e) { body.innerHTML = `<div class="key-status err">✗ ${esc(e.message)}</div>`; return; }
+  if (!data.resources.length) {
+    body.innerHTML = `<p class="muted">No resources yet — run a task that downloads something.</p>`;
+    return;
+  }
+  const rows = data.resources.map(r => {
+    let tasks = (r.tasks || []).map(t => t.task_key || t.task_id || t.session_id).filter(Boolean);
+    if (!tasks.length && r.owner_task) tasks = [r.owner_task];
+    const sharedWith = r.task_count > 1 ? ` <span class="key-set">· ${r.task_count} tasks</span>` : "";
+    const cls = r.visibility === "shared" ? "res-shared" : "res-private";
+    return `<tr class="${cls}">
+      <td>${esc(r.name)}${sharedWith}</td>
+      <td>${esc(r.kind)}</td>
+      <td>${esc(r.visibility)}</td>
+      <td>${tasks.map(esc).join(", ") || "—"}</td>
+      <td>${esc(r.size)} B${r.exists ? "" : " ⚠ missing"}</td>
+    </tr>`;
+  }).join("");
+  body.innerHTML = `
+    <div class="key-desc" style="margin:4px 0 8px">${data.count} sources · ${data.shared} shared · ${data.private} private</div>
+    <table class="res-table">
+      <thead><tr><th>Source</th><th>Kind</th><th>Visibility</th><th>Linked tasks</th><th>Size</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
 
 /* ── Token usage dashboard (per brain, by date) ─────────────────────────── */
 let _usageModal = null;
@@ -2882,6 +3274,10 @@ async function openBrainPicker() {
     <label>Model</label>
     <select class="bp-model"></select>
     <input class="bp-model-custom" placeholder="…or type a custom model name" style="margin-top:6px" />
+    <div class="row bp-model-tools">
+      <button class="btn bp-test-model" title="Ask the provider whether this model is available to your key">Test model</button>
+      <span class="bp-model-status"></span>
+    </div>
     <div class="bp-key-wrap"><label>API key (optional, this session only)</label>
       <input class="bp-key" type="password" placeholder="paste key to use without editing .env" /></div>
     <div class="bp-balance"></div>
@@ -2960,6 +3356,56 @@ async function openBrainPicker() {
   // Picking a listed model must win over a stale custom entry — clear it so the
   // dropdown selection is what gets applied (fixes a half-typed name sticking).
   modelSel.addEventListener("change", () => { customInput.value = ""; });
+
+  // "Test model": ask the provider's own server whether this model is callable by
+  // the current key. Documentation lists models a key may not be entitled to, so
+  // the picker verifies instead of assuming. Results are advisory — a failed probe
+  // never blocks Apply.
+  const testBtn = $(".bp-test-model", pop), modelStatus = $(".bp-model-status", pop);
+  let _modelTestTimer = null;
+  const selectedModel = () => (customInput.value.trim() || modelSel.value || "").trim();
+  const runModelTest = async () => {
+    const provider = provSel.value;
+    const model = selectedModel();
+    modelStatus.className = "bp-model-status";
+    if (!model) { modelStatus.textContent = ""; return; }
+    if (provider === "mock") {
+      modelStatus.textContent = "Mock is offline — no model list to check.";
+      return;
+    }
+    modelStatus.className = "bp-model-status loading";
+    modelStatus.innerHTML = `<span class="spin">◌</span> Testing ${esc(model)} (listing + real request)…`;
+    let res;
+    try {
+      res = await api("POST", "/ui/api/brain/models/check", {
+        provider, model, api_key: keyInput.value.trim() || undefined,
+      });
+    } catch (e) {
+      modelStatus.className = "bp-model-status err";
+      modelStatus.textContent = "Check failed: " + e.message;
+      return;
+    }
+    // Two distinct facts: is it listed, and will the API actually serve it?
+    const listedTxt = res.listed === true ? "listed" : (res.listed === false ? "not listed" : "list n/a");
+    if (res.callable === true) {
+      modelStatus.className = "bp-model-status ok";
+      modelStatus.textContent = `✓ ${res.matched || model} works (${listedTxt}, real request OK)`;
+    } else if (res.callable === false) {
+      modelStatus.className = "bp-model-status err";
+      const why = res.probe && res.probe.http_status ? `HTTP ${res.probe.http_status}` : (res.error || "failed");
+      modelStatus.textContent = `✗ ${model} cannot be used — ${why} (${listedTxt})`;
+      modelStatus.title = [res.message, res.detail].filter(Boolean).join("\n\n");
+    } else {
+      modelStatus.className = "bp-model-status warn";
+      modelStatus.textContent = res.message || "Could not verify this model.";
+    }
+  };
+  testBtn.addEventListener("click", runModelTest);
+  modelSel.addEventListener("change", () => {
+    clearTimeout(_modelTestTimer);
+    _modelTestTimer = setTimeout(runModelTest, 250);
+  });
+  customInput.addEventListener("change", runModelTest);
 
   $(".bp-cancel", pop).addEventListener("click", () => { pop.remove(); _brainPop = null; });
   $(".bp-apply", pop).addEventListener("click", async () => {
@@ -3063,6 +3509,202 @@ function openAccountPicker() {
 
 $("#account-badge").addEventListener("click", openAccountPicker);
 
+/* ── Org chart — CEO on top, employees below, live activity + message bubbles ── */
+let _orgModal = null;
+let _orgTimer = null;
+let _orgRoster = null; // cached /agents catalog (static; doesn't change at runtime)
+
+const OC_CATEGORY_ICON = {
+  management: "🧭", research: "🔎", engineering: "🛠", knowledge: "📚",
+  data: "📊", quality: "✅", ops: "⚙️", comms: "✉️", web: "🌐",
+};
+function ocIcon(agent) {
+  if (agent.name === "ceo") return "★";
+  if (agent.name === "planner") return "🧭";
+  if (agent.name === "human_approval") return "🖐";
+  return OC_CATEGORY_ICON[agent.category] || "🤖";
+}
+
+async function openOrgChartModal() {
+  if (_orgModal) return;
+  const overlay = el(`<div class="modal-overlay"><div class="modal orgchart-modal">
+    <div class="modal-head"><h3>🗺 Org chart</h3><button class="icon-btn modal-close" title="Close">✕</button></div>
+    <p class="modal-sub">The CEO at the top, every employee underneath. An arrow only appears while
+       information is actually moving: <span class="oc-legend-dot dispatch"></span> planner
+       dispatching a step, <span class="oc-legend-dot handoff"></span> one agent's output feeding
+       another, <span class="oc-legend-dot report"></span> a result reaching the CEO. A pulsing
+       border + progress bar marks whoever is working right now, and a bubble travels each arrow
+       in the direction the arrowhead points.</p>
+    <div class="orgchart-body"></div>
+  </div></div>`);
+  document.body.appendChild(overlay);
+  _orgModal = overlay;
+  const close = () => {
+    overlay.remove(); _orgModal = null;
+    if (_orgTimer) { clearInterval(_orgTimer); _orgTimer = null; }
+  };
+  $(".modal-close", overlay).addEventListener("click", close);
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+
+  const body = $(".orgchart-body", overlay);
+  body.innerHTML = `<div class="orgchart-empty">Loading team…</div>`;
+  try {
+    if (!_orgRoster) _orgRoster = (await api("GET", "/agents")).agents;
+  } catch (e) {
+    body.innerHTML = `<div class="key-status err">✗ ${esc(e.message)}</div>`;
+    return;
+  }
+
+  const tick = async () => {
+    if (!_orgModal) return;
+    let data;
+    try { data = await api("GET", "/ui/api/orgchart"); }
+    catch (e) { return; } // transient — keep showing the last good frame
+    if (!_orgModal) return;
+    renderOrgChart(body, _orgRoster, data);
+  };
+  await tick();
+  _orgTimer = setInterval(tick, 1000);
+}
+
+// Fixed tiers so the layout is stable frame to frame (cards don't jump around
+// as agents start/stop working) — grouped by the same category used elsewhere.
+const OC_TIERS = [
+  ["management", "Management", ["planner", "human_approval"]],
+  ["research", "Research", []],
+  ["engineering", "Engineering", []],
+  ["knowledge", "Knowledge", []],
+  ["data", "Data", []],
+  ["quality", "Quality", []],
+  ["ops", "Ops", []],
+  ["comms", "Comms", []],
+  ["web", "Web", []],
+];
+
+function renderOrgChart(body, roster, data) {
+  const ceo = roster.find(a => a.name === "ceo");
+  const others = roster.filter(a => a.name !== "ceo");
+
+  // Live activity, unioned across every currently running task.
+  const activeAgents = new Set();
+  const progressByAgent = new Map();
+  const edges = []; // {from, to, kind}
+  let ceoActive = false;
+  for (const t of (data.tasks || [])) {
+    for (const a of (t.active_agents || [])) {
+      activeAgents.add(a);
+      progressByAgent.set(a, Math.max(progressByAgent.get(a) || 0, t.progress || 0));
+    }
+    if (t.ceo_active) ceoActive = true;
+    for (const e of (t.edges || [])) edges.push(e);
+  }
+
+  const tierBuckets = new Map(OC_TIERS.map(([cat, label]) => [cat, { label, agents: [] }]));
+  if (!tierBuckets.has("other")) tierBuckets.set("other", { label: "Other", agents: [] });
+  const pinned = new Map(OC_TIERS.flatMap(([cat, , names]) => names.map(n => [n, cat])));
+  for (const a of others) {
+    const cat = pinned.get(a.name) || a.category || "other";
+    if (!tierBuckets.has(cat)) tierBuckets.set(cat, { label: cat, agents: [] });
+    tierBuckets.get(cat).agents.push(a);
+  }
+
+  const ocCard = (a, isCeo) => {
+    const active = isCeo ? ceoActive : activeAgents.has(a.name);
+    const progress = isCeo ? 100 : (progressByAgent.get(a.name) || 0);
+    const task = (data.tasks || []).find(t =>
+      isCeo ? t.ceo_active : (t.active_agents || []).includes(a.name));
+    return `<div class="oc-card ${isCeo ? "oc-ceo" : ""} ${active ? "oc-active" : ""}" data-agent="${esc(a.name)}">
+      <div class="oc-icon">${ocIcon(a)}</div>
+      <div class="oc-name">${esc(a.role || a.name)}</div>
+      <div class="oc-role">${esc(a.name)}</div>
+      ${active ? `<div class="oc-status"><span class="pulse"></span> working</div>
+        <div class="oc-progress"><div class="oc-progress-bar" style="width:${progress}%"></div></div>` : ""}
+      ${active && task ? `<div class="oc-goal" title="${esc(task.goal || "")}">${esc(task.goal || "")}</div>` : ""}
+    </div>`;
+  };
+
+  body.innerHTML = `<div class="orgchart-wrap">
+    <div class="oc-ceo-row">${ocCard(ceo, true)}</div>
+    <div class="oc-tiers">
+      ${[...tierBuckets.values()].filter(b => b.agents.length).map(b => `
+        <div class="oc-tier-group">
+          <div class="oc-tier-label">${esc(b.label)}</div>
+          <div class="oc-tier">${b.agents.map(a => ocCard(a, false)).join("")}</div>
+        </div>`).join("")}
+    </div>
+    <svg class="orgchart-svg"></svg>
+  </div>`;
+
+  drawOrgEdges(body, edges);
+}
+
+// Draws ONLY edges that represent a real, live information flow right now —
+// planner->agent dispatch, agent->agent handoff (a depends_on step reading
+// another agent's finished output), and agent->ceo report during synthesis.
+// No standing/always-on lines: an agent with nothing flowing to or from it
+// has no line at all. Each edge gets an arrowhead for direction and an
+// animated bubble travelling from -> to.
+function drawOrgEdges(body, edges) {
+  const svg = $(".orgchart-svg", body);
+  const wrap = $(".orgchart-wrap", body);
+  const wrapRect = wrap.getBoundingClientRect();
+  svg.setAttribute("width", wrapRect.width);
+  svg.setAttribute("height", wrapRect.height);
+
+  const centerOf = (name) => {
+    const card = body.querySelector(`.oc-card[data-agent="${CSS.escape(name)}"]`);
+    if (!card) return null;
+    const r = card.getBoundingClientRect();
+    return { x: r.left + r.width / 2 - wrapRect.left, y: r.top + r.height / 2 - wrapRect.top };
+  };
+
+  const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+  let svgHtml = `<defs>
+    <marker id="oc-arrow-dispatch" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="var(--blue)"></path>
+    </marker>
+    <marker id="oc-arrow-handoff" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="var(--accent-2)"></path>
+    </marker>
+    <marker id="oc-arrow-report" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="var(--green)"></path>
+    </marker>
+  </defs>`;
+
+  // Shrink each line so it stops at the card edge, not its center, so the
+  // arrowhead is visible next to the box instead of hidden under it.
+  const shrink = (from, to, px) => {
+    const dx = to.x - from.x, dy = to.y - from.y;
+    const len = Math.hypot(dx, dy) || 1;
+    const t = Math.min(px / len, 0.45);
+    return { x: to.x - dx * t, y: to.y - dy * t };
+  };
+
+  let bubbleId = 0;
+  for (const e of edges) {
+    const from = centerOf(e.from === "planner" ? "planner" : e.from);
+    const to = centerOf(e.to);
+    if (!from || !to) continue;
+    const kind = e.kind || "dispatch";
+    const end = shrink(from, to, 78);
+    const pathId = `oc-path-${bubbleId++}`;
+    svgHtml += `<path id="${pathId}" d="M${from.x},${from.y} L${to.x},${to.y}" fill="none" stroke="none"></path>`;
+    svgHtml += `<line class="oc-edge active ${esc(kind)}" x1="${from.x}" y1="${from.y}" x2="${end.x}" y2="${end.y}"
+      marker-end="url(#oc-arrow-${esc(kind)})"></line>`;
+    if (!reduceMotion) {
+      svgHtml += `<circle class="oc-bubble ${esc(kind)}" r="4">
+        <animateMotion dur="1.1s" repeatCount="indefinite" rotate="auto">
+          <mpath href="#${pathId}" xlink:href="#${pathId}"></mpath>
+        </animateMotion>
+      </circle>`;
+    }
+  }
+
+  svg.innerHTML = svgHtml;
+}
+
+$("#orgchart-badge").addEventListener("click", openOrgChartModal);
+
 // Populate the saved-tasks panel + brain/coding badges on load. The identity
 // call runs first so the very first request mints the guest cookie before the
 // session list (which is scoped to the current user) is fetched.
@@ -3071,3 +3713,4 @@ loadBrainBadge();
 loadCodingBadge();
 loadMemoryBadge();
 loadParallelBadge();
+loadLimitsBadge();

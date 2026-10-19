@@ -1,6 +1,9 @@
 # Documentation index
 
-- [setup.md](setup.md) — **start here**: install, configure `.env`, run (CLI / UI / Python).
+- [how-it-works.md](how-it-works.md) — **the complete, code-verified explanation of the whole system**: every layer, the Brain boundary, all three orchestrators, the agent ReAct loop, tools/approval/MCP, memory, RAG, verification, observability, config, and where every byte of state lives. Start here if you want to understand everything end to end.
+- [test-scenarios.md](test-scenarios.md) — **realtime acceptance tests**: five goals graded on agent routing and result quality, runnable against the offline mock or a real provider (`python scripts/run_scenarios.py`).
+- [resource-isolation.md](resource-isolation.md) — task ↔ source links, reference-counted deletion, and the shared-vs-private isolation action (console 🗂 Resources button).
+- [setup.md](setup.md) — **start here to run it**: install, configure `.env`, run (CLI / UI / Python).
 - [agent-flow.md](agent-flow.md) — how a goal flows through plan → execute → verify → synthesize → reflect.
 - [providers.md](providers.md) — switch the brain, change the model, run local models (Ollama/Qwen3, vLLM, LM Studio).
 - [architecture.md](architecture.md) — layers, the Brain abstraction, LangGraph orchestration, agents, tools, verification.

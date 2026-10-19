@@ -18,6 +18,7 @@ def build_builtin_tools(settings: Settings) -> list[Tool]:
     )
     from ai_employee.tools.builtins.google_workspace import build_google_tools
     from ai_employee.tools.builtins.research import build_research_tools
+    from ai_employee.tools.builtins.resource_manager import build_resource_manager_tools
     from ai_employee.tools.builtins.resources import build_resource_tools
     from ai_employee.tools.builtins.web import (
         FetchPageTool,
@@ -39,6 +40,7 @@ def build_builtin_tools(settings: Settings) -> list[Tool]:
     ]
     tools.extend(build_research_tools(settings))
     tools.extend(build_resource_tools(settings))
+    tools.extend(build_resource_manager_tools(settings))
     tools.extend(build_google_tools(settings))  # empty until the OAuth client is set up
     if settings.enable_code_execution:
         tools.append(PythonExecTool(workspace))

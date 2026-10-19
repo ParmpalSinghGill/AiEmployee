@@ -18,6 +18,7 @@ from ai_employee.brains import get_brain, get_embedder
 from ai_employee.config import Settings, get_settings
 from ai_employee.core.logging import configure_logging, get_logger
 from ai_employee.memory import build_memory_manager
+from ai_employee.observability.usage_summary import summarize_usage
 from ai_employee.tools import default_registry
 from ai_employee.workflows import Orchestrator, PlanOrchestrator, ResearchOrchestrator
 
@@ -98,6 +99,40 @@ class AIEmployee:
             agents=len(self.agents.names()),
             tools=len(self.tools.names()),
         )
+        # Lifecycle: an employee is replaced when the operator switches the brain
+        # (provider/model) in the console. A run that started earlier must keep the
+        # model it was launched with, so a retired employee is only closed once the
+        # last task still using it has finished. See acquire/release/mark_retired.
+        self._task_refs = 0
+        self._retired = False
+        self._closed = False
+        self._closing = False
+
+    # ── Run lifecycle (one model per task) ──────────────────────────────────
+    def acquire(self) -> None:
+        """A background task is now using this employee — keep its brain alive."""
+        self._task_refs += 1
+
+    def release(self) -> None:
+        """A task finished; close this employee if it was retired and is now idle."""
+        self._task_refs = max(0, self._task_refs - 1)
+        self._maybe_close()
+
+    def mark_retired(self) -> None:
+        """This employee was replaced by a newer one. Close once no task uses it."""
+        self._retired = True
+        self._maybe_close()
+
+    def _maybe_close(self) -> None:
+        if not (self._retired and self._task_refs <= 0) or self._closing:
+            return
+        self._closing = True
+        import asyncio
+        import contextlib
+
+        # No running event loop in some unit tests — the client is GC'd instead.
+        with contextlib.suppress(RuntimeError):
+            asyncio.create_task(self.aclose())
 
     # ── Primary API ──────────────────────────────────────────────────────────
     async def run(
@@ -109,9 +144,15 @@ class AIEmployee:
         resource_decision: dict[str, Any] | None = None,
         workflow_checkpoint: dict[str, Any] | None = None,
         session_context: str = "",
+        base_agent: str | None = None,
         on_progress: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """Plan and execute a high-level goal end-to-end.
+
+        ``base_agent`` is **opt-in**: pass it to pin every step of the run to one
+        agent. By default (``None``) the planner assigns each step to the best
+        specialist — research for finding things, coding for code, data_analysis
+        for data, testing for tests, and so on.
 
         ``on_progress`` receives a resume checkpoint after each completed node, so a
         run stopped mid-flight can be continued instead of restarting from scratch.
@@ -126,13 +167,21 @@ class AIEmployee:
                 resource_decision=resource_decision,
                 workflow_checkpoint=workflow_checkpoint,
                 session_context=session_context,
+                base_agent=base_agent,
                 on_progress=on_progress,
             )
         checkpoint = self.orchestrator.checkpoint_from_state(
             state, goal=goal, session_id=session_id
         )
+        usage = summarize_usage(
+            step_results=state.get("step_results", []),
+            trace=state.get("trace", []),
+        )
         return {
             "goal": goal,
+            "base_agent": state.get("base_agent") or base_agent or "",
+            "brain_provider": self.brain.name,
+            "brain_model": self.brain.model_name,
             "answer": state.get("final", ""),
             "confidence": state.get("confidence"),
             "plan": state.get("plan"),
@@ -141,6 +190,8 @@ class AIEmployee:
             "needs_approval": state.get("needs_approval"),
             "trace": state.get("trace", []),
             "workflow_checkpoint": checkpoint if state.get("plan") else None,
+            "agents_used": usage["agents_used"],
+            "tools_used": usage["tools_used"],
         }
 
     async def research(
@@ -227,6 +278,7 @@ class AIEmployee:
                 result = await self.agents.get("resource_downloader").run(task, ctx)
             finally:
                 clear_resource_decision()
+        usage = summarize_usage(agent=result.agent, tool_trace=result.tool_trace)
         return {
             "goal": goal,
             "answer": result.output,
@@ -236,6 +288,8 @@ class AIEmployee:
             "needs_approval": result.needs_approval,
             "trace": [],
             "agent": result.agent,
+            "agents_used": usage["agents_used"],
+            "tools_used": usage["tools_used"],
         }
 
     async def chat(self, message: str, *, session_id: str = "default") -> str:
@@ -299,7 +353,11 @@ class AIEmployee:
         )
         ctx.scratch["agent_catalog"] = self.agents.catalog()
         result = await self.agents.get(agent_name).run(task, ctx)
-        return result.model_dump()
+        usage = summarize_usage(agent=result.agent, tool_trace=result.tool_trace)
+        out = result.model_dump()
+        out["agents_used"] = usage["agents_used"]
+        out["tools_used"] = usage["tools_used"]
+        return out
 
     # ── Persistence (memory carries context across restarts for "resume") ────
     def _store(self):
@@ -372,7 +430,102 @@ class AIEmployee:
         log.info("memory.cleared_session", session_id=session_id, records=removed)
         return {"cleared": True, "session_id": session_id, "records_removed": removed}
 
+    # ── Resources: task <-> source links, isolation, reference-counted delete ──
+    def resource_manager(self):
+        """The workspace resource catalog (task <-> source links, bytes)."""
+        from ai_employee.resources import manager_for
+
+        return manager_for(self.settings)
+
+    def delete_task_resources(
+        self,
+        *,
+        session_id: str | None = None,
+        task_id: str | None = None,
+        purge: bool = True,
+    ) -> dict[str, Any]:
+        """Reference-counted resource cleanup for a deleted task/run.
+
+        A source is kept while any *other* task still links it, and deleted (with
+        its bytes) only when the removed task was its **last** link.
+        """
+        mgr = self.resource_manager()
+        report: dict[str, Any] = {"unlinked": [], "deleted": [], "kept": [], "bytes_freed": 0}
+        if session_id:
+            report = mgr.delete_for_session(session_id, purge=purge)
+        if task_id:
+            extra = mgr.delete_for_task(task_id, purge=purge)
+            for key in ("unlinked", "deleted", "kept"):
+                report[key] = sorted(set(report.get(key, [])) | set(extra.get(key, [])))
+            report["bytes_freed"] = report.get("bytes_freed", 0) + extra.get("bytes_freed", 0)
+        return report
+
+    async def isolate_resources(
+        self,
+        *,
+        all: bool = False,  # noqa: A002 - mirrors the API request field
+        session_id: str | None = None,
+        task_id: str | None = None,
+        allow_redownload: bool = True,
+    ) -> dict[str, Any]:
+        """Isolate tasks so no source stays shared (re-downloading if required)."""
+        from ai_employee.resources.isolation import isolate_all, isolate_task
+
+        mgr = self.resource_manager()
+        if all:
+            return await isolate_all(mgr, settings=self.settings, allow_redownload=allow_redownload)
+        ref = (task_id or session_id or "").strip()
+        return await isolate_task(
+            mgr, ref, settings=self.settings, allow_redownload=allow_redownload
+        )
+
+    def purge_resources(
+        self, *, purge_bytes: bool = True, wipe_workspace: bool = False
+    ) -> dict[str, Any]:
+        """Delete every resource (catalog + bytes) for a fresh start.
+
+        With ``wipe_workspace`` also delete every other file in the workspace
+        (downloads and outputs that were never catalogued).
+        """
+        mgr = self.resource_manager()
+        report = mgr.purge_all(purge_bytes=purge_bytes)
+        if wipe_workspace:
+            report["workspace"] = mgr.wipe_workspace()
+        return report
+
+    def resources_overview(self) -> dict[str, Any]:
+        """Every resource with its task links — for the console's Resources panel."""
+        mgr = self.resource_manager()
+        items: list[dict[str, Any]] = []
+        for rec in sorted(mgr.records().values(), key=lambda r: r.name):
+            tasks = mgr.tasks_for(rec.id)
+            items.append(
+                {
+                    "id": rec.id,
+                    "name": rec.name,
+                    "kind": rec.kind,
+                    "visibility": rec.visibility,
+                    "owner_task": rec.owner_task,
+                    "size": rec.size,
+                    "path": rec.path,
+                    "source": rec.source,
+                    "url": rec.url,
+                    "exists": mgr.exists(rec),
+                    "tasks": tasks,
+                    "task_count": len(tasks),
+                }
+            )
+        return {
+            "resources": items,
+            "count": len(items),
+            "shared": sum(1 for r in items if r["visibility"] == "shared"),
+            "private": sum(1 for r in items if r["visibility"] == "private"),
+        }
+
     async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         self.persist_memory()
         await self.brain.aclose()
         if self.embedder is not self.brain:

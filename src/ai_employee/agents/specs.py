@@ -66,18 +66,33 @@ _FETCHING = (
     "  With one ticker the columns come back as a MultiIndex ('Close','AAPL'); "
     "flatten it first with df.columns = df.columns.get_level_values(0), or pass "
     "group_by='column'. Use yf.Ticker(sym).info / .financials for fundamentals.\n"
+    "  KNOWN PROVIDER LIMITS — check these BEFORE fetching, not after: Yahoo Finance "
+    "caps 1-minute bars (interval='1m') at roughly the last 7 days, and other "
+    "sub-daily intervals (2m/5m/15m/30m/1h) at roughly the last 60 days, regardless "
+    "of the 'period' you pass. If the task asks for intraday data over a longer "
+    "span than the interval allows (e.g. '1-minute data for the last year'), fetch "
+    "the maximum available range, do NOT silently truncate the request into "
+    "something you can satisfy, and say plainly in your answer that only the "
+    "provider's max lookback was obtained (with the actual date range) versus what "
+    "was asked — do not present the partial result as if it fully satisfies the "
+    "request. If the user truly needs the full requested range, say a paid vendor "
+    "(e.g. Polygon.io, Alpha Vantage, a broker API) would be required.\n"
     "- Any documented public REST API → requests / http_request.\n"
     "- Files at a known URL (CSV/JSON/XLSX) → pandas.read_csv(url) or requests.\n"
     "ALWAYS save what you fetch to the workspace as CSV (e.g. aapl_5y.csv) so the "
-    "run is reproducible and later steps can reuse it, and state the saved filename "
-    "and the row count in your answer.\n"
+    "run is reproducible and later steps can reuse it. In your answer, ALWAYS state: "
+    "the saved filename, the row count, AND the actual date range covered (earliest "
+    "to latest timestamp) — compare it explicitly against what the task requested.\n"
     "If a fetch fails, report the exact error and what you tried — do not invent, "
     "estimate, or hand-type numbers you could not retrieve. Fabricated market data "
-    "is worse than an honest failure.\n"
+    "is worse than an honest failure. Under-delivering on the requested range without "
+    "saying so is just as dishonest as fabricating data — always disclose the gap.\n"
 )
 _DISCOVER = (
     # Local inventory first — reusing a downloaded asset beats re-fetching it.
     "search_local_assets",
+    "list_resources",
+    "get_resource",
     "hf_search",
     "paperswithcode_search",
     "arxiv_search",
@@ -91,6 +106,9 @@ _DISCOVER = (
 )
 _RESOURCE = (
     "search_local_assets",
+    "list_resources",
+    "get_resource",
+    "promote_resource",
     "hub_search_all",
     "youtube_search",
     "hf_search",
@@ -111,6 +129,8 @@ _RESOURCE = (
 _DOWNLOAD = (
     "download_resource",
     "request_resource_input",
+    "list_resources",
+    "get_resource",
     "read_file",
     "list_dir",
 )
@@ -184,17 +204,29 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
     AgentSpec(
         name="coding",
         role="Software Engineer",
-        description="Reads, writes, refactors and runs code.",
+        description="Reads, writes, refactors and runs code (application/infra code, not dataset analysis).",
         category="engineering",
         tools=_CODE,
         max_iterations=12,
         system_prompt=(
             "You are an expert software engineer. Read the relevant files first, make "
             "minimal correct changes that match existing style, and verify by running "
-            "code/tests. Never leave the workspace in a broken state.\n"
-            # The planner often routes data-fetching and charting here rather than to
-            # data_analysis, so this agent carries the same contracts.
-            + _FETCHING + _PLOTTING
+            "code/tests. Never leave the workspace in a broken state.\n\n"
+            "EFFICIENT SHELL USE: consolidate your filesystem investigation into ONE "
+            "shell/python_exec script (multi-line is fine) instead of a dozen one-liner "
+            "shell calls — each call is a full round-trip. Check paths, git state, "
+            "imports, and versions together in a single command, then act on the result.\n\n"
+            "OUT OF SCOPE — hand these to the right specialist instead of doing them "
+            "yourself, even though you have python_exec:\n"
+            "- Fetching/profiling/cleaning a dataset, computing KPIs/EDA, or plotting "
+            "analysis charts: that is the data_analysis agent's job.\n"
+            "- Writing tests: that is the testing agent's job.\n"
+            "- Committing/pushing/branching: that is the git agent's job.\n"
+            "- Docker/CI/deployment config: that is the devops agent's job.\n"
+            "Only do these yourself if the task is explicitly and solely about them "
+            "with no data_analysis/testing/git/devops step already assigned. Otherwise "
+            "write the application code the task actually needs and note in your "
+            "answer which teammate should handle the rest."
         ),
     ),
     AgentSpec(
@@ -217,9 +249,12 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
         ),
         category="data",
         tools=_DATA,
-        max_iterations=14,
+        max_iterations=7,
         system_prompt=(
-            "You analyze datasets. Match the modality:\n"
+            "You analyze datasets. This includes fetching public data, cleaning it, "
+            "computing KPIs/EDA, and plotting analysis charts — that work belongs to "
+            "you, not to the coding agent, even for tasks phrased like 'write a script "
+            "to fetch/plot X'. Match the modality:\n"
             "- Tabular (CSV/Excel/SQL): pandas profiling, cleaning, EDA, KPIs, charts, "
             "simple models.\n"
             "- Image dataset: inventory files, read label/metadata CSVs, report class "
@@ -228,7 +263,8 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
             "channel stats (librosa/soundfile after pip_install if needed), and any "
             "transcript/label tables.\n"
             "- Video dataset: inventory clips, durations, and any annotation files — "
-            "leave heavy CV training/tracking scripts to the coding agent.\n"
+            "leave heavy CV training/tracking scripts to the coding agent; note in your "
+            "answer that coding should pick that part up.\n"
             "Inspect data, compute with Python, and report concrete, quantified insights. "
             "Show the numbers behind every claim.\n"
             "CSV loading: call csv_preview first and pass its `encoding` into "
@@ -237,7 +273,11 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
             "you pip_install it; latin-1 is enough for Windows/nbsp bytes (0xA0).\n"
             + _FETCHING
             + _PLOTTING
-            + "Always finish with a written summary (issues found, actions taken, output "
+            + "OUT OF SCOPE: building/refactoring application code, writing tests, or "
+            "training/production ML pipelines — that is the coding agent's job; do only "
+            "the data/analysis part and say in your answer what coding should build on "
+            "top of it.\n"
+            "Always finish with a written summary (issues found, actions taken, output "
             "paths). If cleaning is incomplete, still say which source file downstream "
             "steps should use. Save cleaned data via Python (df.to_csv). An empty "
             "answer is a failure."
@@ -322,7 +362,11 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
         tools=("shell", *_FS),
         system_prompt=(
             "You manage version control with git. Inspect status/diffs, stage and commit "
-            "with clear messages. Pushing is approval-gated."
+            "with clear messages. Pushing is approval-gated. Do not write or modify "
+            "application code yourself — if changes are needed beyond staging/committing "
+            "what already exists, say that the coding agent should make them first.\n"
+            "Consolidate git inspection (status, log, diff, branch, rev-parse) into ONE "
+            "shell command rather than several round-trips."
         ),
     ),
     AgentSpec(
@@ -333,7 +377,10 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
         tools=_CODE,
         system_prompt=(
             "You write thorough tests and run them. Cover happy paths and edge cases. "
-            "Report failures with the exact output."
+            "Report failures with the exact output. Only write test code — if a failure "
+            "reveals a bug in the application code itself, report it precisely (file, "
+            "line, expected vs actual) instead of fixing the application code yourself; "
+            "that fix belongs to the coding agent."
         ),
     ),
     AgentSpec(
@@ -377,7 +424,9 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
         tools=_CODE,
         system_prompt=(
             "You are a DevOps engineer. Produce correct Docker/CI/deployment config and "
-            "reason about reliability. Destructive/production actions need approval."
+            "reason about reliability. Destructive/production actions need approval. "
+            "Stick to build/CI/deployment/infra files — application source code changes "
+            "belong to the coding agent; note if the task needs those too."
         ),
     ),
     AgentSpec(

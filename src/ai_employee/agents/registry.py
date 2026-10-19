@@ -49,7 +49,12 @@ class AgentRegistry:
     def catalog(self) -> list[dict[str, str]]:
         """Human/LLM-readable roster used for routing & the /agents endpoint."""
         return [
-            {"name": a.name, "role": getattr(a, "role", ""), "description": a.description}
+            {
+                "name": a.name,
+                "role": getattr(a, "role", ""),
+                "description": a.description,
+                "category": getattr(a, "category", ""),
+            }
             for a in self._agents.values()
         ]
 

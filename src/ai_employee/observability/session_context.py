@@ -177,6 +177,32 @@ def _prior_run_section(
     return "\n".join(lines)
 
 
+def build_environment_context(settings: Any | None = None, *, max_siblings: int = 30) -> str:
+    """A tiny block of already-known environment facts (workspace, Python, sibling
+    dirs) so agents don't re-discover them with a dozen shell round-trips.
+
+    The workspace's sibling directories are where external checkouts live (e.g. a
+    ``../django-11555`` repo), which is exactly what an agent re-derives via
+    ``cd .. && ls`` when it could have been told up front.
+    """
+    import sys
+
+    s = settings or get_settings()
+    ws = Path(s.workspace_dir).expanduser().resolve()
+    lines = [f"- Workspace: {ws}", f"- Python: {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"]
+    parent = ws.parent
+    try:
+        siblings = sorted(p.name for p in parent.iterdir() if p.is_dir())[:max_siblings]
+    except OSError:
+        siblings = []
+    if siblings:
+        lines.append(f"- Sibling directories of the workspace ({parent}): {', '.join(siblings)}")
+    return (
+        "ENVIRONMENT (already known — use these instead of re-discovering them with shell):\n"
+        + "\n".join(lines)
+    )
+
+
 def build_prior_session_context(
     prior_runs: list[Any],
     *,

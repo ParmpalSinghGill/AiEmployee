@@ -71,6 +71,11 @@ class ToolCall(BaseModel):
     id: str
     name: str
     arguments: dict[str, Any] = Field(default_factory=dict)
+    # Provider-specific opaque fields that must be replayed unchanged with the
+    # call. Gemini 3, for example, returns ``extra_content.google.
+    # thought_signature`` here; dropping it makes the *next* request fail with
+    # HTTP 400 "Function call is missing a thought_signature".
+    extra: dict[str, Any] = Field(default_factory=dict)
 
 
 class Usage(BaseModel):

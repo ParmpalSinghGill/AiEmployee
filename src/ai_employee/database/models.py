@@ -122,3 +122,29 @@ class AgentEvent(Base, UUIDPrimaryKey, Timestamps):
     event_type: Mapped[str] = mapped_column(String(32))
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+class Resource(Base, UUIDPrimaryKey, Timestamps):
+    """Optional Postgres mirror of the filesystem resource catalog.
+
+    The filesystem catalog is the source of truth (so the framework runs offline);
+    a deployed app can mirror rows here for cross-task SQL queries and reporting.
+    ``visibility`` / ``owner_task`` / ``content_hash`` carry the same meaning as in
+    :class:`ai_employee.resources.models.ResourceRecord`.
+    """
+
+    __tablename__ = "resources"
+
+    name: Mapped[str] = mapped_column(String(255), index=True)
+    kind: Mapped[str] = mapped_column(String(32), default="file")
+    visibility: Mapped[str] = mapped_column(String(16), default="private", index=True)
+    owner_task: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    owner_user: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    content_hash: Mapped[str] = mapped_column(String(80), index=True)
+    hash_kind: Mapped[str] = mapped_column(String(16), default="content")
+    size: Mapped[int] = mapped_column(Integer, default=0)
+    logical_path: Mapped[str] = mapped_column(String(1024), default="")
+    source: Mapped[str] = mapped_column(String(32), default="local")
+    url: Mapped[str] = mapped_column(Text, default="")
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    meta: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)

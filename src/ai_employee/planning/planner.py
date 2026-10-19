@@ -123,24 +123,106 @@ def _has_cycle(by_id: dict[int, PlanStep]) -> bool:
     return any(visit(sid) for sid in by_id)
 
 
+#: Deterministic safety net for the common failure mode where a fast LLM assigns
+#: every step to the first roster agent (`research`) even when a step clearly
+#: writes code or tests. Ordered by priority; the first match wins. Only applied
+#: when the model chose `research` — a model that already picked a specialist is
+#: never overridden here.
+_GENERIC_OVERRIDES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("testing", ("regression test", "test suite", "runtests", "write test", "add test", "run test", "tests pass")),
+    ("git", ("git clone", "git checkout", "git commit", "git diff", "git status", "git rev-parse", "clone", "check out", "checkout")),
+    ("coding", ("implement", "fix", "patch", "refactor", "debug", "reproduce", "reproduction", "write code", "modify", "script")),
+    ("data_analysis", ("eda", "kpi", "pandas", "chart", "plot", "csv", "data analysis", "profiling")),
+    ("documentation", ("readme", "writeup", "write up", "documentation")),
+    ("devops", ("docker", "deploy", "kubernetes", "ci/cd")),
+)
+
+
+def _correct_generic_assignment(description: str, agent: str, valid: set[str]) -> str:
+    """Route a step the model left on ``research`` to the specialist it names.
+
+    ``research`` is the first agent in the roster, so weak models habitually use
+    it for everything — including "implement the fix" and "add a regression test".
+    This maps such steps to ``coding``/``testing``/``git``/… when the wording is
+    unambiguous, while leaving every non-``research`` assignment untouched.
+    """
+    if agent != "research":
+        return agent
+    d = (description or "").lower()
+    for target, keywords in _GENERIC_OVERRIDES:
+        if target in valid and any(k in d for k in keywords):
+            return target
+    return agent
+
+
 class Planner:
     def __init__(self, brain: Brain) -> None:
         self._brain = brain
 
-    async def make_plan(self, goal: str, *, agent_catalog: list[dict[str, str]]) -> Plan:
-        """Decompose ``goal`` into steps assigned to agents from ``agent_catalog``."""
+    async def make_plan(
+        self,
+        goal: str,
+        *,
+        agent_catalog: list[dict[str, str]],
+        base_agent: str | None = None,
+    ) -> Plan:
+        """Decompose ``goal`` into steps assigned to agents from ``agent_catalog``.
+
+        When ``base_agent`` is given, the run is pinned: the plan is written for
+        that one agent and every step is assigned to it, so the workforce cannot
+        drift to a different agent mid-task.
+        """
         roster = "\n".join(
             f"- {a['name']}: {a['role']} — {a['description']}" for a in agent_catalog
         )
         valid_names = {a["name"] for a in agent_catalog}
+        pinned = base_agent if base_agent in valid_names else None
+        if pinned:
+            # Show only the pinned agent: the planner should not design work for
+            # teammates that will never run it.
+            roster = next(
+                f"- {a['name']}: {a['role']} — {a['description']}"
+                for a in agent_catalog
+                if a["name"] == pinned
+            )
         # The planner's *input*: the goal, and the agents it may delegate to.
-        log.info("planner.input", goal=clip(goal, 1200), agents=sorted(valid_names))
+        log.info(
+            "planner.input", goal=clip(goal), agents=sorted(valid_names), base_agent=pinned
+        )
+
+        pin_rule = ""
+        if pinned:
+            pin_rule = (
+                f"AGENT PINNING — this run is pinned to `{pinned}`. Assign EVERY "
+                f"step to `{pinned}`: the `agent` field must be exactly "
+                f"\"{pinned}\". Split the work into steps, not across agents, and "
+                f"plan only work that agent can do with its own tools. Do not route "
+                f"any step to another agent.\n\n"
+            )
 
         system = (
             "You are the planning brain of an AI Employee. Decompose the user's goal "
             "into the smallest number of concrete steps. Assign each step to "
             "exactly one agent from the roster (use the agent's `name`). "
             "Keep it minimal but complete.\n\n"
+            f"{pin_rule}"
+            "AGENT ASSIGNMENT — the single most important decision. Match each step "
+            "to the ONE agent whose description matches what it actually does:\n"
+            "- `research` ONLY searches the web/hubs and reports findings. It never "
+            "writes or edits code, never writes or runs tests, never clones or "
+            "commits a repo. Do NOT use it for those.\n"
+            "- Writing/editing/refactoring application code, or fixing a bug → "
+            "`coding`.\n"
+            "- Writing or running tests → `testing`.\n"
+            "- Cloning/checking out/committing → `git`.\n"
+            "- Dataset analysis/EDA/charts → `data_analysis`.\n"
+            "- Writing docs/READMEs → `documentation`.\n"
+            "- Finding models/datasets/papers (ML resources) → `scout` or `research`.\n"
+            "Do not fall back to `research` for code or test work.\n\n"
+            "PURE QUESTIONS: a goal that is a simple factual question and asks for "
+            "no deliverable (e.g. 'do you update the actual code?', 'what is X?', "
+            "'why did Y fail?', 'how does Z work?') is a SINGLE step assigned to "
+            "`research` — do NOT split it into inspect + write steps.\n\n"
             "DEPENDENCIES — this decides what can run in parallel, so be strict.\n"
             "A step lists another in depends_on ONLY IF it literally cannot start "
             "without that step's OUTPUT as its input. Independent steps run at the "
@@ -206,12 +288,30 @@ class Planner:
             "- Success criteria must NOT require a workspace file before download is "
             "attempted. Accept: (found + downloaded) OR (found + manual download needed).\n"
             "- Never mark a step failed when a suitable URL exists but automation was blocked.\n\n"
-            "CHARTS: assign plotting to data_analysis (or coding) — both run Python and "
-            "save PNGs. Prefer folding charts into the analysis step rather than adding a "
-            "separate one; never assign charting to an agent without python_exec.\n\n"
+            "CHARTS: assign plotting to data_analysis — it owns dataset fetching, "
+            "profiling, and charting. Prefer folding charts into the analysis step "
+            "rather than adding a separate one. Only assign charting to coding when the "
+            "task is purely about visualizing something the coding agent itself built "
+            "(e.g. a training-loss curve from a script it wrote) and no data_analysis "
+            "step exists in the plan.\n\n"
+            "DO NOT DUPLICATE ROLES: each step should be owned by exactly one agent "
+            "whose description matches it. Data fetching/cleaning/EDA/charts → "
+            "data_analysis. Application/engineering code → coding. Tests → testing. "
+            "Commits/pushes → git. Docker/CI/deploy config → devops. Never assign the "
+            "same kind of work to two different agents in one plan on the assumption "
+            "either could do it.\n\n"
             "AGENT ROSTER:\n"
             f"{roster}"
         )
+        if pinned:
+            # The rules above mention specialists (data_analysis, coding, …). In a
+            # pinned run none of them execute, so close with an explicit override.
+            system += (
+                f"\n\nFINAL REMINDER: this run is pinned to `{pinned}`. Every step's "
+                f"`agent` MUST be \"{pinned}\"; ignore any rule above that assigns a "
+                f"step to a different agent. Describe each step as work `{pinned}` "
+                f"itself will carry out, and keep the plan within its tools."
+            )
         plan = await self._brain.structured_output(
             [Message.system(system), Message.user(f"GOAL: {goal}")],
             Plan,
@@ -221,15 +321,39 @@ class Planner:
         for step in plan.steps:
             if step.agent not in valid_names:
                 log.debug("planner.invalid_agent", agent=step.agent)
-                step.agent = "research" if "research" in valid_names else next(iter(valid_names))
+                step.agent = "research" if "research" in valid_names else sorted(valid_names)[0]
+        # A pinned run is authoritative: force every step onto the base agent even
+        # if the model ignored the instruction above.
+        if pinned:
+            for step in plan.steps:
+                step.agent = pinned
+        else:
+            # Multi-agent safety net: a weak model often leaves every step on
+            # `research` (the first roster agent). Re-route obvious code/test/git
+            # steps to their specialist.
+            for step in plan.steps:
+                corrected = _correct_generic_assignment(
+                    step.description, step.agent, valid_names
+                )
+                if corrected != step.agent:
+                    log.info(
+                        "planner.corrected_agent",
+                        step=step.id,
+                        from_agent=step.agent,
+                        to_agent=corrected,
+                    )
+                    step.agent = corrected
         if not plan.steps:
-            plan.steps = [PlanStep(id=1, description=goal, agent=next(iter(valid_names)))]
+            default_agent = pinned or (
+                "research" if "research" in valid_names else sorted(valid_names)[0]
+            )
+            plan.steps = [PlanStep(id=1, description=goal, agent=default_agent)]
         prune_redundant_dependencies(plan.steps)
         # The planner's *output*: its rationale and the concrete step breakdown.
         log.info(
             "planner.plan_ready",
             steps=len(plan.steps),
-            reasoning=clip(plan.reasoning, 1200),
+            reasoning=clip(plan.reasoning),
             plan=[
                 {
                     "id": s.id,

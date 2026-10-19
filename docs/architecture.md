@@ -58,8 +58,11 @@ plan ──▶ execute ──(more steps?)──▶ execute
            END
 ```
 
-- **plan** — `PlannerAgent` decomposes the goal into agent-assigned steps (structured
-  output → validated `Plan`).
+- **plan** — `PlannerAgent` decomposes the goal into ordered steps, each assigned to
+  the best-fit agent (structured output → validated `Plan`). Passing `base_agent=...`
+  explicitly pins every step to one agent (the plan node overwrites mixed assignments);
+  the default is multi-agent, so a coding step runs the coding agent and a research
+  step runs the research agent.
 - **execute** — runs the step's agent, then the `Verifier` reviews the output; failed
   steps retry within a bounded budget. If a tool needs approval, the run halts and
   surfaces the request.

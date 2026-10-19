@@ -206,8 +206,34 @@ async def test_brain_credits_hosted_provider(client):
     assert r.status_code == 200
     body = r.json()
     assert "message" in body
-    # No key → ok=false; configured key on a provider w/o balance API → supported=false.
     assert body["ok"] is False or body.get("balance") or body["supported"] is False
+
+
+async def test_brain_model_check_unknown_provider_400(client):
+    r = await client.post(
+        "/ui/api/brain/models/check", json={"provider": "nope", "model": "x"}
+    )
+    assert r.status_code == 400
+
+
+async def test_brain_model_check_requires_model(client):
+    r = await client.post("/ui/api/brain/models/check", json={"provider": "gemini", "model": " "})
+    assert r.status_code == 400
+
+
+async def test_brain_model_check_mock_is_unsupported(client):
+    r = await client.post(
+        "/ui/api/brain/models/check", json={"provider": "mock", "model": "mock-1"}
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["supported"] is False
+    assert body["available"] is None
+
+
+async def test_brain_model_list_unknown_provider_400(client):
+    r = await client.post("/ui/api/brain/models", json={"provider": "nope"})
+    assert r.status_code == 400
 
 
 async def test_clear_memories(client):

@@ -31,7 +31,13 @@ from ai_employee.tools.invocation_history import (
     clear_task_tool_history,
 )
 from ai_employee.tools.registry import ToolRegistry
-from ai_employee.verification import Verifier, audit_resources, build_waiting_for_user_payload
+from ai_employee.verification import (
+    Verifier,
+    audit_artifacts,
+    audit_filesystem,
+    audit_resources,
+    build_waiting_for_user_payload,
+)
 from ai_employee.workflows.scheduler import (
     describe_schedule,
     has_runnable_work,
@@ -69,6 +75,50 @@ def _looks_like_refusal(text: str) -> bool:
 _SOFT_DEPENDENCY_AGENTS = frozenset(
     {"data_analysis", "documentation", "database", "rag", "knowledge_manager"}
 )
+
+#: Per-prerequisite cap on handoff text. Generous enough to carry a full traceback,
+#: repro commands and fix rationale, but bounded so a downstream prompt can't
+#: balloon unboundedly when a dependency produces a huge report.
+_HANDOFF_MAX_CHARS = 16_000
+
+# ── Quick-answer routing ──────────────────────────────────────────────────────
+# A short, factual question ("do you update the actual code at X?", "what is Y?")
+# should be answered in one turn by the research agent, not decomposed into a
+# full multi-agent pipeline (which costs ~20 LLM calls + dozens of tool rounds for
+# a single sentence). Only obviously-question-shaped goals route here; anything
+# that asks to write/build/fix/analyze/etc. still goes through the full planner.
+_QUESTION_WORD = re.compile(
+    r"\b(what|which|where|when|who|why|how|is|are|does|do|did|can|should|could|would|"
+    r"define|explain|describe|mean|tell)\b",
+    re.I,
+)
+_DELIVERABLE_VERB = re.compile(
+    r"\b(write|build|create|make|generate|produce|download|clone|fetch|acquire|fix|resolve|"
+    r"repair|implement|refactor|debug|analy[sz]e|summari[sz]e|find|search|locate|train|test|"
+    r"deploy|release|email|send|schedule|plot|chart|report|ingest|install|setup|configure|"
+    r"design|optimize|review|audit|translate|convert|rename|delete|remove|extract|compile|run)\b",
+    re.I,
+)
+_REQUEST_PHRASE = re.compile(r"\b(can|could|would|will) you\b|\bplease\b", re.I)
+
+
+def is_quick_question(goal: str) -> bool:
+    """True when ``goal`` is a short factual question, not an action request.
+
+    Heuristics, deliberately conservative:
+    * ends with ``?`` and is short;
+    * does not ask for a deliverable ("can you write…", "fix …?");
+    * is phrased as a question about something.
+    """
+    g = (goal or "").strip()
+    if not g.endswith("?") or len(g) > 240:
+        return False
+    low = g.lower()
+    if _REQUEST_PHRASE.search(low):
+        return False
+    if _DELIVERABLE_VERB.search(low):
+        return False
+    return bool(_QUESTION_WORD.search(low))
 
 
 def _looks_unusable(record: dict[str, Any]) -> bool:
@@ -120,6 +170,53 @@ def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip().lower())[:500]
 
 
+def _dedupe(items: list[str]) -> list[str]:
+    """Preserve order, drop exact (case-insensitive) duplicates."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for it in items:
+        key = (it or "").strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(it)
+    return out
+
+
+def _build_retry_task(
+    *,
+    task: str,
+    previous_output: str,
+    issues: list[str] | None,
+    suggestion: str | None,
+    attempt: int,
+) -> str:
+    """Frame a verifier-driven retry as a CONTINUATION, not a fresh task.
+
+    The original planner step stays first (so the agent keeps the real input), then
+    the previous attempt's result and the reviewer's issues. ``issues`` is the
+    *accumulated* list across every failed attempt so far — not just the latest —
+    so the agent fixes all outstanding problems rather than only the last one. The
+    agent is told to continue from where it left off rather than start over — the
+    retry runs as a fresh conversation, so the previous result must be carried in
+    explicitly.
+    """
+    issue_lines = "\n".join(f"- {i}" for i in (issues or []) if str(i).strip()) or "- (none listed)"
+    prev = (previous_output or "").strip() or "(the previous attempt produced no output)"
+    return (
+        f"{task}\n\n"
+        f"==================== RETRY {attempt} ====================\n"
+        "Your previous attempt at this step did NOT pass review. Do NOT start over.\n\n"
+        f"----- RESULT OF YOUR PREVIOUS ATTEMPT (attempt {attempt - 1}) -----\n"
+        f"{prev}\n"
+        "--------------------------------------------------------------------\n\n"
+        f"The reviewer found these issues across all attempts so far ({len(issues or [])}):\n"
+        f"{issue_lines}\n\n"
+        f"Suggested fix: {suggestion or '(none)'}\n\n"
+        f"CONTINUE from where attempt {attempt - 1} left off — build on it and fix ALL "
+        "the issues above — then give your final answer."
+    )
+
+
 def _keep_last(_old: Any, new: Any) -> Any:
     return new
 
@@ -160,6 +257,9 @@ class EmployeeState(TypedDict, total=False):
     goal: str
     session_id: str
     session_context: str
+    #: Agent every step of this run must use. Set from the run mode, and pinned
+    #: onto the plan so the workforce cannot switch agents mid-task.
+    base_agent: str
     plan: dict[str, Any]
     step_results: Annotated[list[dict[str, Any]], lambda old, new: (old or []) + new]
     cursor: Annotated[int, _keep_last]
@@ -197,15 +297,17 @@ class Orchestrator:
         g = StateGraph(EmployeeState)
         g.add_node("plan", self._plan_node)
         g.add_node("execute", self._execute_node)
+        g.add_node("answer", self._answer_node)
         g.add_node("synthesize", self._synthesize_node)
         g.add_node("reflect", self._reflect_node)
 
         g.add_conditional_edges(
             START,
             self._route_start,
-            {"plan": "plan", "execute": "execute"},
+            {"plan": "plan", "execute": "execute", "answer": "answer"},
         )
         g.add_edge("plan", "execute")
+        g.add_edge("answer", END)
         g.add_conditional_edges(
             "execute",
             self._route_after_execute,
@@ -236,6 +338,7 @@ class Orchestrator:
             session_context=state.get("session_context") or "",
         )
         ctx.scratch["agent_catalog"] = self._agents.catalog()
+        ctx.scratch["base_agent"] = state.get("base_agent")
         if extra_scratch:
             ctx.scratch.update(extra_scratch)
         return ctx
@@ -249,6 +352,31 @@ class Orchestrator:
             return goal
         return f"{ctx}\n\nCURRENT GOAL:\n{goal}"
 
+    async def _answer_node(self, state: EmployeeState) -> EmployeeState:
+        """Answer a simple factual question directly — no plan, no multi-agent run."""
+        bind_context(node="answer", session=state.get("session_id"))
+        goal = state.get("goal") or ""
+        ctx = self._context(state)
+        # Research already recalls long-term memory / skills in _build_initial_messages,
+        # so a follow-up about the workspace/app is answered from context without a
+        # fresh filesystem investigation. The brief nudges it to stay short.
+        task = (
+            "Answer this question concisely and directly. Do NOT start a multi-step "
+            "investigation or write code; only look something up (web or workspace) if "
+            "genuinely necessary to answer correctly.\n\n"
+            f"{goal}"
+        )
+        result = await self._agents.get("research").run(task, ctx)
+        log.info("workflow.quick_answer", agent=result.agent, steps=result.steps_taken)
+        return {
+            "final": result.output,
+            "confidence": result.confidence,
+            "plan": None,
+            "step_results": [],
+            "cursor": 0,
+            "trace": [{"node": "answer", "agent": result.agent}],
+        }
+
     async def _plan_node(self, state: EmployeeState) -> EmployeeState:
         bind_context(node="plan", session=state.get("session_id"))
         if state.get("resume_execute") and state.get("plan"):
@@ -261,12 +389,28 @@ class Orchestrator:
         ctx = self._context(state)
         result = await self._agents.get("planner").run(self._goal_with_session_context(state), ctx)
         plan = result.metadata.get("plan", {})
+        # Pin every step to the run's base agent. The planner prompt asks for this
+        # too, but the plan is model-generated — enforce it deterministically so a
+        # run can never drift to a different agent half-way through.
+        base_agent = state.get("base_agent")
+        if base_agent and base_agent in self._agents:
+            steps = plan.get("steps") or []
+            before = [s.get("agent") for s in steps]
+            for step in steps:
+                step["agent"] = base_agent
+            plan["steps"] = steps
+            log.info(
+                "workflow.base_agent_pinned",
+                agent=base_agent,
+                steps=len(steps),
+                planner_assigned=before,
+            )
         log.info("workflow.planned", steps=len(plan.get("steps", [])))
         return {
             "plan": plan,
             "cursor": 0,
             "step_results": [],
-            "trace": [{"node": "plan", "steps": len(plan.get("steps", []))}],
+            "trace": [{"node": "plan", "agent": "planner", "steps": len(plan.get("steps", []))}],
         }
 
     async def _execute_node(self, state: EmployeeState) -> EmployeeState:
@@ -417,7 +561,7 @@ class Orchestrator:
         # tool.execute, verifier.*) to the right step. Binding only at the node level
         # left every parallel event without a `step`, so the Explain view had nothing
         # to build per-step cards from and showed only Planner and Synthesize.
-        bind_context(node="execute", step=step["id"], agent=step["agent"])
+        bind_context(node="execute", step=step["id"], agent=step["agent"], retry=0)
         settings = get_settings()
 
         # Respect data dependencies: if a prerequisite step produced nothing usable
@@ -447,8 +591,8 @@ class Orchestrator:
                 )
 
         agent = self._resolve_agent(step["agent"])
-        prior = self._format_prior(results)
-        task = step["description"] + (f"\n\nContext from prior steps:\n{prior}" if prior else "")
+        prior = self._format_prior(step, results)
+        task = step["description"] + (f"\n\n{prior}" if prior else "")
 
         ctx = self._context(state, {"step_results": results})
         result = await agent.run(task, ctx)
@@ -520,13 +664,26 @@ class Orchestrator:
                 )
 
         # Verify and (bounded) retry — but don't loop pointlessly.
+        # audit_artifacts is independent of resource_audit: it cross-checks any
+        # byte-count/line-count/pixel-dimension claim the output makes about a file
+        # it produced against the real file on disk, so the LLM verifier gets ground
+        # truth instead of having to trust (and do arithmetic on) the agent's prose.
+        artifact_audit = audit_artifacts(
+            output=result.output, workspace=settings.workspace_dir, task=step["description"]
+        )
+        fs_audit = audit_filesystem(output=result.output, workspace=settings.workspace_dir)
         verdict = await self._verifier.verify(
             task=step["description"],
             output=result.output,
             success_criteria=step.get("success_criteria", ""),
             resource_audit=resource_audit,
+            artifact_audit=artifact_audit,
+            fs_audit=fs_audit,
         )
         retries = 0
+        # Accumulate every issue raised across attempts so a retry fixes ALL of
+        # them, not only the most recent review's findings.
+        all_issues: list[str] = _dedupe(list(verdict.issues or []))
         while not verdict.passed and retries < self._max_retries:
             # A policy refusal won't change on retry — accept it with the verdict noted.
             if settings.no_retry_on_refusal and _looks_like_refusal(result.output):
@@ -535,9 +692,16 @@ class Orchestrator:
             retries += 1
             log.info("workflow.retry", step=step["id"], attempt=retries)
             prev_output = result.output
-            fix_task = (
-                f"{task}\n\nA reviewer found issues: {verdict.issues}. "
-                f"Fix them. Suggestion: {verdict.suggestion}"
+            # Tag the retry attempt so its trace events (agent/brain/tool) carry
+            # retry=N — the dashboard groups each attempt separately instead of
+            # blending the retry into the first attempt's card.
+            bind_context(node="execute", step=step["id"], agent=step["agent"], retry=retries)
+            fix_task = _build_retry_task(
+                task=task,
+                previous_output=prev_output,
+                issues=all_issues,
+                suggestion=verdict.suggestion,
+                attempt=retries,
             )
             result = await agent.run(fix_task, ctx)
             resource_audit = audit_resources(
@@ -547,12 +711,19 @@ class Orchestrator:
                 tool_trace=result.tool_trace,
                 workspace=settings.workspace_dir,
             )
+            artifact_audit = audit_artifacts(
+                output=result.output, workspace=settings.workspace_dir, task=step["description"]
+            )
+            fs_audit = audit_filesystem(output=result.output, workspace=settings.workspace_dir)
             verdict = await self._verifier.verify(
                 task=step["description"],
                 output=result.output,
                 success_criteria=step.get("success_criteria", ""),
                 resource_audit=resource_audit,
+                artifact_audit=artifact_audit,
+                fs_audit=fs_audit,
             )
+            all_issues = _dedupe([*all_issues, *(verdict.issues or [])])
             # If the retry produced essentially the same answer, stop — it's stalled.
             if _normalize(result.output) == _normalize(prev_output):
                 log.info("workflow.retry_stalled", step=step["id"], attempt=retries)
@@ -567,6 +738,10 @@ class Orchestrator:
             "verified": verdict.passed,
             "retries": retries,
             "resource_audit": resource_audit if resource_audit.get("applies") else None,
+            # Persisted so the Extend/Stop decision is visible in the run snapshot
+            # and the Result view, not just in the live log stream.
+            "steps_taken": result.steps_taken,
+            "loop_checks": (result.metadata or {}).get("loop_checks") or [],
         }
         return _StepOutcome(
             record=step_record,
@@ -600,7 +775,7 @@ class Orchestrator:
         return {
             "final": result.output,
             "confidence": round(confidence, 3),
-            "trace": [{"node": "synthesize"}],
+            "trace": [{"node": "synthesize", "agent": "ceo"}],
         }
 
     async def _reflect_node(self, state: EmployeeState) -> EmployeeState:
@@ -650,6 +825,8 @@ class Orchestrator:
     def _route_start(state: EmployeeState) -> str:
         if state.get("resume_execute") and state.get("plan"):
             return "execute"
+        if is_quick_question(state.get("goal", "")):
+            return "answer"
         return "plan"
 
     def _route_after_execute(self, state: EmployeeState) -> str:
@@ -668,8 +845,38 @@ class Orchestrator:
         return self._agents.get("research")
 
     @staticmethod
-    def _format_prior(results: list[dict[str, Any]]) -> str:
-        return "\n".join(f"[step {r['id']}] {r['output'][:2000]}" for r in results[-3:])
+    def _format_prior(step: dict[str, Any], results: list[dict[str, Any]]) -> str:
+        """Hand the agent the OUTPUTS of its declared prerequisites.
+
+        A step lists other steps in ``depends_on`` only when it literally needs
+        their output (the planner is told to name the flowing artifact), so this
+        feeds *those* results — not a generic "last 3 finished steps", which in a
+        parallel run can even omit the real prerequisite. The message explicitly
+        tells the agent to reuse the results instead of redoing the work (e.g. a
+        "fix the error" step must not re-reproduce it).
+        """
+        by_id = {r.get("id"): r for r in results}
+        blocks: list[str] = []
+        for dep in (step.get("depends_on") or []):
+            rec = by_id.get(dep)
+            if rec is None or _looks_unusable(rec):
+                continue
+            out = (rec.get("output") or "").strip()
+            if not out:
+                continue
+            status = "verified" if rec.get("verified") else "unverified"
+            blocks.append(
+                f"### Step {rec['id']} ({rec.get('agent') or '?'}) — {status}\n"
+                f"{out[:_HANDOFF_MAX_CHARS]}"
+            )
+        if not blocks:
+            return ""
+        return (
+            "PREREQUISITE STEPS ALREADY COMPLETED — build directly on their results; "
+            "do NOT redo or re-reproduce this work. Reuse the files and values they "
+            "reference.\n\n"
+            + "\n\n".join(blocks)
+        )
 
     @staticmethod
     def _unmet_dependencies(step: dict[str, Any], results: list[dict[str, Any]]) -> list[int]:
@@ -692,6 +899,7 @@ class Orchestrator:
         return {
             "goal": goal,
             "session_id": session_id,
+            "base_agent": state.get("base_agent") or "",
             "plan": state.get("plan"),
             "cursor": state.get("cursor", 0),
             "step_results": list(state.get("step_results") or []),
@@ -708,6 +916,7 @@ class Orchestrator:
         resource_decision: dict[str, Any] | None = None,
         workflow_checkpoint: dict[str, Any] | None = None,
         session_context: str = "",
+        base_agent: str | None = None,
         on_progress: Callable[[dict[str, Any]], None] | None = None,
     ) -> EmployeeState:
         begin_task_tool_history()
@@ -720,6 +929,9 @@ class Orchestrator:
                 initial: EmployeeState = {
                     "goal": workflow_checkpoint.get("goal") or goal,
                     "session_id": workflow_checkpoint.get("session_id") or session_id,
+                    "base_agent": (
+                        workflow_checkpoint.get("base_agent") or base_agent or ""
+                    ),
                     "plan": workflow_checkpoint["plan"],
                     "cursor": int(workflow_checkpoint.get("cursor", 0)),
                     "step_results": list(workflow_checkpoint.get("step_results") or []),
@@ -738,12 +950,17 @@ class Orchestrator:
                     "goal": goal,
                     "session_id": session_id,
                     "session_context": session_context or "",
+                    "base_agent": base_agent or "",
                     "step_results": [],
                     "cursor": 0,
                     "trace": [],
                 }
                 if ops:
                     initial["approved_ops"] = ops
+            # The plan is authoritative on resume: its steps already carry the
+            # agent assignments chosen at plan time (the plan node pinned them when
+            # ``base_agent`` was set). Do not re-pin here — that would let a stale
+            # ``base_agent`` from an old checkpoint overwrite a multi-agent plan.
             if resource_decision:
                 initial["resource_decision"] = resource_decision
             # recursion_limit guards against pathological plans.

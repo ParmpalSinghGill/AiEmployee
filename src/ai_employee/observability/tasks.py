@@ -25,6 +25,9 @@ _FLOW_EVENTS = {
     "planner.plan_ready",
     "agent.start",
     "agent.needs_approval",
+    "agent.loop_check",
+    "agent.loop_extended",
+    "agent.loop_stopped",
     "approval.granted",
     "tool.execute",
     "tool.result",
@@ -33,6 +36,10 @@ _FLOW_EVENTS = {
     "verifier.verdict",
     "workflow.node",
     "workflow.retry",
+    "brain.rate_limited",
+    "brain.rate_limit_cleared",
+    "brain.rate_limit_exhausted",
+    "brain.retry",
     "rag.ingested",
     "memory.degraded_to_in_memory",
 }
@@ -49,6 +56,10 @@ def _uid() -> str:
 class TaskStatus(str, Enum):
     pending = "pending"
     running = "running"
+    #: A live run whose LLM provider is rate-limiting it. The agent is sleeping
+    #: out the provider's cooldown and will retry automatically; the task is not
+    #: failed and the UI should show the retry time instead of "running".
+    cooling = "cooling"
     awaiting_approval = "awaiting_approval"
     waiting_for_user = "waiting_for_user"
     completed = "completed"
@@ -88,6 +99,11 @@ class TaskRecord:
         self.session_id = session_id
         self.parent_id = parent_id
         self.mode = mode
+        #: Brain (provider + chat model) captured when this task was launched. Every
+        #: agent in the run uses it, so the run keeps its model even if the operator
+        #: switches the brain for a later task.
+        self.brain_provider = ""
+        self.brain_model = ""
         self.status = TaskStatus.pending
         self.created_at = _now()
         self.finished_at: datetime | None = None
@@ -95,6 +111,10 @@ class TaskRecord:
         self.result: dict[str, Any] | None = None
         self.error: str | None = None
         self._seq = 0
+        # Active provider cooldowns, keyed by the cooling_id in the provider's
+        # rate-limit events. Parallel steps can cool independently; the task stays
+        # "cooling" until every active one has cleared or exhausted.
+        self.cooling: dict[str, dict[str, Any]] = {}
         # Operations the user has approved for this run (persisted so an approval
         # survives a restart). ``resumable`` marks a run interrupted mid-flight.
         self.approved_ops: set[str] = set()
@@ -122,14 +142,54 @@ class TaskRecord:
             )
         )
 
+    def begin_cooling(self, event: dict[str, Any]) -> None:
+        """Record a provider-imposed cooldown (rate limit / quota)."""
+        cid = str(event.get("cooling_id") or "default")
+        until = event.get("retry_at")
+        previous = self.cooling.get(cid) or {}
+        self.cooling[cid] = {
+            "reason": event.get("reason") or "rate limit",
+            "until": until or previous.get("until"),
+            "agent": event.get("agent") or previous.get("agent"),
+            "step": event.get("step") if event.get("step") is not None else previous.get("step"),
+            "provider": event.get("provider") or previous.get("provider"),
+            "model": event.get("model") or previous.get("model"),
+            "attempt": event.get("attempt") or previous.get("attempt"),
+            "max_attempts": event.get("max_attempts") or previous.get("max_attempts"),
+            "wait_s": event.get("wait_s") or previous.get("wait_s"),
+        }
+        self.status = TaskStatus.cooling
+
+    def end_cooling(self, event: dict[str, Any]) -> None:
+        """Clear one cooldown; go back to running when none remain."""
+        cid = str(event.get("cooling_id") or "default")
+        self.cooling.pop(cid, None)
+        if not self.cooling and self.status is TaskStatus.cooling:
+            self.status = TaskStatus.running
+
+    def clear_cooling(self) -> None:
+        """Drop every cooldown (used when a run finishes or is resumed)."""
+        self.cooling.clear()
+        if self.status is TaskStatus.cooling:
+            self.status = TaskStatus.running
+
     def snapshot(self, *, since: int = 0) -> dict[str, Any]:
         events = [e.model_dump() for e in self.events if e.seq > since]
+        cooling = None
+        if self.cooling:
+            latest = max(
+                self.cooling.values(), key=lambda c: str(c.get("until") or "")
+            )
+            cooling = {**latest, "count": len(self.cooling)}
         return {
             "id": self.id,
+            "cooling": cooling,
             "goal": self.goal,
             "session_id": self.session_id,
             "parent_id": self.parent_id,
             "mode": self.mode,
+            "brain_provider": self.brain_provider,
+            "brain_model": self.brain_model,
             "status": self.status.value,
             "created_at": self.created_at.isoformat(),
             "finished_at": self.finished_at.isoformat() if self.finished_at else None,
@@ -173,6 +233,8 @@ class TaskRecord:
         rec._seq = d.get("last_seq", len(rec.events))
         rec.result = d.get("result")
         rec.error = d.get("error")
+        rec.brain_provider = d.get("brain_provider", "")
+        rec.brain_model = d.get("brain_model", "")
         rec.approved_ops = set(d.get("approved_ops", []))
         rd = d.get("resource_decision")
         rec.resource_decision = rd if isinstance(rd, dict) else None
@@ -181,7 +243,7 @@ class TaskRecord:
         status = d.get("status", "completed")
         pending_approval = _pending_approval(rec.result)
         resume_checkpoint = _resume_checkpoint(rec.result)
-        if status in {"running", "pending"}:
+        if status in {"running", "pending", "cooling"}:
             if pending_approval:
                 op = pending_approval.get("operation")
                 status = "waiting_for_user" if op == "waiting_for_user" else "awaiting_approval"
@@ -275,7 +337,22 @@ class TaskManager:
     def _route_log(self, event_dict: dict[str, Any]) -> None:
         tid = event_dict.get("task_id")
         if tid and tid in self._tasks:
+            task = self._tasks[tid]
             event = str(event_dict.get("event", ""))
+            # Provider cooldowns drive the visible "cooling" status. This happens
+            # before the display filter: even if a future change trims the log,
+            # the status must still reflect an active rate limit.
+            if event == "brain.rate_limited":
+                # Ignore late events from a run that already finished/was cancelled;
+                # without this a stray embed retry could flip a done task to cooling.
+                if task.status in {
+                    TaskStatus.pending,
+                    TaskStatus.running,
+                    TaskStatus.cooling,
+                }:
+                    task.begin_cooling(event_dict)
+            elif event in {"brain.rate_limit_cleared", "brain.rate_limit_exhausted"}:
+                task.end_cooling(event_dict)
             # Keep flow milestones + warnings/errors; drop low-signal debug chatter.
             level = str(event_dict.get("level", "info"))
             if (
@@ -293,7 +370,7 @@ class TaskManager:
                     )
                 )
             ):
-                self._tasks[tid].add_log(event_dict)
+                task.add_log(event_dict)
 
     # ── Creation / execution ─────────────────────────────────────────────────
     def start(
@@ -318,17 +395,27 @@ class TaskManager:
             session = self._sessions[session_id]
             parent_id = session.task_ids[-1] if session.task_ids else None
         else:
+            guest = bool((owner or {}).get("guest", False))
+            from ai_employee.config import get_settings as _gs
+
+            persist_guest = bool(getattr(_gs(), "persist_guest_sessions", False))
             session = _Session(
                 title=_title(goal),
                 user_id=(owner or {}).get("id"),
                 user_name=(owner or {}).get("name"),
-                persist=not (owner or {}).get("guest", False),
+                persist=(not guest) or persist_guest,
             )
             self._sessions[session.id] = session
             parent_id = None
 
         task = TaskRecord(goal=goal, session_id=session.id, parent_id=parent_id, mode=mode)
         task.auto_approve = bool(auto_approve)
+        # Freeze the brain at launch: capture the provider + model the operator had
+        # selected when they clicked Run, so every agent in this run uses it even if
+        # the brain is switched for a later task.
+        brain = getattr(employee, "brain", None)
+        task.brain_provider = getattr(brain, "name", "") or ""
+        task.brain_model = getattr(brain, "model_name", "") or ""
         if token_budget is not None:
             task.token_budget = max(0, int(token_budget))
         ops = set(approved_ops or set())
@@ -403,6 +490,7 @@ class TaskManager:
         handle = self._handles.get(task_id)
         if handle is not None and not handle.done():
             return None
+        task.clear_cooling()
         task.status = TaskStatus.running
         task.resumable = False
         task.error = None
@@ -470,6 +558,10 @@ class TaskManager:
         structlog.contextvars.bind_contextvars(task_id=task.id)
         task.status = TaskStatus.running
         task.resumable = False
+        # Keep this employee (and its frozen brain/model) alive for the whole run.
+        acquire = getattr(employee, "acquire", None)
+        if callable(acquire):
+            acquire()
         log.info("task.started", goal=task.goal[:120])
         # Bind a budgeted meter for the whole run (all rounds, incl. resumes in
         # this call). The Brain choke point enforces the cap; we total spend.
@@ -592,6 +684,9 @@ class TaskManager:
             task.resumable = _resume_checkpoint(task.result) is not None
             log.warning("task.failed", error=task.error, resumable=task.resumable)
         finally:
+            # A run that ended (completed, failed, cancelled) can no longer be
+            # cooling — drop any cooldown markers so the next snapshot is clean.
+            task.cooling.clear()
             task.tokens_used += _meter.total_tokens
             _usage_cm.__exit__(None, None, None)
             self._notify_transition(task)
@@ -601,6 +696,11 @@ class TaskManager:
             # Persist memory so a resumed session keeps its accumulated context.
             with contextlib.suppress(Exception):
                 employee.persist_memory()
+            # Release the employee last: if it was retired while this run was
+            # active (the operator switched the brain), it now closes safely.
+            release = getattr(employee, "release", None)
+            if callable(release):
+                release()
 
     def _notify_transition(self, task: TaskRecord) -> None:
         """Push the terminal/paused state to the operator's phone (ntfy)."""
@@ -653,6 +753,28 @@ class TaskManager:
             log.info("task.named", title=title, task_id=task.id)
 
     # ── Persistence ──────────────────────────────────────────────────────────
+    def add_saved_session(self, meta: dict[str, Any], snapshots: list[dict[str, Any]]) -> None:
+        """Register a session + its run snapshots (e.g. a recovered run) in memory.
+
+        Mirrors what ``_load_from_store`` does at startup, so a run imported while
+        the server is live shows up in the console immediately.
+        """
+        session = _Session(
+            meta.get("title", "Saved task"),
+            user_id=meta.get("user_id"),
+            user_name=meta.get("user_name"),
+        )
+        session.id = meta["id"]
+        for snap in snapshots:
+            try:
+                rec = TaskRecord.from_snapshot(snap)
+            except Exception as exc:  # noqa: BLE001 - a bad snapshot must not break load
+                log.warning("tasks.import_bad_snapshot", error=str(exc))
+                continue
+            self._tasks[rec.id] = rec
+            session.task_ids.append(rec.id)
+        self._sessions[session.id] = session
+
     def _persist_session(self, session: _Session) -> None:
         if self._store is None or not session.persist:
             return
@@ -736,13 +858,14 @@ class TaskManager:
         'running' forever and the UI would poll it indefinitely. The UI polls this
         every second, so a dead task is surfaced within a second or two.
         """
-        if task.status not in {TaskStatus.running, TaskStatus.pending}:
+        if task.status not in {TaskStatus.running, TaskStatus.pending, TaskStatus.cooling}:
             return
         handle = self._handles.get(task.id)
         if handle is not None and not handle.done():
             return  # genuinely still running
         if handle is None and task.status == TaskStatus.pending:
             return  # queued by startup, not yet launched
+        task.cooling.clear()
         task.status = TaskStatus.failed
         task.error = task.error or "interrupted (worker stopped)"
         task.resumable = _resume_checkpoint(task.result) is not None
@@ -787,6 +910,24 @@ class TaskManager:
             return []
         return [self._tasks[t] for t in s.task_ids if t in self._tasks]
 
+    def running_tasks(self, owner_id: str | None = None) -> list[TaskRecord]:
+        """Currently non-terminal tasks for a user — the live org-chart feed."""
+        live = {
+            TaskStatus.pending,
+            TaskStatus.running,
+            TaskStatus.cooling,
+            TaskStatus.awaiting_approval,
+        }
+        out = []
+        for s in self._sessions.values():
+            if owner_id is not None and s.user_id != owner_id:
+                continue
+            for tid in s.task_ids:
+                task = self._tasks.get(tid)
+                if task is not None and task.status in live:
+                    out.append(task)
+        return out
+
     def _build_session_context(self, task: TaskRecord) -> str:
         """Context for a run: local asset inventory + earlier runs in this session.
 
@@ -798,7 +939,10 @@ class TaskManager:
             AssetRegistry,
             build_local_inventory_context,
         )
-        from ai_employee.observability.session_context import build_prior_session_context
+        from ai_employee.observability.session_context import (
+            build_environment_context,
+            build_prior_session_context,
+        )
 
         parts: list[str] = []
         try:
@@ -809,6 +953,15 @@ class TaskManager:
                 parts.append(inventory)
         except Exception as exc:  # noqa: BLE001 - inventory must never break a run
             log.warning("asset_inventory_failed", error=str(exc))
+
+        # Known environment facts (workspace, Python, sibling dirs) go first, so the
+        # agents don't burn shell round-trips re-discovering them.
+        try:
+            env = build_environment_context(get_settings())
+            if env:
+                parts.append(env)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("environment_context_failed", error=str(exc))
 
         session = self._sessions.get(task.session_id)
         if session:

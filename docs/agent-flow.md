@@ -37,9 +37,14 @@ decomposing the goal into ordered steps:
   { "id": 1, "description": "...", "agent": "research", "depends_on": [],
     "success_criteria": "..." }, ... ] }
 ```
-Each step is assigned to the best-fit agent from the roster (**23 agents total** — 20
-declarative ones in `agents/specs.py` + 3 bespoke classes in `agents/custom.py`; see
-[The agent roster](#the-agent-roster) below). Invalid assignments are repaired.
+The planner assigns each step to the best-fit agent from the full roster
+(**29 agents total** — 26 declarative ones in `agents/specs.py` + 3 bespoke
+classes in `agents/custom.py`; see [The agent roster](#the-agent-roster) below):
+research for finding things, coding for code, data_analysis for data, testing for
+tests, and so on. A run may be **pinned** to one agent only when the caller passes
+`base_agent=...` explicitly (`agents/routing.py` maps the single-purpose modes to
+their owner — `plan` → `planner`, `download` → `resource_downloader`); the general
+`task` mode is **not** pinned, so its steps keep their specialist assignments.
 
 ### 2. EXECUTE — one step at a time (looped)
 For each step the orchestrator runs the assigned agent. Most agents are a
@@ -78,7 +83,7 @@ a reusable **skill** (so similar future goals are faster/better). See `docs/memo
 | Layer | Responsibility | Code |
 |---|---|---|
 | **Brain** | provider-independent LLM (chat, tools, structured output, embeddings) | `brains/` |
-| **Planner** | goal → ordered, agent-assigned steps | `planning/planner.py` |
+| **Planner** | goal → ordered steps, each assigned to the best-fit agent | `planning/planner.py` |
 | **Agents** | execute a step via reason→tool→observe loop | `agents/` |
 | **Tools** | sandboxed capabilities (fs, code, web, data) w/ approval gate | `tools/` |
 | **Verifier** | self-review each step, drive retries, estimate confidence | `verification/` |
@@ -88,11 +93,11 @@ a reusable **skill** (so similar future goals are faster/better). See `docs/memo
 
 ## The agent roster
 
-**23 agents** are registered (`agents/registry.py::build_agent_registry`). The Planner
+**29 agents** are registered (`agents/registry.py::build_agent_registry`). The Planner
 routes each step to one of them by `name`. The live list is also available at runtime via
 `GET /agents` (and `emp.agents.catalog()`).
 
-**20 declarative agents** — pure `AgentSpec` data in `agents/specs.py` (role, system
+**26 declarative agents** — pure `AgentSpec` data in `agents/specs.py` (role, system
 prompt, allowed tools). Grouped by `category`:
 
 | Category | Agent (`name`) | Role | Tools |
@@ -117,6 +122,12 @@ prompt, allowed tools). Grouped by `category`:
 | management | `task_manager` | Task Manager | none (reasoning only) |
 | management | `memory_manager` | Memory Manager | none (reasoning only) |
 | web | `browser` | Browser Operator | web |
+| research | `plan_researcher` | Plan Researcher | hub discovery (no downloads) |
+| research | `resource_downloader` | Resource Downloader | download_resource + filesystem |
+| research | `resource_acquirer` | Resource Acquirer | hub search + download_resource |
+| research | `scout` | ML Resource Scout | hub discovery (no downloads) |
+| research | `hardware_analyst` | Hardware Analyst | estimate_hardware, hf_search, fetch_page |
+| research | `codesmith` | ML Code Generator | code + hf_search, fetch_page |
 
 **3 bespoke agents** — real classes in `agents/custom.py` with logic too specific for a
 spec:

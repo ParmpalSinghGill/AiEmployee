@@ -41,6 +41,35 @@ async def test_planner_produces_plan(brain):
     assert all(s.agent in valid for s in plan.steps)
 
 
+def test_generic_assignment_correction_routes_to_specialists():
+    from ai_employee.planning.planner import _correct_generic_assignment
+
+    valid = {"research", "coding", "testing", "git", "data_analysis", "documentation", "devops"}
+
+    # A weak model leaves these on `research`; the safety net must fix them.
+    assert _correct_generic_assignment("Implement the minimal fix", "research", valid) == "coding"
+    assert _correct_generic_assignment("Add a regression test", "research", valid) == "testing"
+    assert _correct_generic_assignment("Clone the repo and check out the commit", "research", valid) == "git"
+    assert _correct_generic_assignment("Create a pandas EDA with charts", "research", valid) == "data_analysis"
+
+    # Genuine research stays research.
+    assert _correct_generic_assignment("Search the web for a model", "research", valid) == "research"
+
+    # A model that already picked a specialist is never overridden.
+    assert _correct_generic_assignment("Implement the minimal fix", "data_analysis", valid) == "data_analysis"
+
+    # If the target specialist is absent, leave the assignment alone.
+    assert _correct_generic_assignment("Implement the fix", "research", {"research"}) == "research"
+
+
+def test_planner_prompt_warns_against_defaulting_to_research():
+    import inspect
+
+    src = inspect.getsource(Planner.make_plan)
+    assert "AGENT ASSIGNMENT" in src
+    assert "Do not fall back to `research`" in src
+
+
 async def test_tool_using_agent_runs(brain, settings):
     reg = build_agent_registry()
     agent = reg.get("research")
@@ -450,7 +479,9 @@ def test_data_analysis_spec_handles_encoding_and_budget():
     from ai_employee.agents.specs import spec_by_name
 
     spec = spec_by_name()["data_analysis"]
-    assert spec.max_iterations >= 12
+    # Deliberately trimmed: a smaller base cap that the loop check extends when
+    # the agent is still making progress (see agents/loop_check.py).
+    assert spec.max_iterations == 7
     prompt = spec.system_prompt.lower()
     assert "encoding" in prompt
     assert "latin-1" in prompt

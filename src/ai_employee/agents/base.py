@@ -10,12 +10,13 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from ai_employee.agents.loop_check import LoopCheckService, LoopVerdict
 from ai_employee.brains.base import Brain
 from ai_employee.brains.schemas import Message, Role
 from ai_employee.config import get_settings
 from ai_employee.core.exceptions import ApprovalRequired
 from ai_employee.core.logging import get_logger
-from ai_employee.core.trace import clip, clip_obj
+from ai_employee.core.trace import clip, clip_obj, tool_clip
 from ai_employee.memory import MemoryManager, MemoryNamespace
 from ai_employee.tools import ToolRegistry
 from ai_employee.tools.invocation_history import bind_dedup_scope, reset_dedup_scope
@@ -110,263 +111,316 @@ class ToolUsingAgent(BaseAgent):
         stop_reason: str | None = None
         steps_done = 0
 
-        for step in range(self.max_iterations):
-            steps_done = step + 1
-            # Keep context (and per-call latency) from compounding as the loop runs.
-            messages = self._compact_history(messages, settings.agent_history_window)
-            result = await ctx.brain.chat(
-                messages,
-                tools=tool_specs or None,
-                temperature=0.2,
-            )
-            if not result.has_tool_calls:
-                output = (result.content or "").strip()
-                # finish_reason="length" means the model was cut off at the token
-                # ceiling — the answer ends mid-word. Length alone can't detect it
-                # (a 124-char stub looks "long enough"), so trust the provider's
-                # signal and ask for a complete answer instead of shipping a stub.
-                truncated = str(result.finish_reason or "").lower() == "length"
-                if len(output) < 20 or truncated:
-                    if truncated:
-                        log.warning(
-                            "agent.output_truncated",
-                            agent=self.name,
-                            chars=len(output),
-                            note="hit llm_max_tokens; retrying for a complete answer",
-                        )
-                    output = await self._final_answer(
-                        messages,
-                        trace,
-                        ctx,
-                        stop_reason=(
-                            "truncated_at_token_limit" if truncated else "empty_or_truncated_answer"
-                        ),
-                        previous=output if truncated else "",
-                    )
-                await self._remember(task, output, ctx)
-                log.info(
-                    "agent.answer",
-                    agent=self.name,
-                    output=clip(output, 4000),
-                    steps=steps_done,
-                )
-                return AgentResult(
-                    agent=self.name,
-                    success=True,
-                    output=output,
-                    confidence=self._estimate_confidence(output, trace),
-                    steps_taken=steps_done,
-                    tool_trace=trace,
-                    metadata={"usage": result.usage.model_dump()},
-                )
+        # The agent's total rounds = a base window plus any extra windows the
+        # loop check grants when it decides we are progressing, not stuck. This
+        # keeps a small fixed cap for the common case while letting a long but
+        # healthy task finish instead of being cut off mid-work. Both numbers are
+        # configurable per agent from .env (AGENT_MAX_ITERATIONS* /
+        # AGENT_LOOP_EXTENSIONS*), falling back to the agent's built-in default.
+        max_iterations = settings.iteration_limit_for(self.name, self.max_iterations)
+        max_extensions = (
+            settings.loop_limit_for(self.name) if settings.agent_loop_check_enabled else 0
+        )
+        extensions_used = 0
+        loop_checks: list[dict[str, Any]] = []
 
-            # Record the assistant's tool request, then execute each call.
-            messages.append(
-                Message(role=Role.assistant, content=result.content, tool_calls=result.tool_calls)
-            )
-            abort = False
-            pending_exc: ApprovalRequired | None = None
-            batched_pending: list[dict[str, Any]] = []
-            for call in result.tool_calls:
-                try:
-                    tool_result = await ctx.tools.execute(
-                        call.name,
-                        call.arguments,
-                        approved=self._is_approved(call.name, ctx, call.arguments),
-                    )
-                    observation = tool_result.as_text()
-                    if tool_result.metadata.get("duplicate"):
-                        dup_total += 1
-                        log.info(
-                            "agent.duplicate_call",
-                            agent=self.name,
-                            tool=call.name,
-                            count=dup_total,
-                        )
-                        if dup_total >= 3:
-                            if (
-                                self.name in _RESOURCE_DOWNLOAD_AGENTS
-                                and not self._downloads_attempted(trace)
-                            ):
-                                observation += (
-                                    "\n\n[SYSTEM] Too many repeated searches. Stop searching "
-                                    "and call download_resource on your best YouTube and "
-                                    "Hugging Face URLs now (yt-dlp / huggingface_hub)."
-                                )
-                            else:
-                                observation += (
-                                    "\n\n[SYSTEM] Too many repeated identical tool calls. "
-                                    "Stop searching and synthesize your best final answer from "
-                                    "what you already have."
-                                )
-                                stop_reason = "aborted after repeated duplicate tool calls"
-                                abort = True
-                    trace.append(
-                        {
-                            "tool": call.name,
-                            "args": call.arguments,
-                            "ok": tool_result.ok,
-                            "output": clip(tool_result.output, 2000),
-                            "error": tool_result.error,
-                            "observation": clip(observation, 1000),
-                        }
-                    )
-                    if not tool_result.ok:
-                        ecls = self._error_class(tool_result.error)
-                        sig = f"{call.name}:{ecls}"
-                        fail_counts[sig] = fail_counts.get(sig, 0) + 1
-                        err_text = tool_result.error or ""
-                        if ecls == "UnicodeDecodeError":
-                            observation += (
-                                "\n\n[SYSTEM] UnicodeDecodeError: this file is not UTF-8 "
-                                "(byte 0xA0 is often a cp1252/latin-1 non-breaking space). "
-                                "Retry with pd.read_csv(path, encoding='latin-1') or "
-                                "encoding='cp1252'. csv_preview reports the encoding to use. "
-                                "Do not import chardet."
-                            )
-                        elif ecls == "InvalidToolArgs":
-                            observation += (
-                                "\n\n[SYSTEM] Tool call JSON was truncated or invalid. "
-                                "Retry python_exec with a SHORTER script (under 40 lines). "
-                                "Do not wrap arguments in _raw."
-                            )
-                        elif ecls == "ModuleNotFoundError" and "chardet" in err_text:
-                            observation += (
-                                "\n\n[SYSTEM] chardet is not installed. Skip detection — "
-                                "use encoding='latin-1' instead of importing chardet."
-                            )
-                        if fail_counts[sig] >= settings.agent_repeat_failure_limit:
-                            log.info(
-                                "agent.repeated_failure",
+        while True:
+            for _ in range(max_iterations):
+                steps_done += 1
+                # Keep context (and per-call latency) from compounding as the loop runs.
+                messages = self._compact_history(messages, settings.agent_history_window)
+                result = await ctx.brain.chat(
+                    messages,
+                    tools=tool_specs or None,
+                    temperature=0.2,
+                )
+                if not result.has_tool_calls:
+                    output = (result.content or "").strip()
+                    # finish_reason="length" means the model was cut off at the token
+                    # ceiling — the answer ends mid-word. Length alone can't detect it
+                    # (a 124-char stub looks "long enough"), so trust the provider's
+                    # signal and ask for a complete answer instead of shipping a stub.
+                    truncated = str(result.finish_reason or "").lower() == "length"
+                    if len(output) < 20 or truncated:
+                        if truncated:
+                            log.warning(
+                                "agent.output_truncated",
                                 agent=self.name,
-                                tool=call.name,
-                                error_class=ecls,
-                                count=fail_counts[sig],
+                                chars=len(output),
+                                note="hit llm_max_tokens; retrying for a complete answer",
                             )
-                            if (
-                                self.name in _RESOURCE_DOWNLOAD_AGENTS
-                                and call.name in _PROBE_TOOLS
-                                and not self._downloads_attempted(trace)
-                            ):
-                                observation += (
-                                    f"\n\n[SYSTEM] '{call.name}' failed {fail_counts[sig]}× "
-                                    "(often 403 on stock sites) but you have NOT called "
-                                    "download_resource yet. fetch_page failures do NOT mean "
-                                    "YouTube/HF downloads will fail — call download_resource "
-                                    "on every YouTube and Hugging Face URL before finishing."
-                                )
-                            elif (
-                                self.name in _RESOURCE_DOWNLOAD_AGENTS
-                                and call.name == "download_resource"
-                                and not self._downloads_succeeded(trace)
-                            ):
-                                observation += (
-                                    f"\n\n[SYSTEM] This candidate URL failed {fail_counts[sig]}× "
-                                    f"with error type ({ecls}). Do NOT stop after the first few "
-                                    "failed links. Mark this candidate as failed, skip it, and "
-                                    "continue trying the next distinct resource URL before asking "
-                                    "the user for manual help."
-                                )
-                            elif ecls in {
-                                "UnicodeDecodeError",
-                                "InvalidToolArgs",
-                                "ValidationError",
-                            }:
-                                # Recoverable: encoding mismatch or truncated tool JSON.
-                                pass
-                            else:
-                                observation += (
-                                    f"\n\n[SYSTEM] '{call.name}' has now failed {fail_counts[sig]}× with the same "
-                                    f"error type ({ecls}). Stop retrying this approach. If a dependency or resource "
-                                    "is missing, say so plainly; otherwise give your best final answer now."
-                                )
-                                stop_reason = f"aborted after repeated tool failure ({sig})"
-                                abort = True
-                except ApprovalRequired as exc:
-                    if exc.operation in ctx.approved_ops:
+                        output = await self._final_answer(
+                            messages,
+                            trace,
+                            ctx,
+                            stop_reason=(
+                                "truncated_at_token_limit" if truncated else "empty_or_truncated_answer"
+                            ),
+                            previous=output if truncated else "",
+                        )
+                    await self._remember(task, output, ctx)
+                    log.info(
+                        "agent.answer",
+                        agent=self.name,
+                        output=clip(output),
+                        steps=steps_done,
+                    )
+                    return AgentResult(
+                        agent=self.name,
+                        success=True,
+                        output=output,
+                        confidence=self._estimate_confidence(output, trace),
+                        steps_taken=steps_done,
+                        tool_trace=trace,
+                        metadata={"usage": result.usage.model_dump()},
+                    )
+
+                # Record the assistant's tool request, then execute each call.
+                messages.append(
+                    Message(role=Role.assistant, content=result.content, tool_calls=result.tool_calls)
+                )
+                abort = False
+                pending_exc: ApprovalRequired | None = None
+                batched_pending: list[dict[str, Any]] = []
+                for call in result.tool_calls:
+                    try:
                         tool_result = await ctx.tools.execute(
                             call.name,
                             call.arguments,
-                            approved=True,
+                            approved=self._is_approved(call.name, ctx, call.arguments),
                         )
                         observation = tool_result.as_text()
+                        if tool_result.metadata.get("duplicate"):
+                            dup_total += 1
+                            log.info(
+                                "agent.duplicate_call",
+                                agent=self.name,
+                                tool=call.name,
+                                count=dup_total,
+                            )
+                            if dup_total >= 3:
+                                if (
+                                    self.name in _RESOURCE_DOWNLOAD_AGENTS
+                                    and not self._downloads_attempted(trace)
+                                ):
+                                    observation += (
+                                        "\n\n[SYSTEM] Too many repeated searches. Stop searching "
+                                        "and call download_resource on your best YouTube and "
+                                        "Hugging Face URLs now (yt-dlp / huggingface_hub)."
+                                    )
+                                else:
+                                    observation += (
+                                        "\n\n[SYSTEM] Too many repeated identical tool calls. "
+                                        "Stop searching and synthesize your best final answer from "
+                                        "what you already have."
+                                    )
+                                    stop_reason = "aborted after repeated duplicate tool calls"
+                                    abort = True
                         trace.append(
                             {
                                 "tool": call.name,
                                 "args": call.arguments,
                                 "ok": tool_result.ok,
-                                "output": clip(tool_result.output, 2000),
+                                "output": tool_clip(tool_result.output),
                                 "error": tool_result.error,
-                                "observation": clip(observation, 1000),
-                                "preapproved": True,
+                                "observation": tool_clip(observation),
                             }
+                        )
+                        if not tool_result.ok:
+                            ecls = self._error_class(tool_result.error)
+                            sig = f"{call.name}:{ecls}"
+                            fail_counts[sig] = fail_counts.get(sig, 0) + 1
+                            err_text = tool_result.error or ""
+                            if ecls == "UnicodeDecodeError":
+                                observation += (
+                                    "\n\n[SYSTEM] UnicodeDecodeError: this file is not UTF-8 "
+                                    "(byte 0xA0 is often a cp1252/latin-1 non-breaking space). "
+                                    "Retry with pd.read_csv(path, encoding='latin-1') or "
+                                    "encoding='cp1252'. csv_preview reports the encoding to use. "
+                                    "Do not import chardet."
+                                )
+                            elif ecls == "InvalidToolArgs":
+                                observation += (
+                                    "\n\n[SYSTEM] Tool call JSON was truncated or invalid. "
+                                    "Retry python_exec with a SHORTER script (under 40 lines). "
+                                    "Do not wrap arguments in _raw."
+                                )
+                            elif ecls == "ModuleNotFoundError" and "chardet" in err_text:
+                                observation += (
+                                    "\n\n[SYSTEM] chardet is not installed. Skip detection — "
+                                    "use encoding='latin-1' instead of importing chardet."
+                                )
+                            if fail_counts[sig] >= settings.agent_repeat_failure_limit:
+                                log.info(
+                                    "agent.repeated_failure",
+                                    agent=self.name,
+                                    tool=call.name,
+                                    error_class=ecls,
+                                    count=fail_counts[sig],
+                                )
+                                if (
+                                    self.name in _RESOURCE_DOWNLOAD_AGENTS
+                                    and call.name in _PROBE_TOOLS
+                                    and not self._downloads_attempted(trace)
+                                ):
+                                    observation += (
+                                        f"\n\n[SYSTEM] '{call.name}' failed {fail_counts[sig]}× "
+                                        "(often 403 on stock sites) but you have NOT called "
+                                        "download_resource yet. fetch_page failures do NOT mean "
+                                        "YouTube/HF downloads will fail — call download_resource "
+                                        "on every YouTube and Hugging Face URL before finishing."
+                                    )
+                                elif (
+                                    self.name in _RESOURCE_DOWNLOAD_AGENTS
+                                    and call.name == "download_resource"
+                                    and not self._downloads_succeeded(trace)
+                                ):
+                                    observation += (
+                                        f"\n\n[SYSTEM] This candidate URL failed {fail_counts[sig]}× "
+                                        f"with error type ({ecls}). Do NOT stop after the first few "
+                                        "failed links. Mark this candidate as failed, skip it, and "
+                                        "continue trying the next distinct resource URL before asking "
+                                        "the user for manual help."
+                                    )
+                                elif ecls in {
+                                    "UnicodeDecodeError",
+                                    "InvalidToolArgs",
+                                    "ValidationError",
+                                }:
+                                    # Recoverable: encoding mismatch or truncated tool JSON.
+                                    pass
+                                else:
+                                    observation += (
+                                        f"\n\n[SYSTEM] '{call.name}' has now failed {fail_counts[sig]}× with the same "
+                                        f"error type ({ecls}). Stop retrying this approach. If a dependency or resource "
+                                        "is missing, say so plainly; otherwise give your best final answer now."
+                                    )
+                                    stop_reason = f"aborted after repeated tool failure ({sig})"
+                                    abort = True
+                    except ApprovalRequired as exc:
+                        if exc.operation in ctx.approved_ops:
+                            tool_result = await ctx.tools.execute(
+                                call.name,
+                                call.arguments,
+                                approved=True,
+                            )
+                            observation = tool_result.as_text()
+                            trace.append(
+                                {
+                                    "tool": call.name,
+                                    "args": call.arguments,
+                                    "ok": tool_result.ok,
+                                    "output": tool_clip(tool_result.output),
+                                    "error": tool_result.error,
+                                    "observation": tool_clip(observation),
+                                    "preapproved": True,
+                                }
+                            )
+                            messages.append(
+                                Message.tool(
+                                    observation[:8000],
+                                    tool_call_id=call.id,
+                                    name=call.name,
+                                )
+                            )
+                            continue
+                        if pending_exc is not None and pending_exc.operation != exc.operation:
+                            payload = {**pending_exc.payload, "batched_calls": batched_pending}
+                            if len(batched_pending) > 1:
+                                payload["batch_count"] = len(batched_pending)
+                            return AgentResult(
+                                agent=self.name,
+                                success=False,
+                                output=f"Paused: needs approval for {pending_exc.operation}.",
+                                confidence=0.0,
+                                steps_taken=steps_done,
+                                tool_trace=trace,
+                                needs_approval={"operation": pending_exc.operation, **payload},
+                            )
+                        if pending_exc is None:
+                            pending_exc = exc
+                        for item in self._batched_approval_calls(result.tool_calls, call, ctx):
+                            if item not in batched_pending:
+                                batched_pending.append(item)
+                        log.info(
+                            "agent.needs_approval",
+                            agent=self.name,
+                            op=exc.operation,
+                            tool=exc.payload.get("tool"),
+                            args=clip_obj(exc.payload.get("args") or {}),
+                            batched=len(batched_pending),
                         )
                         messages.append(
                             Message.tool(
-                                observation[:8000],
+                                f"Paused: needs approval for {exc.operation}"
+                                + (
+                                    f" ({len(batched_pending)} operations in this batch)."
+                                    if len(batched_pending) > 1
+                                    else "."
+                                )
+                                + " Approve in the UI to continue.",
                                 tool_call_id=call.id,
                                 name=call.name,
                             )
                         )
                         continue
-                    if pending_exc is not None and pending_exc.operation != exc.operation:
-                        payload = {**pending_exc.payload, "batched_calls": batched_pending}
-                        if len(batched_pending) > 1:
-                            payload["batch_count"] = len(batched_pending)
-                        return AgentResult(
-                            agent=self.name,
-                            success=False,
-                            output=f"Paused: needs approval for {pending_exc.operation}.",
-                            confidence=0.0,
-                            steps_taken=steps_done,
-                            tool_trace=trace,
-                            needs_approval={"operation": pending_exc.operation, **payload},
-                        )
-                    if pending_exc is None:
-                        pending_exc = exc
-                    for item in self._batched_approval_calls(result.tool_calls, call, ctx):
-                        if item not in batched_pending:
-                            batched_pending.append(item)
-                    log.info(
-                        "agent.needs_approval",
-                        agent=self.name,
-                        op=exc.operation,
-                        tool=exc.payload.get("tool"),
-                        args=clip_obj(exc.payload.get("args") or {}),
-                        batched=len(batched_pending),
-                    )
                     messages.append(
-                        Message.tool(
-                            f"Paused: needs approval for {exc.operation}"
-                            + (
-                                f" ({len(batched_pending)} operations in this batch)."
-                                if len(batched_pending) > 1
-                                else "."
-                            )
-                            + " Approve in the UI to continue.",
-                            tool_call_id=call.id,
-                            name=call.name,
-                        )
+                        Message.tool(observation[:8000], tool_call_id=call.id, name=call.name)
                     )
-                    continue
-                messages.append(
-                    Message.tool(observation[:8000], tool_call_id=call.id, name=call.name)
-                )
-            if pending_exc:
-                payload = {**pending_exc.payload, "batched_calls": batched_pending}
-                if len(batched_pending) > 1:
-                    payload["batch_count"] = len(batched_pending)
-                return AgentResult(
-                    agent=self.name,
-                    success=False,
-                    output=f"Paused: needs approval for {pending_exc.operation}.",
-                    confidence=0.0,
-                    steps_taken=steps_done,
-                    tool_trace=trace,
-                    needs_approval={"operation": pending_exc.operation, **payload},
-                )
+                if pending_exc:
+                    payload = {**pending_exc.payload, "batched_calls": batched_pending}
+                    if len(batched_pending) > 1:
+                        payload["batch_count"] = len(batched_pending)
+                    return AgentResult(
+                        agent=self.name,
+                        success=False,
+                        output=f"Paused: needs approval for {pending_exc.operation}.",
+                        confidence=0.0,
+                        steps_taken=steps_done,
+                        tool_trace=trace,
+                        needs_approval={"operation": pending_exc.operation, **payload},
+                    )
+                if abort:
+                    break
+
             if abort:
                 break
+
+            # Iteration cap reached with no natural answer. Ask the loop check
+            # whether we are stuck (stop) or merely long (grant another window).
+            if extensions_used >= max_extensions:
+                stop_reason = stop_reason or "max_iterations reached"
+                break
+            verdict = await self._check_loop(ctx, messages, trace, base_iterations=max_iterations)
+            loop_checks.append(
+                {
+                    "is_loop": verdict.is_loop,
+                    "confidence": verdict.confidence,
+                    "method": verdict.method,
+                    "reason": verdict.reason,
+                    "signals": verdict.signals,
+                }
+            )
+            log.info(
+                "agent.loop_check",
+                agent=self.name,
+                is_loop=verdict.is_loop,
+                confidence=verdict.confidence,
+                method=verdict.method,
+                reason=verdict.reason,
+            )
+            if verdict.is_loop:
+                stop_reason = f"stopped by loop check ({verdict.method}: {verdict.reason})"
+                log.info("agent.loop_stopped", agent=self.name, reason=verdict.reason)
+                break
+            extensions_used += 1
+            log.info(
+                "agent.loop_extended",
+                agent=self.name,
+                extension=extensions_used,
+                extra_iterations=max_iterations,
+                reason=verdict.reason,
+            )
 
         # Loop ended (iterations exhausted, or aborted on a repeated failure).
         stop_reason = stop_reason or "max_iterations reached"
@@ -374,7 +428,7 @@ class ToolUsingAgent(BaseAgent):
         log.info(
             "agent.answer",
             agent=self.name,
-            output=clip(output, 4000),
+            output=clip(output),
             steps=steps_done,
             note=stop_reason,
         )
@@ -385,7 +439,7 @@ class ToolUsingAgent(BaseAgent):
             confidence=0.35 if "failure" in stop_reason else 0.4,
             steps_taken=steps_done,
             tool_trace=trace,
-            metadata={"note": stop_reason},
+            metadata={"note": stop_reason, "loop_checks": loop_checks},
         )
 
     # ── Helpers ──────────────────────────────────────────────────────────────
@@ -516,6 +570,35 @@ class ToolUsingAgent(BaseAgent):
         line = text.splitlines()[-1].strip()
         return re.sub(r"\d+|'[^']*'|\"[^\"]*\"", "", line)[:60].strip() or "error"
 
+    async def _check_loop(
+        self,
+        ctx: AgentContext,
+        messages: list[Message],
+        trace: list[dict[str, Any]],
+        *,
+        base_iterations: int | None = None,
+    ) -> LoopVerdict:
+        """Decide whether hitting the iteration cap means "stuck" or just "long".
+
+        Uses the agent's own budget as the inspection window unless a global
+        override is set. Never raises: a failure to judge defaults to "keep
+        going", which is safe because the extension count is bounded.
+        """
+        settings = get_settings()
+        window = settings.agent_loop_check_window or base_iterations or self.max_iterations
+        service = LoopCheckService(ctx.brain, settings)
+        try:
+            return await service.evaluate(
+                agent=self.name,
+                trace=trace,
+                messages=messages,
+                window=window,
+                settings=settings,
+            )
+        except Exception as exc:  # noqa: BLE001 - the check must not break the run
+            log.warning("agent.loop_check_error", agent=self.name, error=str(exc))
+            return LoopVerdict(False, 0.0, "error", f"loop check failed: {exc}", {})
+
     def _compact_history(self, messages: list[Message], window: int) -> list[Message]:
         """Shrink the *content* of older messages once history exceeds ``window``.
 
@@ -545,6 +628,9 @@ class ToolUsingAgent(BaseAgent):
 
     async def _build_initial_messages(self, task: str, ctx: AgentContext) -> list[Message]:
         messages = [Message.system(self.system_prompt)]
+        roster_msg = self._roster_message(ctx)
+        if roster_msg:
+            messages.append(roster_msg)
         context_blobs: list[str] = []
         if ctx.session_context:
             context_blobs.append(ctx.session_context)
@@ -568,11 +654,36 @@ class ToolUsingAgent(BaseAgent):
         log.info(
             "agent.context",
             agent=self.name,
-            system=clip(self.system_prompt, 800),
-            memories=[clip(b, 300) for b in context_blobs],
-            task=clip(task, 1200),
+            system=clip(self.system_prompt),
+            memories=[clip(b) for b in context_blobs],
+            task=clip(task),
         )
         return messages
+
+    def _roster_message(self, ctx: AgentContext) -> Message | None:
+        """Tell the agent who its teammates are so it can stay in its lane.
+
+        The planner already assigns steps to specific agents, but a step's
+        description can drift into a neighboring specialty (e.g. a "coding" step
+        that also asks for a chart). Without knowing other agents exist, an agent
+        just does whatever the task text asks with whatever tools it has, instead
+        of doing its own part and flagging the rest for the right specialist.
+        """
+        catalog = ctx.scratch.get("agent_catalog") or []
+        peers = [a for a in catalog if a.get("name") != self.name]
+        if not peers:
+            return None
+        roster = "\n".join(f"- {a['name']}: {a['role']} — {a['description']}" for a in peers)
+        return Message.system(
+            f"You are the '{self.name}' ({self.role}) on a multi-agent team. Do ONLY the "
+            "part of the task that matches your role above — do not take over work that "
+            "belongs to a teammate just because you happen to have a tool for it.\n"
+            "If the task (or something you discover mid-task) needs a teammate's "
+            "specialty, do your own part and clearly say in your final answer what "
+            "still needs to be done and by which agent (name it) — do not silently do "
+            "it yourself or silently skip it.\n\n"
+            f"TEAMMATES:\n{roster}"
+        )
 
     def _is_approved(
         self, tool_name: str, ctx: AgentContext, arguments: dict[str, Any] | None = None

@@ -13,6 +13,32 @@ from ai_employee.core.trace import clip
 log = get_logger("verifier")
 
 
+def _describe_checked(entry: dict) -> str:
+    parts = [f"{entry['actual_bytes']:,} bytes"]
+    if "actual_lines" in entry:
+        parts.append(f"{entry['actual_lines']:,} lines")
+    if "actual_dimensions" in entry:
+        w, h = entry["actual_dimensions"]
+        parts.append(f"{w}x{h}px")
+    return ", ".join(parts)
+
+
+def _describe_fs(entry: dict) -> str:
+    if not entry.get("exists"):
+        return "does not exist"
+    parts = [str(entry.get("kind"))]
+    if entry.get("git_head"):
+        parts.append(f"HEAD={entry['git_head']}")
+    if entry.get("kind") == "dir":
+        parts.append(f"{entry.get('entry_count', 0)} entries")
+        names = entry.get("entries") or []
+        if names:
+            parts.append("e.g. " + ", ".join(names[:8]))
+    elif entry.get("bytes") is not None:
+        parts.append(f"{entry['bytes']:,} bytes")
+    return ", ".join(parts)
+
+
 class Verdict(BaseModel):
     passed: bool = Field(description="True if the output satisfies the requirement.")
     confidence: float = Field(ge=0.0, le=1.0, description="Confidence in the verdict.")
@@ -33,6 +59,8 @@ class Verifier:
         output: str,
         success_criteria: str = "",
         resource_audit: dict | None = None,
+        artifact_audit: dict | None = None,
+        fs_audit: dict | None = None,
     ) -> Verdict:
         criteria = success_criteria or "The output fully and correctly addresses the task."
         system = (
@@ -41,6 +69,26 @@ class Verifier:
             "claims. Be skeptical: only pass output that is genuinely correct and "
             "complete. Return your verdict as the required JSON."
         )
+        if artifact_audit and artifact_audit.get("applies"):
+            system += (
+                "\n\nGROUND TRUTH: the facts below about files the output mentions were "
+                "measured directly from disk (actual byte size / line count / pixel "
+                "dimensions) — they are not the agent's self-report and cannot be wrong. "
+                "If the output's own prose contradicts a ground-truth fact for a file's "
+                "FINAL state, that is a real defect. But agents sometimes redo a file "
+                "mid-task (e.g. regenerate a chart) and their prose can quote an earlier, "
+                "superseded version alongside the final one — that is sloppy writing, not "
+                "a defect in the deliverable, since ground truth always reflects the file "
+                "as it exists now. Judge which case this is; don't fail solely because the "
+                "prose is internally inconsistent if the ground truth itself checks out.\n"
+                "A date-range shortfall (task asked for N days, the file covers far fewer) "
+                "IS a real defect even if the agent's prose is internally consistent and "
+                "even if the shortfall has a legitimate cause (e.g. a data provider's "
+                "intraday history limit) — the deliverable still doesn't cover what was "
+                "asked. Only pass such a step if the output itself clearly discloses the "
+                "shortfall and the reason for it; fail it if the output presents a partial "
+                "range as if it fully satisfies the request."
+            )
         if resource_audit and resource_audit.get("applies"):
             outcome = resource_audit.get("outcome", "")
             system += (
@@ -60,17 +108,45 @@ class Verifier:
                     "\n\nThe programmatic audit marks this as WAITING_FOR_USER: pass if a "
                     "suitable URL is documented even when the file is not in the workspace yet."
                 )
+        if fs_audit and fs_audit.get("applies"):
+            system += (
+                "\n\nFILESYSTEM GROUND TRUTH: the facts below about paths the output "
+                "mentions were measured directly from disk — whether each path exists, "
+                "its kind, its directory contents, and its resolved git HEAD — they are "
+                "not the agent's self-report and cannot be wrong. If the output claims a "
+                "path exists, is located somewhere, or was created/cloned/checked out "
+                "somewhere that ground truth contradicts, that is a real defect. If the "
+                "output quotes a git commit SHA for a directory, compare it to the "
+                "measured HEAD and flag any mismatch. A path the output correctly says "
+                "does NOT exist is not a defect."
+            )
         user = f"TASK:\n{task}\n\nSUCCESS CRITERIA:\n{criteria}\n\nOUTPUT TO REVIEW:\n{output}"
         if resource_audit and resource_audit.get("issues"):
             user += "\n\nPROGRAMMATIC RESOURCE AUDIT ISSUES:\n" + "\n".join(
                 f"- {issue}" for issue in resource_audit["issues"]
             )
+        if artifact_audit and artifact_audit.get("checked"):
+            user += "\n\nGROUND-TRUTH FILE FACTS (measured directly from disk):\n" + "\n".join(
+                f"- {c['file']}: {_describe_checked(c)}" for c in artifact_audit["checked"]
+            )
+        if fs_audit and fs_audit.get("checked"):
+            user += "\n\nGROUND-TRUTH FILESYSTEM FACTS (measured directly from disk):\n" + "\n".join(
+                f"- {c['path']}: {_describe_fs(c)}" for c in fs_audit["checked"]
+            )
+        if fs_audit and fs_audit.get("issues"):
+            user += "\n\nPROGRAMMATIC FILESYSTEM AUDIT — prose vs. ground truth:\n" + "\n".join(
+                f"- {issue}" for issue in fs_audit["issues"]
+            )
+        if artifact_audit and artifact_audit.get("issues"):
+            user += "\n\nPROGRAMMATIC ARTIFACT AUDIT — prose vs. ground truth:\n" + "\n".join(
+                f"- {issue}" for issue in artifact_audit["issues"]
+            )
         # The verifier's *input*: what it was asked to judge and against what.
         log.info(
             "verifier.input",
-            task=clip(task, 800),
-            criteria=clip(criteria, 400),
-            output=clip(output, 2000),
+            task=clip(task),
+            criteria=clip(criteria),
+            output=clip(output),
         )
         try:
             # phase=verify lets the trace attribute this LLM call to the verifier
@@ -108,7 +184,9 @@ class Verifier:
             "verifier.verdict",
             passed=verdict.passed,
             confidence=verdict.confidence,
-            issues=[clip(i, 300) for i in verdict.issues],
-            suggestion=clip(verdict.suggestion, 500),
+            issues=[clip(i) for i in verdict.issues],
+            suggestion=clip(verdict.suggestion),
+            artifact_audit_issues=(artifact_audit or {}).get("issues") or [],
+            fs_audit_issues=(fs_audit or {}).get("issues") or [],
         )
         return verdict

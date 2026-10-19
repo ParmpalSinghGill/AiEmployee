@@ -6,14 +6,18 @@
 <p align="center">
   <img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg">
   <img alt="Python" src="https://img.shields.io/badge/python-3.12-blue.svg">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-266%20offline-brightgreen.svg">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-333%20offline-brightgreen.svg">
   <img alt="Providers" src="https://img.shields.io/badge/LLM-DeepSeek%20%7C%20OpenAI%20%7C%20Gemini%20%7C%20GLM%20%7C%20local-orange.svg">
 </p>
 
 Most AI tools give you a chat box: you ask, it answers, and you still do the work. This
 framework takes a **high-level goal** and runs it to completion — decomposing it into
-steps, assigning each to one of **29 specialized agents**, calling **24 sandboxed tools**,
-self-reviewing every step, and persisting the whole run so it survives a restart.
+steps executed by the **right specialist agent** for each step (research for finding
+things, coding for code, data_analysis for data, …), calling **24 sandboxed tools**
+(29 with Google Workspace connected), self-reviewing every step, and persisting the
+whole run so it survives a restart. The **29 specialized agents** are chosen by the
+planner per step; the dedicated research/plan pipelines and `ask_agent` run agents
+directly.
 
 The LLM provider is swappable with a **single environment variable** — business logic
 never imports an LLM SDK. It runs **fully offline** out of the box (mock brain +
@@ -47,10 +51,10 @@ your approval before it downloads anything large.
 | Capability | What you get |
 |---|---|
 | **Provider independence** | DeepSeek (default), OpenAI, Gemini, GLM, and a `mock` provider — all behind one `Brain` interface. Swap via `LLM_PROVIDER`. |
-| **Multi-agent** | **29 specialized agents** (CEO, Planner, Scout, Coding, Security, QA, DevOps, …) orchestrated with **LangGraph**. |
+| **Multi-agent** | **29 specialized agents** (CEO, Planner, Scout, Coding, Security, QA, DevOps, …) orchestrated with **LangGraph**. The planner assigns each step to the best-fit agent, so research steps run the research agent and coding steps run the coding agent; the research/plan pipelines use their own specialist teams. |
 | **Parallel execution** | Independent plan steps run **concurrently**; dependent steps wait and start the instant they're unblocked. One toggle in the console. |
-| **Hierarchical planning** | Goal → decomposition → agent assignment → execution → verification → reflection → memory. |
-| **Tools** | **24 sandboxed tools**: filesystem, Python/shell execution, HTTP, web fetch/search, CSV/JSON, hub search (HF/Kaggle/Roboflow/arXiv/GitHub) — with a human-approval gate for sensitive ops. |
+| **Hierarchical planning** | Goal → decomposition → specialist execution → verification → reflection → memory. |
+| **Tools** | **24 sandboxed tools** (29 with Google Workspace): filesystem, Python/shell execution, HTTP, web fetch/search, CSV/JSON, hub search (HF/Kaggle/Roboflow/arXiv/GitHub) — with a human-approval gate for sensitive ops. |
 | **MCP connectors** | Plug in popular **Model Context Protocol** servers from the console — GitHub, Git, Gmail, Google Calendar/Drive/Maps, Slack, Postgres, SQLite, Brave Search, Playwright, Notion, Linear, Sentry, Context7, or any custom stdio/HTTP server. Their tools appear to every agent as `mcp_*` tools, with an optional approval gate per connector. |
 | **Asset reuse** | Downloaded models/datasets are indexed workspace-wide and **never fetched twice** — enforced in the download tool, not just suggested to the model. |
 | **Memory** | Short-term, long-term, conversation, task, knowledge, project, skill — over pgvector or in-memory. |
@@ -78,7 +82,7 @@ your approval before it downloads anything large.
         ▼           ▼          ▼           ▼            ▼
    ┌────────┐  ┌─────────┐ ┌────────┐ ┌─────────┐  ┌──────────┐
    │ Brains │  │ Agents  │ │ Tools  │ │ Memory  │  │Knowledge │
-   │(swap-  │  │(23 spec-│ │(registry│ │(pgvector│  │  (RAG)   │
+   │(swap-  │  │(29 spec-│ │(registry│ │(pgvector│  │  (RAG)   │
    │ pable) │  │ialized) │ │+approval│ │/in-mem) │  │          │
    └────────┘  └─────────┘ └────────┘ └─────────┘  └──────────┘
         │                                  │
@@ -209,7 +213,7 @@ The provider is chosen entirely from configuration (`brains/factory.py`):
 | `mock` | ✓ (offline) | ✓ | ✓ (hash-based) |
 | `deepseek` *(default)* | `deepseek-chat` | `deepseek-reasoner` | — (use `EMBEDDING_PROVIDER`) |
 | `openai` | `gpt-4o` | `o3-mini` | `text-embedding-3-small` |
-| `gemini` | `gemini-1.5-pro` | — | `text-embedding-004` |
+| `gemini` | `gemini-2.5-pro` | — | `gemini-embedding-001` |
 | `glm` | `glm-4-plus` | — | `embedding-3` |
 | `local` | `qwen3:8b` (Ollama) | `qwen3:8b` | `Qwen3-Embedding-8B` |
 
@@ -261,7 +265,7 @@ make format      # black + ruff --fix
 make typecheck   # mypy
 ```
 
-All **266 tests** run offline in seconds — no network, no database, no API keys.
+All **333 tests** run offline in seconds — no network, no database, no API keys.
 
 ---
 
@@ -269,6 +273,9 @@ All **266 tests** run offline in seconds — no network, no database, no API key
 
 | Guide | What's in it |
 |---|---|
+| [docs/how-it-works.md](docs/how-it-works.md) | **The complete, code-verified explanation of the whole system** — every layer, all three orchestrators, the agent loop, tools, memory, RAG, verification, config, and where state lives |
+| [docs/test-scenarios.md](docs/test-scenarios.md) | Realtime acceptance tests — 5 goals graded on agent routing and result quality (`python scripts/run_scenarios.py`) |
+| [docs/resource-isolation.md](docs/resource-isolation.md) | Task ↔ source links, reference-counted deletion, and isolating tasks (shared → private) |
 | [docs/setup.md](docs/setup.md) | Install, configure, first run |
 | [docs/operator-sop.md](docs/operator-sop.md) | Operator SOP for the web console — for non-technical users ([printable HTML](docs/operator-sop.html)) |
 | [docs/agent-flow.md](docs/agent-flow.md) | How a goal becomes a result, step by step |

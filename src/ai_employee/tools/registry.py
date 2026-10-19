@@ -12,7 +12,7 @@ from ai_employee.brains.schemas import ToolSpec
 from ai_employee.config import Settings, get_settings
 from ai_employee.core.exceptions import ApprovalRequired
 from ai_employee.core.logging import get_logger
-from ai_employee.core.trace import clip, clip_obj
+from ai_employee.core.trace import clip_obj, tool_clip
 from ai_employee.tools.base import Tool, ToolResult
 from ai_employee.tools.invocation_history import (
     current_tool_history,
@@ -145,7 +145,7 @@ class ToolRegistry:
             tool=name,
             ok=result.ok,
             latency_ms=result.latency_ms,
-            output=clip(result.as_text()),
+            output=tool_clip(result.as_text()),
             error=result.error,
         )
         if approval_key:  # sensitive op executed — put it on the audit trail

@@ -40,6 +40,20 @@ def get_resource_session() -> str | None:
     return _session_id_var.get()
 
 
+def get_resource_task_id() -> str:
+    """The current run's task id (bound by the task runner), if any.
+
+    Used to link a resource to the *specific* run, not just its session, so the
+    catalog can tell which tasks share a source.
+    """
+    try:
+        import structlog
+
+        return str(structlog.contextvars.get_contextvars().get("task_id") or "")
+    except Exception:  # noqa: BLE001 - never let attribution break a tool call
+        return ""
+
+
 def clear_resource_decision() -> None:
     _decision_var.set(None)
     _approved_ops_var.set(None)
@@ -54,4 +68,5 @@ __all__ = [
     "get_approved_ops",
     "get_resource_decision",
     "get_resource_session",
+    "get_resource_task_id",
 ]

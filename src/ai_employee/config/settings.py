@@ -39,6 +39,29 @@ class EmbeddingProvider(str, Enum):
     local = "local"
 
 
+def parse_agent_limits(spec: str) -> dict[str, int]:
+    """Parse ``"coding=16, research=12"`` → ``{"coding": 16, "research": 12}``.
+
+    Accepts comma- or semicolon-separated ``name=value`` pairs. Names are
+    normalized (lowercased, ``-`` → ``_``); malformed entries are ignored rather
+    than raising, so a typo in ``.env`` can never break startup.
+    """
+    out: dict[str, int] = {}
+    for chunk in (spec or "").replace(";", ",").split(","):
+        chunk = chunk.strip()
+        if not chunk or "=" not in chunk:
+            continue
+        name, _, raw = chunk.partition("=")
+        name = name.strip().lower().replace("-", "_")
+        if not name:
+            continue
+        try:
+            out[name] = max(0, int(float(raw.strip())))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 class Settings(BaseSettings):
     """Strongly-typed, validated runtime configuration.
 
@@ -71,6 +94,13 @@ class Settings(BaseSettings):
     llm_max_tokens: int = 8192
     llm_request_timeout: int = 60
     llm_max_retries: int = 3
+    # Rate limits (HTTP 429 / quota) get their own, longer backoff. A per-minute
+    # quota usually clears within a minute; 6 attempts with a 60s cap means the
+    # step waits instead of failing after a few seconds. Retry-After is honored
+    # when the provider sends it.
+    llm_rate_limit_retries: int = 6
+    llm_rate_limit_base_wait: float = 5.0
+    llm_rate_limit_max_wait: float = 60.0
 
     # ── DeepSeek ─────────────────────────────────────────────────────────────
     deepseek_api_key: str = ""
@@ -87,8 +117,11 @@ class Settings(BaseSettings):
 
     # ── Gemini ───────────────────────────────────────────────────────────────
     google_api_key: str = ""
-    gemini_chat_model: str = "gemini-1.5-pro"
-    gemini_embedding_model: str = "text-embedding-004"
+    # Default is a current stable model. The UI picker (api/ui.py ``_SUGGESTED``)
+    # lists the full current lineup — 2.5 GA, 3.x previews and the -latest aliases
+    # — so any of them can be selected without editing config.
+    gemini_chat_model: str = "gemini-2.5-pro"
+    gemini_embedding_model: str = "gemini-embedding-001"
 
     # ── GLM / Zhipu ──────────────────────────────────────────────────────────
     glm_api_key: str = ""
@@ -242,6 +275,44 @@ class Settings(BaseSettings):
     # Don't re-run a step whose agent refused on policy grounds — the retry would
     # just reproduce the same refusal. Accept-with-note instead.
     no_retry_on_refusal: bool = True
+
+    # ── Loop check: extend-vs-stop when an agent hits its iteration cap ──────
+    # When an agent exhausts max_iterations without answering, a loop check
+    # inspects the recent transcript. If it is genuinely stuck (repeating calls
+    # or making no progress) the step stops; if it is still advancing it gets
+    # another max_iterations window instead of being cut off mid-task.
+    agent_loop_check_enabled: bool = True
+    # Extra max_iterations windows granted when the loop check says "no loop".
+    # Bounds the worst case: total rounds <= max_iterations * (1 + this).
+    agent_loop_extensions_max: int = 2
+    # How many recent transcript entries the check inspects. 0 => the agent's own
+    # max_iterations (e.g. 8 for testing, 12 for coding).
+    agent_loop_check_window: int = 0
+    # Let an ambiguous verdict be decided by a cheap LLM judge call. Skipped
+    # automatically for the mock provider so offline runs stay deterministic.
+    agent_loop_check_llm: bool = True
+    # A tool call (or a repeated read of the same target) repeating this many
+    # times inside the window counts as a definite loop signal. Kept at 4 so a
+    # repeat only counts once it exceeds 3 (2–3 repeats are normal working rhythm).
+    agent_loop_repeat_threshold: int = 4
+    # A short A,B(,C) cycle must repeat at least this many times to count as a
+    # loop — normal edit→test→edit→test repeats twice and must not be flagged.
+    agent_loop_cycle_min_repeats: int = 4
+
+    # ── Per-agent iteration & loop budgets (editable in .env) ────────────────
+    # Base tool rounds an agent gets before its loop check runs. 0 => use each
+    # agent's built-in "max_iterations" (set per agent in agents/specs.py, 7–12).
+    agent_max_iterations: int = 0
+    # Per-agent iteration overrides — name=value, comma-separated. These WIN over
+    # both the global value above and the agent's built-in default.
+    #   AGENT_MAX_ITERATIONS_BY_NAME=coding=24,research=16,planner=4
+    agent_max_iterations_by_name: str = ""
+    # Per-agent loop overrides — how many extra iteration windows the loop check
+    # may grant when it judges the agent "progressing". Falls back to
+    # agent_loop_extensions_max. Total rounds = iterations × (1 + loops).
+    #   AGENT_LOOP_EXTENSIONS_BY_NAME=coding=4,research=2
+    agent_loop_extensions_by_name: str = ""
+
     # Run plan steps that don't depend on each other at the same time. Off by
     # default: sequential execution is easier to follow in the live flow view, and
     # concurrent agents multiply token spend and provider rate-limit pressure.
@@ -271,10 +342,19 @@ class Settings(BaseSettings):
     # received, reasoned, and produced. Adds verbose brain.* events; turn off to
     # quiet the event stream in production.
     explain_trace: bool = True
+    # Per-string cap (chars) for the Explain trace: LLM messages, the step
+    # task/system prompt, and agent answers. 0 = NO truncation (show everything).
+    explain_max_chars: int = 0
+    # Per-string cap (chars) for tool arguments and tool output in the trace.
+    # 0 = NO truncation. Raise/tune from the 🎚 Limits modal or .env.
+    explain_tool_max_chars: int = 0
 
     # ── Persistence (task history + memory, for resume) ──────────────────────
     persist_sessions: bool = True
     sessions_dir: Path = Path("./data/sessions")
+    # Persist guest (no-account) sessions too. Default ON so a restart never loses
+    # the runs you just did; set false to keep guests strictly memory-only.
+    persist_guest_sessions: bool = True
     # Generate a concise, well-formed task title with a small LLM call (vs. raw goal).
     auto_name_tasks: bool = True
 
@@ -299,6 +379,38 @@ class Settings(BaseSettings):
     @property
     def approval_required(self) -> set[str]:
         return {p.strip() for p in self.require_approval_for.split(",") if p.strip()}
+
+    @property
+    def agent_iteration_overrides(self) -> dict[str, int]:
+        """Per-agent base-iteration overrides parsed from the env string."""
+        return parse_agent_limits(self.agent_max_iterations_by_name)
+
+    @property
+    def agent_loop_overrides(self) -> dict[str, int]:
+        """Per-agent loop-extension overrides parsed from the env string."""
+        return parse_agent_limits(self.agent_loop_extensions_by_name)
+
+    def iteration_limit_for(self, agent: str, default: int) -> int:
+        """Base tool rounds for ``agent`` — per-agent override > global > built-in.
+
+        ``AGENT_MAX_ITERATIONS_BY_NAME`` wins, then ``AGENT_MAX_ITERATIONS``, then
+        the agent's own ``max_iterations`` (``default``).
+        """
+        key = (agent or "").strip().lower().replace("-", "_")
+        overrides = self.agent_iteration_overrides
+        if overrides.get(key, 0) > 0:
+            return overrides[key]
+        if self.agent_max_iterations > 0:
+            return self.agent_max_iterations
+        return max(1, int(default))
+
+    def loop_limit_for(self, agent: str) -> int:
+        """Extra loop windows for ``agent`` — per-agent override > global."""
+        key = (agent or "").strip().lower().replace("-", "_")
+        overrides = self.agent_loop_overrides
+        if key in overrides:
+            return overrides[key]
+        return max(0, int(self.agent_loop_extensions_max))
 
     @property
     def is_production(self) -> bool:

@@ -13,6 +13,7 @@ os.environ.setdefault("MEMORY_BACKEND", "memory")
 os.environ.setdefault("WORKSPACE_DIR", "./data/test_workspace")
 os.environ.setdefault("SESSIONS_DIR", "./data/test_sessions")
 os.environ.setdefault("SECRETS_FILE", "./data/test_secrets.json")
+os.environ.setdefault("PERSIST_GUEST_SESSIONS", "false")  # tests assume guests are memory-only
 os.environ.setdefault("USAGE_LEDGER_FILE", "./data/test_usage.jsonl")
 os.environ.setdefault("UI_PREFERENCES_FILE", "./data/test_ui_preferences.json")
 os.environ.setdefault("MCP_CONFIG_FILE", "./data/test_mcp_servers.json")

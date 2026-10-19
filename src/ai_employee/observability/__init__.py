@@ -14,6 +14,7 @@ from ai_employee.observability.tasks import (
     TaskStatus,
     get_task_manager,
 )
+from ai_employee.observability.usage_summary import summarize_usage
 
 __all__ = [
     "TaskManager",
@@ -21,4 +22,5 @@ __all__ = [
     "TaskEvent",
     "TaskStatus",
     "get_task_manager",
+    "summarize_usage",
 ]

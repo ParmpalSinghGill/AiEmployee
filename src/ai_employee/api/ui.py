@@ -49,7 +49,20 @@ _SUGGESTED = {
     "mock": ["mock-1"],
     "deepseek": ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner"],
     "openai": ["gpt-4o", "gpt-4o-mini", "o3-mini"],
-    "gemini": ["gemini-1.5-pro", "gemini-1.5-flash"],
+    "gemini": [
+        # Current chat lineup: newest stable Flash first, then 2.5 GA and previews.
+        "gemini-3.8-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-3.1-pro-preview",
+        "gemini-3-flash-preview",
+        "gemini-pro-latest",
+        "gemini-flash-latest",
+    ],
     "glm": ["glm-4-plus", "glm-4", "glm-4-air"],
     "opencode": ["deepseek-v4-pro", "claude-opus-4-8", "gpt-5.5", "glm-5.2"],
     "local": ["qwen3:8b"],
@@ -106,6 +119,12 @@ class BrainCreditsRequest(BaseModel):
     api_key: str | None = None  # optional override (typed in picker, else stored key)
 
 
+class ModelCheckRequest(BaseModel):
+    provider: str
+    model: str
+    api_key: str | None = None  # optional override (typed in picker, else stored key)
+
+
 class CodingBackendRequest(BaseModel):
     backend: str
     save_default: bool = False
@@ -119,6 +138,20 @@ class MemorySettingsRequest(BaseModel):
 class ParallelSettingsRequest(BaseModel):
     parallel_steps: bool
     max_parallel_steps: int | None = None
+    save_default: bool = False
+
+
+class AgentLimitsRequest(BaseModel):
+    """Per-agent iteration/loop budgets edited from the 🎚 Limits modal."""
+
+    max_iterations: int = 0  # 0 => each agent's built-in default
+    max_iterations_by_name: str = ""  # e.g. "coding=24,research=16"
+    loop_extensions_max: int = 2  # extra windows when the loop check says "progressing"
+    loop_extensions_by_name: str = ""  # e.g. "coding=4"
+    loop_check_enabled: bool = True
+    # Explain-trace text caps (chars). 0 = keep everything (no truncation).
+    explain_max_chars: int = 0
+    explain_tool_max_chars: int = 0
     save_default: bool = False
 
 
@@ -398,6 +431,33 @@ async def brain_credits(req: BrainCreditsRequest) -> dict:
     return await check_brain_credits(get_settings(), req.provider, req.api_key)
 
 
+@router.post("/ui/api/brain/models/check", tags=["ui"])
+async def brain_model_check(req: ModelCheckRequest) -> dict:
+    """Probe the provider's live model list and report whether ``model`` is usable.
+
+    A documented model can still be unavailable to a given key (tier limits,
+    regional rollout, preview gating), so the picker asks the server instead of
+    assuming its suggestion list is callable.
+    """
+    from ai_employee.config.model_checker import check_model
+
+    if req.provider not in {p.value for p in LLMProvider}:
+        raise HTTPException(400, f"unknown provider: {req.provider}")
+    if not (req.model or "").strip():
+        raise HTTPException(400, "model is required")
+    return await check_model(get_settings(), req.provider, req.model.strip(), req.api_key)
+
+
+@router.post("/ui/api/brain/models", tags=["ui"])
+async def brain_model_list(req: BrainCreditsRequest) -> dict:
+    """The provider's live model list (for refreshing the picker on demand)."""
+    from ai_employee.config.model_checker import list_models
+
+    if req.provider not in {p.value for p in LLMProvider}:
+        raise HTTPException(400, f"unknown provider: {req.provider}")
+    return await list_models(get_settings(), req.provider, req.api_key)
+
+
 def _current_model(s) -> str:
     attr = _CHAT_MODEL_ATTR.get(s.llm_provider.value)
     return getattr(s, attr) if attr else s.llm_provider.value
@@ -579,9 +639,7 @@ async def authorize_mcp_server(server_id: str, request: Request) -> dict:
     save_server(s, server_id, enabled=True)  # ensure an entry exists to attach tokens to
     redirect_uri = str(request.base_url).rstrip("/") + "/ui/api/mcp/oauth/callback"
     try:
-        url = await begin_authorization(
-            s, server_id, render_server(spec, {}).url, redirect_uri
-        )
+        url = await begin_authorization(s, server_id, render_server(spec, {}).url, redirect_uri)
     except Exception as exc:  # noqa: BLE001 - surface the reason in the UI
         raise HTTPException(502, f"could not start authorization: {exc}") from exc
     return {"server": server_id, "auth_url": url}
@@ -620,8 +678,7 @@ def _oauth_result_page(ok: bool, message: str) -> HTMLResponse:
     import html as _html
 
     icon, title = ("✅", "Connected") if ok else ("❌", "Authorization failed")
-    return HTMLResponse(
-        f"""<!doctype html><meta charset="utf-8"><title>{title}</title>
+    return HTMLResponse(f"""<!doctype html><meta charset="utf-8"><title>{title}</title>
 <body style="font-family:system-ui;display:grid;place-items:center;height:90vh;margin:0">
 <div style="text-align:center;max-width:32rem">
   <div style="font-size:3rem">{icon}</div>
@@ -629,8 +686,7 @@ def _oauth_result_page(ok: bool, message: str) -> HTMLResponse:
   <p style="color:#888">You can close this window and return to the console.</p>
 </div>
 <script>setTimeout(() => window.close(), {2500 if ok else 15000});</script>
-</body>"""
-    )
+</body>""")
 
 
 # ── Scheduled tasks & watchers (⏰) ──────────────────────────────────────────
@@ -660,9 +716,7 @@ async def patch_schedule(schedule_id: str, req: SchedulePatchRequest) -> dict:
     from ai_employee.observability.schedules import update_schedule
 
     try:
-        return update_schedule(
-            get_settings(), schedule_id, req.model_dump(exclude_none=True)
-        )
+        return update_schedule(get_settings(), schedule_id, req.model_dump(exclude_none=True))
     except KeyError:
         raise HTTPException(404, f"unknown schedule: {schedule_id}") from None
 
@@ -792,9 +846,7 @@ async def google_oauth_callback(
         count = _sync_google_tools(emp)
     except Exception as exc:  # noqa: BLE001 - show the failure in the popup
         return _oauth_result_page(False, str(exc))
-    return _oauth_result_page(
-        True, f"{email} connected — {count} Gmail/Calendar tools are live."
-    )
+    return _oauth_result_page(True, f"{email} connected — {count} Gmail/Calendar tools are live.")
 
 
 @router.delete("/ui/api/google/accounts/{email}", tags=["ui"])
@@ -897,6 +949,33 @@ async def list_sessions(user: CurrentUser = Depends(get_current_user)) -> dict:
     return {"sessions": get_task_manager().list_sessions(owner_id=user.id)}
 
 
+@router.post("/ui/api/sessions/recover", tags=["ui"])
+async def recover_sessions(user: CurrentUser = Depends(get_current_user)) -> dict:
+    """Re-import runs still present in the server log but not saved on disk.
+
+    Recovers a run lost to a restart/crash (guest runs used to be memory-only) as
+    a session owned by the requesting user, so it appears in Saved tasks and its
+    Explain/Logs/Result views render again.
+    """
+    from ai_employee.observability.recover import import_all_new
+    from ai_employee.observability.store import SessionStore
+
+    s = get_settings()
+    log_path = Path(s.sessions_dir).parent / "server.log"
+    if not log_path.exists():
+        return {"imported": [], "count": 0, "log": str(log_path), "note": "no server log found"}
+    store = SessionStore(s.sessions_dir)
+    imported = import_all_new(store, log_path, owner_id=user.id, owner_name=user.name)
+    tm = get_task_manager()
+    for meta, snap in imported:
+        tm.add_saved_session(meta, [snap])
+    return {
+        "imported": [{"session_id": m["id"], "task_id": m["run_ids"][0], "title": m["title"]} for m, _ in imported],
+        "count": len(imported),
+        "log": str(log_path),
+    }
+
+
 @router.get("/ui/api/sessions/{session_id}", tags=["ui"])
 async def get_session(session_id: str, user: CurrentUser = Depends(get_current_user)) -> dict:
     """Full session (meta + every run's snapshot) — used to open/resume a saved task."""
@@ -905,6 +984,117 @@ async def get_session(session_id: str, user: CurrentUser = Depends(get_current_u
     if detail is None or not tm.owned_by(session_id, user.id):
         raise HTTPException(404, "unknown session")
     return detail
+
+
+def _orgchart_from_task(task) -> dict:
+    """Reduce one task's event stream to {active agents, edges, progress}.
+
+    Mirrors the client-side ``deriveFlow`` in app.js: the event stream carries
+    no explicit "agent A -> agent B" message, so activity is inferred from the
+    same fields the Flow tab already relies on (agent.start / workflow.parallel_*
+    / workflow.node), plus the plan's own ``depends_on`` graph for step->step
+    handoffs. Every edge below corresponds to a real information flow, not a
+    standing org-chart line:
+
+    - ``plan -> agent``: the planner has dispatched a step to that agent and it
+      is currently running.
+    - ``agent -> agent``: step B depends on step A (different agents) and B is
+      now running — A's output is literally in B's prompt (see
+      ``Orchestrator._format_prior``), so this is a real handoff, not a guess.
+    - ``agent -> ceo``: that agent's step result is part of the digest the CEO
+      is synthesizing right now.
+    """
+    running_steps: dict[int, str] = {}  # step -> agent, still in flight
+    done_steps = 0
+    planned_steps = 0
+    synth = False
+    ceo_active = False
+    for e in task.get("events", []):
+        f = e.get("fields") or {}
+        ev = e.get("event")
+        if ev in ("planner.plan_ready", "workflow.planned") and f.get("steps") is not None:
+            planned_steps = max(planned_steps, int(f.get("steps") or 0))
+        elif (
+            ev == "workflow.parallel_start" or (ev == "agent.start" and f.get("node") == "execute")
+        ) and f.get("step") is not None:
+            running_steps[f["step"]] = f.get("agent") or "?"
+        elif ev == "workflow.parallel_done" and f.get("step") is not None:
+            running_steps.pop(f["step"], None)
+            done_steps += 1
+        elif ev == "workflow.node" and f.get("node") == "synthesize":
+            synth = True
+            ceo_active = True
+        elif ev == "workflow.node" and f.get("node") == "reflect":
+            ceo_active = False
+
+    completed = task.get("completed_steps") or done_steps
+    planned = task.get("planned_steps") or planned_steps
+    progress = round(100 * completed / planned) if planned else (100 if task.get("result") else 0)
+
+    result = task.get("result") or {}
+    checkpoint = result.get("workflow_checkpoint") or {}
+    plan_steps = (checkpoint.get("plan") or {}).get("steps") or []
+    agent_by_step: dict[int, str] = {s["id"]: s["agent"] for s in plan_steps if s.get("agent")}
+    depends_by_step: dict[int, list[int]] = {
+        s["id"]: list(s.get("depends_on") or []) for s in plan_steps
+    }
+
+    active_agents = {a for a in running_steps.values() if a and a != "?"}
+    edges: list[dict[str, str]] = []
+    seen_pairs: set[tuple[str, str, str]] = set()
+
+    def add_edge(frm: str, to: str, kind: str) -> None:
+        key = (frm, to, kind)
+        if frm and to and frm != to and key not in seen_pairs:
+            seen_pairs.add(key)
+            edges.append({"from": frm, "to": to, "kind": kind})
+
+    for step_id, agent in running_steps.items():
+        if not agent or agent == "?":
+            continue
+        upstream_agents = {
+            agent_by_step[dep] for dep in depends_by_step.get(step_id, []) if dep in agent_by_step
+        }
+        if upstream_agents:
+            # This step's inputs came from other agents' finished work — a real
+            # handoff, not a planner dispatch.
+            for up in sorted(upstream_agents):
+                add_edge(up, agent, "handoff")
+        else:
+            add_edge("planner", agent, "dispatch")
+
+    if synth:
+        # Everyone who has contributed a step result is reporting to the CEO
+        # right now, as part of the synthesis digest.
+        contributors = {r.get("agent") for r in (result.get("steps") or []) if r.get("agent")}
+        for a in sorted(contributors):
+            add_edge(a, "ceo", "report")
+
+    return {
+        "task_id": task.get("id"),
+        "goal": task.get("goal"),
+        "status": task.get("status"),
+        "progress": progress,
+        "active_agents": sorted(active_agents),
+        "ceo_active": ceo_active,
+        "edges": edges,
+    }
+
+
+@router.get("/ui/api/orgchart", tags=["ui"])
+async def orgchart(
+    emp: AIEmployee = Depends(get_employee),
+    user: CurrentUser = Depends(get_current_user),
+) -> dict:
+    """Live org-chart feed: static roster + who's working right now, task by task.
+
+    Powers the CEO-at-top team visualization — polled on the same 1s cadence as
+    the per-task Flow view, since there is no push channel for agent activity.
+    """
+    tm = get_task_manager()
+    roster = emp.agents.catalog()
+    tasks = [_orgchart_from_task(t.snapshot()) for t in tm.running_tasks(owner_id=user.id)]
+    return {"agents": roster, "tasks": tasks}
 
 
 @router.delete("/ui/api/sessions", tags=["ui"])
@@ -916,23 +1106,40 @@ async def delete_all_sessions(
     tm = get_task_manager()
     ids = [s["id"] for s in tm.list_sessions(owner_id=user.id)]
     removed_memory = 0
+    removed_resources = 0
     for sid in ids:
         mem = await emp.clear_session_memory(sid)
         removed_memory += int(mem.get("records_removed") or 0)
+        report = emp.delete_task_resources(session_id=sid, purge=True)
+        removed_resources += len(report.get("deleted", []))
         tm.delete_session(sid)
-    return {"deleted": len(ids), "session_ids": ids, "memory_records_removed": removed_memory}
+    return {
+        "deleted": len(ids),
+        "session_ids": ids,
+        "memory_records_removed": removed_memory,
+        "resources_deleted": removed_resources,
+    }
 
 
 @router.delete("/ui/api/sessions/{session_id}/runs/{task_id}", tags=["ui"])
 async def delete_followup(
-    session_id: str, task_id: str, user: CurrentUser = Depends(get_current_user)
+    session_id: str,
+    task_id: str,
+    emp: AIEmployee = Depends(get_employee),
+    user: CurrentUser = Depends(get_current_user),
 ) -> dict:
     """Delete a single follow-up run. The session's initial task is kept."""
     tm = get_task_manager()
     _require_session(tm, session_id, user)
     if not tm.delete_run(session_id, task_id):
         raise HTTPException(404, "unknown session, run, or cannot delete the initial task")
-    return {"deleted": task_id, "session_id": session_id}
+    report = emp.delete_task_resources(task_id=task_id, purge=True)
+    return {
+        "deleted": task_id,
+        "session_id": session_id,
+        "resources_deleted": len(report.get("deleted", [])),
+        "resources_kept": len(report.get("kept", [])),
+    }
 
 
 @router.delete("/ui/api/sessions/{session_id}", tags=["ui"])
@@ -944,10 +1151,13 @@ async def delete_session(
     tm = get_task_manager()
     _require_session(tm, session_id, user)
     mem = await emp.clear_session_memory(session_id)
+    report = emp.delete_task_resources(session_id=session_id, purge=True)
     tm.delete_session(session_id)
     return {
         "deleted": session_id,
         "memory_records_removed": mem.get("records_removed", 0),
+        "resources_deleted": len(report.get("deleted", [])),
+        "resources_kept": len(report.get("kept", [])),
     }
 
 
@@ -1032,6 +1242,88 @@ async def set_parallel_settings(req: ParallelSettingsRequest) -> dict:
     }
 
 
+def _agent_limits_payload(emp: AIEmployee) -> dict:
+    """Current limits + each tool-using agent's resolved budget (for the modal)."""
+    from ai_employee.agents.base import ToolUsingAgent
+
+    s = get_settings()
+    agents = []
+    for a in emp.agents.all():
+        if not isinstance(a, ToolUsingAgent):
+            continue  # planner/ceo/human_approval don't run the tool loop
+        iters = s.iteration_limit_for(a.name, a.max_iterations)
+        loops = s.loop_limit_for(a.name) if s.agent_loop_check_enabled else 0
+        agents.append(
+            {
+                "name": a.name,
+                "role": getattr(a, "role", ""),
+                "iterations": iters,
+                "loops": loops,
+                "max_rounds": iters * (1 + loops),
+            }
+        )
+    agents.sort(key=lambda r: r["name"])
+    return {
+        "max_iterations": s.agent_max_iterations,
+        "max_iterations_by_name": s.agent_max_iterations_by_name,
+        "loop_extensions_max": s.agent_loop_extensions_max,
+        "loop_extensions_by_name": s.agent_loop_extensions_by_name,
+        "loop_check_enabled": s.agent_loop_check_enabled,
+        "explain_max_chars": s.explain_max_chars,
+        "explain_tool_max_chars": s.explain_tool_max_chars,
+        "agents": agents,
+    }
+
+
+def _normalize_agent_limits(spec: str) -> str:
+    """Canonicalize "coding=16, research=12" → "coding=16,research=12"."""
+    from ai_employee.config.settings import parse_agent_limits
+
+    return ",".join(f"{k}={v}" for k, v in sorted(parse_agent_limits(spec).items()))
+
+
+@router.get("/ui/api/agents/limits", tags=["ui"])
+async def get_agent_limits(emp: AIEmployee = Depends(get_employee)) -> dict:
+    """Per-agent iteration & loop budgets (shown/edited in the 🎚 Limits modal)."""
+    return _agent_limits_payload(emp)
+
+
+@router.post("/ui/api/agents/limits", tags=["ui"])
+async def set_agent_limits(
+    req: AgentLimitsRequest, emp: AIEmployee = Depends(get_employee)
+) -> dict:
+    """Set how many tool rounds and loop extensions each agent may use.
+
+    Per-agent overrides win over the global values, which win over each agent's
+    built-in default. Applied live (the agent loop reads settings per run) and,
+    with ``save_default``, persisted so it survives a restart.
+    """
+    from ai_employee.config.ui_preferences import save_agent_limits
+
+    s = get_settings()
+    s.agent_max_iterations = max(0, int(req.max_iterations))
+    s.agent_max_iterations_by_name = _normalize_agent_limits(req.max_iterations_by_name)
+    s.agent_loop_extensions_max = max(0, int(req.loop_extensions_max))
+    s.agent_loop_extensions_by_name = _normalize_agent_limits(req.loop_extensions_by_name)
+    s.agent_loop_check_enabled = bool(req.loop_check_enabled)
+    s.explain_max_chars = max(0, int(req.explain_max_chars))
+    s.explain_tool_max_chars = max(0, int(req.explain_tool_max_chars))
+    if req.save_default:
+        save_agent_limits(
+            s,
+            max_iterations=s.agent_max_iterations,
+            max_iterations_by_name=s.agent_max_iterations_by_name,
+            loop_extensions_max=s.agent_loop_extensions_max,
+            loop_extensions_by_name=s.agent_loop_extensions_by_name,
+            loop_check_enabled=s.agent_loop_check_enabled,
+            explain_max_chars=s.explain_max_chars,
+            explain_tool_max_chars=s.explain_tool_max_chars,
+        )
+    payload = _agent_limits_payload(emp)
+    payload["saved_default"] = req.save_default
+    return payload
+
+
 @router.post("/ui/api/memory/restore", tags=["ui"])
 async def restore_memories(emp: AIEmployee = Depends(get_employee)) -> dict:
     """Reload memory from the archive saved before the last clear."""
@@ -1039,6 +1331,68 @@ async def restore_memories(emp: AIEmployee = Depends(get_employee)) -> dict:
     if not result.get("restored"):
         raise HTTPException(404, "no memory backup to restore")
     return result
+
+
+# ── Resources: task <-> source links + isolation ─────────────────────────────
+class IsolateRequest(BaseModel):
+    all: bool = False  # isolate every task
+    task_id: str | None = None  # or one run
+    session_id: str | None = None  # or one task/session
+    allow_redownload: bool = True  # re-fetch shared sources whose bytes are gone
+
+
+@router.get("/ui/api/resources", tags=["ui"])
+async def list_resources(emp: AIEmployee = Depends(get_employee)) -> dict:
+    """Every source with the tasks linked to it (task <-> source, both ways)."""
+    return emp.resources_overview()
+
+
+@router.post("/ui/api/resources/isolate", tags=["ui"])
+async def isolate_resources(req: IsolateRequest, emp: AIEmployee = Depends(get_employee)) -> dict:
+    """Isolate tasks so no source stays shared.
+
+    Shared sources are copied into each task's private area; if the shared bytes
+    are gone, ``allow_redownload`` re-fetches them from the recorded URL. Shared
+    records left with no task links are then purged.
+    """
+    return await emp.isolate_resources(
+        all=req.all,
+        task_id=req.task_id,
+        session_id=req.session_id,
+        allow_redownload=req.allow_redownload,
+    )
+
+
+@router.delete("/ui/api/resources/{resource_id}", tags=["ui"])
+async def delete_resource(resource_id: str, emp: AIEmployee = Depends(get_employee)) -> dict:
+    """Delete one source by id (system actor; purges its bytes when unreferenced)."""
+    mgr = emp.resource_manager()
+    deleted = mgr.delete(resource_id, task=None, purge=True)
+    if not deleted:
+        raise HTTPException(404, "unknown resource")
+    return {"deleted": resource_id}
+
+
+class PurgeRequest(BaseModel):
+    purge_bytes: bool = True  # also delete the files on disk
+    wipe_workspace: bool = False  # also delete every other file in the workspace
+
+
+@router.post("/ui/api/resources/purge", tags=["ui"])
+async def purge_resources(
+    req: PurgeRequest | None = None, emp: AIEmployee = Depends(get_employee)
+) -> dict:
+    """Delete **every** resource (and its bytes) for a fresh start.
+
+    Removes all catalog entries, the files/objects they point at, the managed
+    ``shared/`` and ``tasks/`` trees, and the legacy download cache. With
+    ``wipe_workspace`` it also deletes every other file in the workspace
+    (downloads/outputs that were never catalogued). Irreversible.
+    """
+    return emp.purge_resources(
+        purge_bytes=(req.purge_bytes if req else True),
+        wipe_workspace=(req.wipe_workspace if req else False),
+    )
 
 
 @router.post("/ui/api/tasks/{task_id}/cancel", tags=["ui"])
