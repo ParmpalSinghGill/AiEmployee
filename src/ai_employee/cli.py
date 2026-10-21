@@ -43,7 +43,7 @@ def _render_usage(result: dict) -> None:
             table.add_row(
                 a.get("agent", "?"),
                 str(a.get("steps", 0)),
-                str(len(a.get("tools", []))),
+                str(int(a.get("ok", 0)) + int(a.get("failed", 0))),
                 str(a.get("ok", 0)),
                 str(a.get("failed", 0)),
             )
@@ -357,7 +357,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     rec = sub.add_parser("recover-log", help="Recover runs from the server log into Saved tasks")
     rec.add_argument("--log", default=None, help="Path to server.log (default: <data>/server.log).")
-    rec.add_argument("--apply", action="store_true", help="Actually import (default: show what would).")
+    rec.add_argument(
+        "--apply", action="store_true", help="Actually import (default: show what would)."
+    )
     return p
 
 

@@ -7,6 +7,8 @@ types are namespaces, so one consistent API serves them all.
 
 from __future__ import annotations
 
+import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 from ai_employee.brains.base import Brain
@@ -14,6 +16,15 @@ from ai_employee.config import Settings, get_settings
 from ai_employee.core.logging import get_logger
 from ai_employee.memory.base import MemoryNamespace, MemoryRecord, VectorStore
 from ai_employee.memory.in_memory import InMemoryVectorStore
+from ai_employee.memory.skill_policy import (
+    SkillRejectedError,
+    sanitize_skill,
+    skill_name_from_content,
+    skill_rejection_reason,
+    skill_rejection_reason_from_dict,
+    skill_rejection_reason_from_record,
+    skill_slug,
+)
 
 log = get_logger("memory")
 
@@ -67,13 +78,12 @@ class MemoryManager:
     async def remember_skill(
         self, name: str, description: str, steps: list[str], *, tags: list[str] | None = None
     ) -> MemoryRecord:
-        """Store a reusable skill/workflow the employee learned."""
-        content = f"SKILL: {name}\n{description}\nSTEPS:\n" + "\n".join(f"- {s}" for s in steps)
-        return await self.record(
-            content,
-            namespace=MemoryNamespace.skill,
-            metadata={"name": name, "tags": tags or [], "steps": steps},
-        )
+        """Store a reusable skill/workflow the employee learned.
+
+        Sanitizes against task-specific content, deduplicates by title, and raises
+        :class:`SkillRejectedError` when the candidate is not a general skill.
+        """
+        return await self.save_skill(name=name, description=description, steps=steps, tags=tags)
 
     # ── Read ─────────────────────────────────────────────────────────────────
     async def recall(
@@ -100,7 +110,116 @@ class MemoryManager:
         return list(reversed(records))  # chronological order
 
     async def find_skill(self, query: str, *, k: int = 3) -> list[MemoryRecord]:
-        return await self.recall(query, namespace=MemoryNamespace.skill, k=k)
+        """Recall skills for prompt injection, skipping task-specific records."""
+        # Over-fetch so filtering out banned skills still leaves up to ``k``.
+        records = await self.recall(query, namespace=MemoryNamespace.skill, k=max(k * 3, 6))
+        kept = [r for r in records if skill_rejection_reason_from_record(r) is None]
+        return kept[:k]
+
+    async def list_skills(self, *, limit: int = 500) -> list[MemoryRecord]:
+        """Every learned skill, newest first (no semantic query needed)."""
+        return await self._store.recent(MemoryNamespace.skill, limit=limit)
+
+    async def get_skill(self, skill_id: str) -> MemoryRecord | None:
+        for record in await self.list_skills(limit=5000):
+            if record.id == skill_id:
+                return record
+        return None
+
+    async def _find_skill_by_slug(self, slug: str) -> MemoryRecord | None:
+        """Find an existing general skill by canonical title, for deduplication."""
+        if not slug:
+            return None
+        for record in await self.list_skills(limit=5000):
+            name = (record.metadata or {}).get("name") or skill_name_from_content(
+                record.content or ""
+            )
+            if name and skill_slug(str(name)) == slug:
+                return record
+        return None
+
+    async def save_skill(
+        self,
+        *,
+        name: str,
+        description: str,
+        steps: list[str],
+        tags: list[str] | None = None,
+        skill_id: str | None = None,
+    ) -> MemoryRecord:
+        """Create a skill, or replace an existing one while keeping its id.
+
+        Task-specific candidates are rejected with :class:`SkillRejectedError`.
+        General skills are deduplicated by title (an existing skill is updated in
+        place rather than appended). Editing deletes and re-inserts the record so
+        the same code works for the in-memory store and pgvector (whose ``upsert``
+        only inserts).
+        """
+        clean = sanitize_skill(name=name, description=description, steps=steps, tags=tags)
+        if clean is None:
+            reason = skill_rejection_reason(name, description, steps)
+            log.warning("memory.skill_rejected", reason=reason or "task-specific")
+            raise SkillRejectedError(reason or "task-specific skill cannot be saved")
+        name = clean["name"]
+        description = clean["description"]
+        steps = clean["steps"]
+        tags = clean["tags"]
+
+        existing = await self.get_skill(skill_id) if skill_id else None
+        if skill_id and existing is None:
+            raise KeyError(skill_id)
+        if existing is None:
+            existing = await self._find_skill_by_slug(skill_slug(name))
+            if existing is not None:
+                log.info("memory.skill_merged", slug=skill_slug(name), id=existing.id)
+
+        content = f"SKILL: {name}\n{description}\nSTEPS:\n" + "\n".join(f"- {s}" for s in steps)
+        embedding = existing.embedding if existing is not None else None
+        try:
+            embedding = (await self._embedder.embed([content]))[0]
+        except Exception as exc:  # noqa: BLE001 - keep the old vector if embedding fails
+            log.warning("memory.skill_embed_failed", error=str(exc))
+
+        metadata = dict(existing.metadata) if existing is not None else {}
+        metadata.update({"name": name, "tags": tags or [], "steps": steps})
+        record = MemoryRecord(
+            id=existing.id if existing is not None else uuid.uuid4().hex,
+            namespace=MemoryNamespace.skill,
+            content=content,
+            metadata=metadata,
+            session_id=existing.session_id if existing is not None else None,
+            created_at=existing.created_at if existing is not None else datetime.now(UTC),
+            embedding=embedding,
+        )
+        if existing is not None:
+            await self._store.delete([existing.id])
+        await self._store.upsert([record])
+        log.info("memory.skill_saved", id=record.id, updated=existing is not None)
+        return record
+
+    async def purge_task_specific_skills(self) -> int:
+        """Delete every stored skill that fails the task-specific guard.
+
+        Returns the number of records removed so callers can persist the change.
+        """
+        skills = await self.list_skills(limit=100000)
+        bad = [r for r in skills if skill_rejection_reason_from_record(r) is not None]
+        if bad:
+            await self._store.delete([r.id for r in bad])
+            for record in bad:
+                name = (record.metadata or {}).get("name") or skill_name_from_content(
+                    record.content or ""
+                )
+                log.info("memory.skill_purged", id=record.id, name=str(name)[:120])
+        return len(bad)
+
+    async def delete_skill(self, skill_id: str) -> bool:
+        """Delete a skill by id. Returns False when it is not a known skill."""
+        if await self.get_skill(skill_id) is None:
+            return False
+        await self._store.delete([skill_id])
+        log.info("memory.skill_deleted", id=skill_id)
+        return True
 
     async def clear(self, namespace: MemoryNamespace | None = None) -> None:
         await self._store.clear(namespace)
@@ -119,11 +238,28 @@ class MemoryManager:
         return hasattr(self._store, "export_records")
 
     def export_records(self) -> list[dict]:
-        return self._store.export_records() if self.is_persistable else []
+        export = getattr(self._store, "export_records", None)
+        return export() if export is not None else []
 
     def import_records(self, records: list[dict]) -> None:
-        if self.is_persistable:
-            self._store.import_records(records)
+        import_records = getattr(self._store, "import_records", None)
+        if import_records is None:
+            return
+        # Never resurrect a legacy task-specific skill from an old snapshot: the
+        # same policy that guards saves also guards what enters the live store.
+        kept: list[dict] = []
+        dropped = 0
+        for record in records:
+            namespace = record.get("namespace")
+            if namespace == MemoryNamespace.skill.value and (
+                skill_rejection_reason_from_dict(record) is not None
+            ):
+                dropped += 1
+                continue
+            kept.append(record)
+        if dropped:
+            log.info("memory.skills_dropped_on_import", count=dropped)
+        import_records(kept)
 
 
 def build_memory_manager(embedder: Brain, settings: Settings | None = None) -> MemoryManager:

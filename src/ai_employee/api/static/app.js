@@ -2151,6 +2151,9 @@ function openMemoryPicker() {
     <button class="btn mp-restore" style="width:100%;margin-top:8px" ${st.backup_available ? "" : "disabled"}>
       ↩ Restore previous memory (${st.backup_available ? st.backup_records : 0} records)
     </button>
+    <button class="btn mp-skills" style="width:100%;margin-top:8px">
+      💡 Manage learned skills…
+    </button>
     <div class="row">
       <button class="btn mp-cancel">Cancel</button>
       <button class="btn primary mp-apply">Apply</button>
@@ -2168,6 +2171,7 @@ function openMemoryPicker() {
   const saveDefault = $(".mp-save-default", pop);
   saveDefault.checked = typeof st.saved_default === "boolean" ? st.saved_default : false;
   $(".mp-cancel", pop).addEventListener("click", close);
+  $(".mp-skills", pop).addEventListener("click", () => { close(); openSkillsModal(); });
   $(".mp-restore", pop).addEventListener("click", async () => {
     if (!st.backup_available) return;
     if (!confirm("Restore memory from before the last clear?")) return;
@@ -2375,6 +2379,7 @@ async function saveLimits(overlay) {
 $("#clear-memories").addEventListener("click", clearAllMemories);
 $("#restore-memories").addEventListener("click", restoreArchivedMemories);
 $("#memory-badge").addEventListener("click", openMemoryPicker);
+$("#skills-badge").addEventListener("click", openSkillsModal);
 $("#brain-badge").addEventListener("click", openBrainPicker);
 $("#coding-badge").addEventListener("click", openCodingPicker);
 $("#keys-badge").addEventListener("click", openKeysModal);
@@ -2384,6 +2389,151 @@ $("#autonomy-badge").addEventListener("click", openAutonomyModal);
 $("#usage-badge").addEventListener("click", openUsageModal);
 $("#resources-badge").addEventListener("click", openResourcesModal);
 $("#limits-badge").addEventListener("click", openLimitsModal);
+
+/* ── 💡 Learned skills (list / create / edit / delete) ──────────────────── */
+let _skillsModal = null;
+
+function skillWhen(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? "" : d.toLocaleString();
+}
+
+async function openSkillsModal() {
+  if (_skillsModal) return;
+  const overlay = el(`<div class="modal-overlay"><div class="modal skills-modal">
+    <div class="modal-head"><h3>💡 Learned skills</h3><button class="icon-btn modal-close" title="Close">✕</button></div>
+    <p class="modal-sub">Reusable workflows the employee learned after successful runs.
+      Future tasks recall them during planning, so edit a bad skill here or delete it to stop the recall.</p>
+    <div class="skill-toolbar">
+      <button class="btn primary skill-new">＋ New skill</button>
+      <button class="btn skill-refresh">⟳ Refresh</button>
+      <span class="key-status skill-status"></span>
+    </div>
+    <div class="skills-body"></div>
+  </div></div>`);
+  document.body.appendChild(overlay);
+  _skillsModal = overlay;
+  const close = () => { overlay.remove(); _skillsModal = null; };
+  $(".modal-close", overlay).addEventListener("click", close);
+  overlay.addEventListener("click", e => { if (e.target === overlay) close(); });
+  $(".skill-new", overlay).addEventListener("click", () => showSkillEditor(overlay, null));
+  $(".skill-refresh", overlay).addEventListener("click", () => loadSkills(overlay));
+  await loadSkills(overlay);
+}
+
+async function loadSkills(overlay) {
+  const body = $(".skills-body", overlay);
+  const status = $(".skill-status", overlay);
+  body.innerHTML = `<div class="x-muted" style="padding:14px 0"><span class="spin">◌</span> Loading…</div>`;
+  let data;
+  try { data = await api("GET", "/ui/api/skills"); }
+  catch (e) { body.innerHTML = `<div class="key-status err">✗ ${esc(e.message)}</div>`; return; }
+
+  if (!data.skills.length) {
+    body.innerHTML = `<p class="muted">No learned skills yet. They appear here after a successful run
+      (the Reflect step distils one), or you can create one with <b>＋ New skill</b>.</p>`;
+    return;
+  }
+
+  body.innerHTML = data.skills.map(s => {
+    const tags = (s.tags || []).map(t => `<span class="skill-tag">${esc(t)}</span>`).join("");
+    const meta = [
+      skillWhen(s.created_at),
+      s.steps.length ? `${s.steps.length} step${s.steps.length === 1 ? "" : "s"}` : "",
+    ].filter(Boolean).join(" · ");
+    const steps = (s.steps || []).length
+      ? `<ol class="skill-steps">${s.steps.map(x => `<li>${esc(x)}</li>`).join("")}</ol>`
+      : "";
+    return `<div class="skill-card" data-skill-id="${esc(s.id)}">
+      <div class="skill-card-head">
+        <div class="skill-title">
+          <div class="skill-name">${esc(s.name)}</div>
+          <div class="skill-meta">${esc(meta)}</div>
+          ${tags ? `<div class="skill-tags">${tags}</div>` : ""}
+        </div>
+        <div class="skill-actions">
+          <button class="btn skill-edit" title="Edit this skill">✎ Edit</button>
+          <button class="btn skill-del" title="Delete this skill">🗑 Delete</button>
+        </div>
+      </div>
+      ${s.description ? `<div class="skill-desc">${esc(s.description)}</div>` : ""}
+      ${steps}
+    </div>`;
+  }).join("");
+
+  body.querySelectorAll(".skill-card").forEach(card => {
+    const skill = data.skills.find(s => s.id === card.dataset.skillId);
+    if (!skill) return;
+    $(".skill-edit", card).addEventListener("click", () => showSkillEditor(overlay, skill));
+    $(".skill-del", card).addEventListener("click", async () => {
+      if (!confirm(`Delete the skill “${skill.name}”?\n\nFuture tasks will no longer recall it.`)) return;
+      if (status) { status.className = "key-status"; status.textContent = "deleting…"; }
+      try {
+        await api("DELETE", "/ui/api/skills/" + encodeURIComponent(skill.id));
+        if (status) { status.className = "key-status ok"; status.textContent = "✓ deleted"; }
+        await loadSkills(overlay);
+      } catch (e) {
+        if (status) { status.className = "key-status err"; status.textContent = "✗ " + e.message; }
+      }
+    });
+  });
+}
+
+function showSkillEditor(overlay, skill) {
+  const body = $(".skills-body", overlay);
+  body.innerHTML = `<form class="skill-form">
+    <label>Name
+      <input class="skill-f-name" maxlength="200" required value="${esc(skill?.name || "")}"
+             placeholder="e.g. Deploy a Django app" />
+    </label>
+    <label>When to use / description
+      <textarea class="skill-f-desc" rows="3"
+        placeholder="What problem does this skill solve?">${esc(skill?.description || "")}</textarea>
+    </label>
+    <label>Steps — one per line
+      <textarea class="skill-f-steps" rows="7"
+        placeholder="Inspect the repository&#10;Apply the minimal fix&#10;Run the targeted tests">${esc((skill?.steps || []).join("\n"))}</textarea>
+    </label>
+    <label>Tags — comma separated
+      <input class="skill-f-tags" value="${esc((skill?.tags || []).join(", "))}"
+             placeholder="django, testing" />
+    </label>
+    <div class="skill-form-actions">
+      <button type="submit" class="btn primary">${skill ? "Save changes" : "Create skill"}</button>
+      <button type="button" class="btn skill-cancel">Cancel</button>
+      <span class="key-status skill-status"></span>
+    </div>
+  </form>`;
+
+  const form = $(".skill-form", body);
+  const status = $(".skill-status", form);
+  $(".skill-cancel", form).addEventListener("click", () => loadSkills(overlay));
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const name = $(".skill-f-name", form).value.trim();
+    if (!name) { status.className = "key-status err"; status.textContent = "A name is required."; return; }
+    const payload = {
+      name,
+      description: $(".skill-f-desc", form).value.trim(),
+      steps: $(".skill-f-steps", form).value.split("\n").map(x => x.trim()).filter(Boolean),
+      tags: $(".skill-f-tags", form).value.split(",").map(x => x.trim()).filter(Boolean),
+    };
+    const btn = $("button[type=submit]", form);
+    btn.disabled = true;
+    status.className = "key-status"; status.textContent = "saving…";
+    try {
+      if (skill) await api("PUT", "/ui/api/skills/" + encodeURIComponent(skill.id), payload);
+      else await api("POST", "/ui/api/skills", payload);
+      await loadSkills(overlay);
+      const top = $(".skill-status", overlay);
+      if (top) { top.className = "key-status ok"; top.textContent = skill ? "✓ saved" : "✓ created"; }
+    } catch (err) {
+      status.className = "key-status err"; status.textContent = "✗ " + err.message;
+      btn.disabled = false;
+    }
+  });
+}
 
 /* ── 🗂 Resources modal (task <-> source links + Isolate) ─────────────────── */
 let _resModal = null;

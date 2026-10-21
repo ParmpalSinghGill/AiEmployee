@@ -67,6 +67,34 @@ class TaskStatus(str, Enum):
     cancelled = "cancelled"
 
 
+def _executed_steps(result: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Step records the run actually executed (skipped steps are not attempts)."""
+    steps = (result or {}).get("steps")
+    if not isinstance(steps, list):
+        return []
+    return [s for s in steps if isinstance(s, dict) and not s.get("skipped")]
+
+
+def _result_status(result: dict[str, Any] | None) -> TaskStatus:
+    """Terminal status implied by a run result's own evidence.
+
+    A pipeline that returns without a pending approval normally completed, but a
+    run whose every executed step failed verification is a failure even though the
+    graph still synthesizes an answer. This is deliberately evidence-based (and
+    task-agnostic): a single verified step — or no step evidence at all, as with a
+    quick answer — counts as success.
+    """
+    attempted = _executed_steps(result)
+    if attempted and all(step.get("verified") is False for step in attempted):
+        return TaskStatus.failed
+    return TaskStatus.completed
+
+
+def _all_steps_failed_message(result: dict[str, Any] | None) -> str:
+    attempted = _executed_steps(result)
+    return f"all {len(attempted)} executed step(s) failed verification"
+
+
 class TaskEvent(BaseModel):
     seq: int
     ts: str
@@ -177,9 +205,7 @@ class TaskRecord:
         events = [e.model_dump() for e in self.events if e.seq > since]
         cooling = None
         if self.cooling:
-            latest = max(
-                self.cooling.values(), key=lambda c: str(c.get("until") or "")
-            )
+            latest = max(self.cooling.values(), key=lambda c: str(c.get("until") or ""))
             cooling = {**latest, "count": len(self.cooling)}
         return {
             "id": self.id,
@@ -256,7 +282,9 @@ class TaskRecord:
                 if not rec.error:
                     rec.error = "interrupted (resume available)"
             elif rec.result:
-                status = "completed"
+                status = _result_status(rec.result).value
+                if status == "failed" and not rec.error:
+                    rec.error = _all_steps_failed_message(rec.result)
             elif not rec.events:
                 # Queued but never actually ran (process died before it started).
                 # Keep it 'pending' + resumable so startup can relaunch it safely.
@@ -267,6 +295,13 @@ class TaskRecord:
                 status = "failed"
                 if not rec.error:
                     rec.error = "interrupted (process restarted)"
+        # A stored "completed" can still be a failed run: older snapshots marked
+        # any pipeline return as success even when every executed step failed.
+        if status == "completed" and rec.result:
+            derived = _result_status(rec.result)
+            if derived is TaskStatus.failed:
+                status = derived.value
+                rec.error = rec.error or _all_steps_failed_message(rec.result)
         rec.status = TaskStatus(status)
         return rec
 
@@ -572,9 +607,7 @@ class TaskManager:
         from ai_employee.config import get_settings as _get_settings
         from ai_employee.core.usage import track_usage
 
-        budget = task.token_budget or int(
-            getattr(_get_settings(), "task_token_budget", 0) or 0
-        )
+        budget = task.token_budget or int(getattr(_get_settings(), "task_token_budget", 0) or 0)
         _usage_cm = track_usage(budget=budget)
         _meter = _usage_cm.__enter__()
         # Record what the user just approved, inline in the flow/logs/explain, so
@@ -641,7 +674,9 @@ class TaskManager:
                 task.result = result
                 pending = result.get("needs_approval")
                 if not pending:
-                    task.status = TaskStatus.completed
+                    task.status = _result_status(result)
+                    if task.status is TaskStatus.failed and not task.error:
+                        task.error = _all_steps_failed_message(result)
                     break
                 if not task.auto_approve:
                     op = (pending or {}).get("operation")
@@ -673,7 +708,15 @@ class TaskManager:
                     if op == "waiting_for_user"
                     else TaskStatus.awaiting_approval
                 )
-            log.info("task.completed", confidence=(task.result or {}).get("confidence"))
+            if task.status is TaskStatus.completed:
+                log.info("task.completed", confidence=(task.result or {}).get("confidence"))
+            elif task.status is TaskStatus.failed:
+                log.warning(
+                    "task.failed",
+                    error=task.error,
+                    resumable=task.resumable,
+                    all_steps_failed=True,
+                )
         except asyncio.CancelledError:
             # User-requested stop (handle.cancel()). Record it as a terminal
             # state and let the cancellation propagate so the asyncio task ends.
@@ -737,9 +780,7 @@ class TaskManager:
                 click_url=url,
             )
         elif task.status is TaskStatus.completed:
-            push_soon(
-                s, "Task completed", goal, tags="white_check_mark", click_url=url
-            )
+            push_soon(s, "Task completed", goal, tags="white_check_mark", click_url=url)
 
     # ── Auto-naming ──────────────────────────────────────────────────────────
     def _spawn_name(self, employee: Any, task: TaskRecord) -> None:
@@ -837,9 +878,7 @@ class TaskManager:
         """Remove every saved session/task from memory and disk.
 
         With ``owner_id``, only that user's own sessions are removed."""
-        ids = [
-            sid for sid in self._sessions if owner_id is None or self.owned_by(sid, owner_id)
-        ]
+        ids = [sid for sid in self._sessions if owner_id is None or self.owned_by(sid, owner_id)]
         for sid in ids:
             self.delete_session(sid)
         return ids

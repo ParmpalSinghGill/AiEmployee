@@ -8,6 +8,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from ai_employee.tools.base import Tool, ToolResult
+from ai_employee.tools.builtins._internal_state import check_path_access
 from ai_employee.tools.builtins._sandbox import resolve_in_workspace
 
 
@@ -24,6 +25,7 @@ class ReadFileTool(Tool):
         self._ws = workspace
 
     async def _run(self, args: ReadFileTool.Args) -> ToolResult:
+        check_path_access(args.path, self._ws)
         p = resolve_in_workspace(self._ws, args.path, must_exist=True)
         data = p.read_text(encoding="utf-8", errors="replace")[: args.max_bytes]
         return ToolResult(output=data, metadata={"bytes": len(data)})
@@ -77,6 +79,7 @@ class ListDirTool(Tool):
         self._ws = workspace
 
     async def _run(self, args: ListDirTool.Args) -> ToolResult:
+        check_path_access(args.path, self._ws)
         p = resolve_in_workspace(self._ws, args.path, must_exist=True)
         limit = max(1, int(args.max_entries))
 

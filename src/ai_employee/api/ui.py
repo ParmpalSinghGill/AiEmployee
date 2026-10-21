@@ -23,6 +23,8 @@ from ai_employee.api.workspace_files import (
 )
 from ai_employee.config import LLMProvider, get_settings
 from ai_employee.core.employee import AIEmployee
+from ai_employee.memory import MemoryRecord
+from ai_employee.memory.skill_policy import SkillRejectedError
 from ai_employee.observability import get_task_manager
 
 router = APIRouter()
@@ -133,6 +135,15 @@ class CodingBackendRequest(BaseModel):
 class MemorySettingsRequest(BaseModel):
     use_stored_memory: bool
     save_default: bool = False
+
+
+class SkillRequest(BaseModel):
+    """A learned skill, as edited in the 💡 Skills modal."""
+
+    name: str = Field(min_length=1, max_length=200)
+    description: str = Field("", max_length=8000)
+    steps: list[str] = Field(default_factory=list, max_length=100)
+    tags: list[str] = Field(default_factory=list, max_length=30)
 
 
 class ParallelSettingsRequest(BaseModel):
@@ -970,7 +981,10 @@ async def recover_sessions(user: CurrentUser = Depends(get_current_user)) -> dic
     for meta, snap in imported:
         tm.add_saved_session(meta, [snap])
     return {
-        "imported": [{"session_id": m["id"], "task_id": m["run_ids"][0], "title": m["title"]} for m, _ in imported],
+        "imported": [
+            {"session_id": m["id"], "task_id": m["run_ids"][0], "title": m["title"]}
+            for m, _ in imported
+        ],
         "count": len(imported),
         "log": str(log_path),
     }
@@ -1207,6 +1221,117 @@ async def set_memory_settings(req: MemorySettingsRequest) -> dict:
         "use_stored_memory": s.use_stored_memory,
         "saved_default": req.save_default,
     }
+
+
+# ── Learned skills (list / create / edit / delete) ──────────────────────────
+
+
+def _skill_payload(record: MemoryRecord) -> dict:
+    """Expose a skill record as editable fields.
+
+    Metadata is the primary source, but older/imported skills may only have the
+    ``SKILL: ... / STEPS:`` content format. Parse that as a fallback so every
+    skill is editable from the console.
+    """
+    metadata = record.metadata or {}
+    content = record.content or ""
+    lines = content.splitlines()
+    header = lines[0].strip() if lines else ""
+    name = str(metadata.get("name") or "").strip()
+    if not name and header.upper().startswith("SKILL:"):
+        name = header.split(":", 1)[1].strip()
+
+    body = lines[1:] if header.upper().startswith("SKILL:") else lines
+    description_lines: list[str] = []
+    parsed_steps: list[str] = []
+    in_steps = False
+    for line in body:
+        if line.strip().upper() == "STEPS:":
+            in_steps = True
+            continue
+        if in_steps:
+            stripped = line.strip()
+            if stripped:
+                parsed_steps.append(stripped[2:].strip() if stripped.startswith("- ") else stripped)
+        else:
+            description_lines.append(line)
+
+    raw_steps = metadata.get("steps")
+    if isinstance(raw_steps, list):
+        steps = [str(s).strip() for s in raw_steps if str(s).strip()]
+    else:
+        steps = parsed_steps
+    raw_tags = metadata.get("tags")
+    tags = (
+        [str(t).strip() for t in raw_tags if str(t).strip()] if isinstance(raw_tags, list) else []
+    )
+
+    return {
+        "id": record.id,
+        "name": name or "(unnamed skill)",
+        "description": "\n".join(description_lines).strip(),
+        "steps": steps,
+        "tags": tags,
+        "content": content,
+        "created_at": record.created_at.isoformat(),
+    }
+
+
+def _clean_skill(req: SkillRequest) -> tuple[str, str, list[str], list[str]]:
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(422, "skill name is required")
+    steps = [step.strip() for step in req.steps if step.strip()]
+    tags = [tag.strip() for tag in req.tags if tag.strip()]
+    return name, req.description.strip(), steps, tags
+
+
+@router.get("/ui/api/skills", tags=["ui"])
+async def list_skills(emp: AIEmployee = Depends(get_employee)) -> dict:
+    """Every skill the employee has learned, newest first."""
+    records = await emp.memory.list_skills(limit=1000)
+    return {"skills": [_skill_payload(r) for r in records], "count": len(records)}
+
+
+@router.post("/ui/api/skills", tags=["ui"])
+async def create_skill(req: SkillRequest, emp: AIEmployee = Depends(get_employee)) -> dict:
+    """Add a skill manually (or replace the wording of an automated one)."""
+    name, description, steps, tags = _clean_skill(req)
+    try:
+        record = await emp.memory.save_skill(
+            name=name, description=description, steps=steps, tags=tags
+        )
+    except SkillRejectedError as exc:
+        raise HTTPException(422, str(exc)) from None
+    emp.persist_memory()
+    return {"skill": _skill_payload(record), "created": True}
+
+
+@router.put("/ui/api/skills/{skill_id}", tags=["ui"])
+async def update_skill(
+    skill_id: str, req: SkillRequest, emp: AIEmployee = Depends(get_employee)
+) -> dict:
+    """Edit a skill in place; the id (and its recall linkage) is preserved."""
+    name, description, steps, tags = _clean_skill(req)
+    try:
+        record = await emp.memory.save_skill(
+            skill_id=skill_id, name=name, description=description, steps=steps, tags=tags
+        )
+    except KeyError:
+        raise HTTPException(404, "skill not found") from None
+    except SkillRejectedError as exc:
+        raise HTTPException(422, str(exc)) from None
+    emp.persist_memory()
+    return {"skill": _skill_payload(record), "updated": True}
+
+
+@router.delete("/ui/api/skills/{skill_id}", tags=["ui"])
+async def delete_skill(skill_id: str, emp: AIEmployee = Depends(get_employee)) -> dict:
+    """Forget a bad skill so future tasks stop recalling it."""
+    if not await emp.memory.delete_skill(skill_id):
+        raise HTTPException(404, "skill not found")
+    emp.persist_memory()
+    return {"deleted": skill_id}
 
 
 @router.get("/ui/api/parallel/settings", tags=["ui"])

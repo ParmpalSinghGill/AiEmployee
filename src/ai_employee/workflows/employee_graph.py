@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Annotated, Any, TypedDict
@@ -26,6 +27,11 @@ from ai_employee.brains.base import Brain
 from ai_employee.config import get_settings
 from ai_employee.core.logging import bind_context, get_logger
 from ai_employee.memory import MemoryManager, MemoryNamespace
+from ai_employee.memory.skill_policy import (
+    SKILL_EXTRACTION_SYSTEM,
+    SkillDraft,
+    SkillRejectedError,
+)
 from ai_employee.tools.invocation_history import (
     begin_task_tool_history,
     clear_task_tool_history,
@@ -505,7 +511,14 @@ class Orchestrator:
                             "retries": 0,
                             "failed": True,
                         },
-                        trace=[{"node": "execute", "step": step["id"], "error": str(exc)}],
+                        trace=[
+                            {
+                                "node": "execute",
+                                "step": step["id"],
+                                "agent": step["agent"],
+                                "error": str(exc),
+                            }
+                        ],
                     )
 
                 traces.extend(outcome.trace)
@@ -587,7 +600,15 @@ class Orchestrator:
                 }
                 return _StepOutcome(
                     record=skip_record,
-                    trace=[{"node": "execute", "step": step["id"], "skipped": True, "deps": unmet}],
+                    trace=[
+                        {
+                            "node": "execute",
+                            "step": step["id"],
+                            "agent": step["agent"],
+                            "skipped": True,
+                            "deps": unmet,
+                        }
+                    ],
                 )
 
         agent = self._resolve_agent(step["agent"])
@@ -595,6 +616,9 @@ class Orchestrator:
         task = step["description"] + (f"\n\n{prior}" if prior else "")
 
         ctx = self._context(state, {"step_results": results})
+        # Wall-clock start of this step: the filesystem audit uses it to distinguish
+        # a commit made now (changes saved) from a pre-existing clean checkout.
+        step_started = time.time()
         result = await agent.run(task, ctx)
         if (
             not result.needs_approval
@@ -627,7 +651,15 @@ class Orchestrator:
                 return _StepOutcome(
                     halt={
                         "needs_approval": result.needs_approval,
-                        "trace": [{"node": "execute", "step": step["id"], "halted": "approval"}],
+                        "trace": [
+                            {
+                                "node": "execute",
+                                "step": step["id"],
+                                "agent": step["agent"],
+                                "halted": "approval",
+                                "tools": result.tool_trace,
+                            }
+                        ],
                     }
                 )
 
@@ -658,7 +690,13 @@ class Orchestrator:
                     halt={
                         "needs_approval": payload,
                         "trace": [
-                            {"node": "execute", "step": step["id"], "halted": "waiting_for_user"}
+                            {
+                                "node": "execute",
+                                "step": step["id"],
+                                "agent": step["agent"],
+                                "halted": "waiting_for_user",
+                                "tools": result.tool_trace,
+                            }
                         ],
                     }
                 )
@@ -671,7 +709,9 @@ class Orchestrator:
         artifact_audit = audit_artifacts(
             output=result.output, workspace=settings.workspace_dir, task=step["description"]
         )
-        fs_audit = audit_filesystem(output=result.output, workspace=settings.workspace_dir)
+        fs_audit = audit_filesystem(
+            output=result.output, workspace=settings.workspace_dir, since=step_started
+        )
         verdict = await self._verifier.verify(
             task=step["description"],
             output=result.output,
@@ -714,7 +754,9 @@ class Orchestrator:
             artifact_audit = audit_artifacts(
                 output=result.output, workspace=settings.workspace_dir, task=step["description"]
             )
-            fs_audit = audit_filesystem(output=result.output, workspace=settings.workspace_dir)
+            fs_audit = audit_filesystem(
+                output=result.output, workspace=settings.workspace_dir, since=step_started
+            )
             verdict = await self._verifier.verify(
                 task=step["description"],
                 output=result.output,
@@ -803,11 +845,7 @@ class Orchestrator:
                 )
                 plan_steps = state.get("plan", {}).get("steps", [])
                 if len(plan_steps) >= 2:
-                    await self._memory.remember_skill(
-                        name=state["goal"][:60],
-                        description=f"Reusable approach for: {state['goal']}",
-                        steps=[s["description"] for s in plan_steps],
-                    )
+                    await self._remember_general_skill(state)
             except Exception as exc:  # noqa: BLE001
                 log.warning("reflect.memory_failed", error=str(exc))
         else:
@@ -819,6 +857,43 @@ class Orchestrator:
                 use_stored_memory=get_settings().use_stored_memory,
             )
         return {"trace": [{"node": "reflect"}]}
+
+    async def _distill_skill(self, state: EmployeeState) -> SkillDraft | None:
+        """Ask the brain to distill the run into a *general* skill (or none)."""
+        from ai_employee.brains.schemas import Message
+
+        plan_steps = state.get("plan", {}).get("steps", [])
+        steps_txt = "\n".join(
+            f"{i}. {s.get('description', '')}" for i, s in enumerate(plan_steps, 1)
+        )
+        user = (
+            f"GOAL: {state.get('goal', '')}\n\n"
+            f"PLAN:\n{steps_txt}\n\n"
+            f"OUTCOME SUMMARY:\n{state.get('final', '')}"
+        )
+        try:
+            return await self._brain.structured_output(
+                [Message.system(SKILL_EXTRACTION_SYSTEM), Message.user(user)],
+                SkillDraft,
+            )
+        except Exception as exc:  # noqa: BLE001 - distillation is best-effort
+            log.warning("reflect.skill_distill_failed", error=str(exc))
+            return None
+
+    async def _remember_general_skill(self, state: EmployeeState) -> None:
+        draft = await self._distill_skill(state)
+        if not draft or not draft.should_save or not draft.name.strip():
+            log.info("reflect.skill_skipped", reason="no_general_skill")
+            return
+        try:
+            await self._memory.remember_skill(
+                name=draft.name,
+                description=draft.description,
+                steps=draft.steps,
+                tags=draft.tags,
+            )
+        except SkillRejectedError as exc:
+            log.info("reflect.skill_rejected", reason=str(exc))
 
     # ── Routing ──────────────────────────────────────────────────────────────
     @staticmethod
@@ -857,7 +932,7 @@ class Orchestrator:
         """
         by_id = {r.get("id"): r for r in results}
         blocks: list[str] = []
-        for dep in (step.get("depends_on") or []):
+        for dep in step.get("depends_on") or []:
             rec = by_id.get(dep)
             if rec is None or _looks_unusable(rec):
                 continue
@@ -874,8 +949,7 @@ class Orchestrator:
         return (
             "PREREQUISITE STEPS ALREADY COMPLETED — build directly on their results; "
             "do NOT redo or re-reproduce this work. Reuse the files and values they "
-            "reference.\n\n"
-            + "\n\n".join(blocks)
+            "reference.\n\n" + "\n\n".join(blocks)
         )
 
     @staticmethod
@@ -929,9 +1003,7 @@ class Orchestrator:
                 initial: EmployeeState = {
                     "goal": workflow_checkpoint.get("goal") or goal,
                     "session_id": workflow_checkpoint.get("session_id") or session_id,
-                    "base_agent": (
-                        workflow_checkpoint.get("base_agent") or base_agent or ""
-                    ),
+                    "base_agent": (workflow_checkpoint.get("base_agent") or base_agent or ""),
                     "plan": workflow_checkpoint["plan"],
                     "cursor": int(workflow_checkpoint.get("cursor", 0)),
                     "step_results": list(workflow_checkpoint.get("step_results") or []),

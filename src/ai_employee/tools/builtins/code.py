@@ -11,6 +11,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from ai_employee.tools.base import Tool, ToolResult
+from ai_employee.tools.builtins._internal_state import restricted_command
 from ai_employee.tools.builtins._sandbox import ensure_workspace
 
 
@@ -237,6 +238,12 @@ class ShellTool(Tool):
         guard = _block_unbounded_traversal(args.command)
         if guard:
             return ToolResult(ok=False, error=guard)
+        restriction = restricted_command(args.command, self._ws)
+        if restriction:
+            return ToolResult(
+                ok=False,
+                error=f"{restriction.message} Blocked target: {restriction.target}",
+            )
         ws = ensure_workspace(self._ws)
         code, out, err = await _run_subprocess(["bash", "-lc", args.command], ws, args.timeout)
         out = _truncate_output(out)

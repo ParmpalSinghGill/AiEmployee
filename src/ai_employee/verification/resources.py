@@ -17,6 +17,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from ai_employee.core.text_paths import clean_for_path_extraction
 from ai_employee.tools.builtins.resource_download import (
     prioritize_download_urls,
     sanitize_url,
@@ -108,7 +109,10 @@ def _extract_urls(text: str) -> list[str]:
 
 
 def _extract_paths(text: str) -> list[str]:
-    return list(dict.fromkeys(_PATH_RE.findall(text or "")))
+    # URLs and diff headers contain path-shaped substrings ("/org/repo.git",
+    # "a/file.py") that are not local files; strip them before matching.
+    cleaned = clean_for_path_extraction(text or "")
+    return list(dict.fromkeys(_PATH_RE.findall(cleaned)))
 
 
 def _files_from_tool_trace(tool_trace: list[dict[str, Any]]) -> set[str]:

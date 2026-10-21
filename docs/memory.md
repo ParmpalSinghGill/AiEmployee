@@ -18,6 +18,11 @@ All memory is modeled as namespaces over one `VectorStore`, so a single API serv
 `record_message`, `conversation_window`, `remember_skill`, `find_skill`. It embeds on
 write (via the embedder `Brain`) and does cosine semantic search on read.
 
+Learned skills can be reviewed and managed from the Web UI: click **💡 Skills** in the
+top bar (or **Manage learned skills…** in the Memory menu) to list, create, edit, or
+delete them. Saving re-embeds the corrected skill and persists it through the normal
+memory backend, so future tasks recall the fixed version instead of a bad one.
+
 ## Backends
 
 - **In-memory** (`in_memory.py`) — cosine over numpy. Default offline; zero infra.

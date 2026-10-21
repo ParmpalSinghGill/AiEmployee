@@ -211,7 +211,13 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
         system_prompt=(
             "You are an expert software engineer. Read the relevant files first, make "
             "minimal correct changes that match existing style, and verify by running "
-            "code/tests. Never leave the workspace in a broken state.\n\n"
+            "code/tests. Always keep your required code modifications physically saved "
+            "on disk (never revert your working fix or output a diff in prose without "
+            "leaving the actual edits in the files on disk). If a repository's full "
+            "test suite fails due to Python version or environment incompatibilities, "
+            "do NOT revert your fix—instead, verify your logic using a targeted "
+            "standalone script or unit test, clean up any temporary scratch scripts you "
+            "created, and leave your source code edits intact on disk.\n\n"
             "EFFICIENT SHELL USE: consolidate your filesystem investigation into ONE "
             "shell/python_exec script (multi-line is fine) instead of a dozen one-liner "
             "shell calls — each call is a full round-trip. Check paths, git state, "
@@ -325,7 +331,23 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
         system_prompt=(
             "When the team lacks knowledge, you research it, distill an understanding, "
             "and produce a concise reusable skill (name, when-to-use, steps) for future "
-            "tasks. Optimize for reuse, not novelty."
+            "tasks. Optimize for reuse, not novelty.\n\n"
+            "STRICT RULES for creating a skill:\n"
+            "- NEVER create a skill for a specific task instance, bug ticket, commit "
+            "hash, or one-off user question.\n"
+            "- FORBIDDEN in a skill: task/benchmark instance IDs (e.g. "
+            "django__django-11555, scikit-learn__scikit-learn-14053, "
+            "sphinx-doc__sphinx-7454), specific git commit SHAs, issue/PR numbers or "
+            "bug descriptions, the raw user goal/prompt pasted as the title or body, "
+            'and conversational follow-up questions (e.g. "do you update the actual '
+            'code?").\n'
+            "- ALLOWED: general-purpose, reusable workflows scoped to a programming "
+            "language (e.g. Python), a framework/repository family (e.g. how to run "
+            "Django or SymPy tests generally), a dataset/modality type (e.g. tabular "
+            "EDA, JSONL generation), or a tooling pattern.\n"
+            "- If the task only applied existing knowledge to a specific bug and "
+            "yielded no new generalizable workflow, do NOT create or save a skill at "
+            "all."
         ),
     ),
     AgentSpec(
@@ -368,7 +390,15 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
             "When inspecting or setting up a target directory, combine path resolution, "
             "directory listing, `git rev-parse HEAD`, and `git status --porcelain` into a "
             "SINGLE chained shell command rather than multiple round-trips (e.g. "
-            "`pwd && ls -la && git rev-parse HEAD && git status --porcelain`)."
+            "`pwd && ls -la && git rev-parse HEAD && git status --porcelain`).\n"
+            "When a target repository directory already exists in the workspace, "
+            "ALWAYS run `git fetch --all` (if needed), `git reset --hard "
+            "<target_commit>`, and `git clean -fd` so that leftover edits or different "
+            "commits from prior tasks are completely wiped before checking out the "
+            "requested commit.\n"
+            "Focus strictly on the requested git operations (clone, checkout, status, "
+            "diff, commit) in the target repository directory. Do not inspect internal "
+            "application logs or unrelated parent directories."
         ),
     ),
     AgentSpec(

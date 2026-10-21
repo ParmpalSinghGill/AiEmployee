@@ -82,6 +82,82 @@ def test_summarize_usage_agent_from_trace_without_step_record() -> None:
         trace=[{"node": "execute", "step": 1, "agent": "coding", "tools": []}],
     )
     assert [a["agent"] for a in usage["agents_used"]] == ["coding"]
+    # It still counts as one attempted step, not zero.
+    assert usage["agents_used"][0]["steps"] == 1
+
+
+def test_summarize_usage_counts_planner_and_ceo_phases() -> None:
+    """Auxiliary phases are real work; they must not render as "0 steps"."""
+    usage = summarize_usage(
+        step_results=[{"id": 1, "agent": "coding", "verified": True}],
+        trace=[
+            {"node": "plan", "agent": "planner", "steps": 1},
+            {"node": "execute", "step": 1, "agent": "coding", "tools": []},
+            {"node": "synthesize", "agent": "ceo"},
+        ],
+    )
+
+    agents = {a["agent"]: a for a in usage["agents_used"]}
+    assert agents["planner"]["steps"] == 1
+    assert agents["ceo"]["steps"] == 1
+    # A trace entry for a step already counted in step_results is not double-counted.
+    assert agents["coding"]["steps"] == 1
+
+
+def test_summarize_usage_keeps_tools_for_failed_and_halted_steps() -> None:
+    usage = summarize_usage(
+        step_results=[
+            {"id": 1, "agent": "coding", "verified": False},
+            # A halted step has no record; its trace carries the agent + calls.
+        ],
+        trace=[
+            {
+                "node": "execute",
+                "step": 1,
+                "agent": "coding",
+                "verified": False,
+                "tools": [
+                    {"tool": "shell", "ok": True},
+                    {"tool": "shell", "ok": False},
+                ],
+            },
+            {
+                "node": "execute",
+                "step": 2,
+                "agent": "qa",
+                "halted": "approval",
+                "tools": [{"tool": "python_exec", "ok": True}],
+            },
+        ],
+    )
+
+    agents = {a["agent"]: a for a in usage["agents_used"]}
+    assert agents["coding"]["steps"] == 1
+    assert agents["coding"]["tools"] == ["shell"]
+    assert agents["coding"]["ok"] == 1
+    assert agents["coding"]["failed"] == 1
+    assert agents["qa"]["steps"] == 1
+    assert agents["qa"]["tools"] == ["python_exec"]
+    tools = {t["tool"]: t for t in usage["tools_used"]}
+    assert tools["shell"]["calls"] == 2
+    assert tools["python_exec"]["agents"] == ["qa"]
+
+
+def test_summarize_usage_accepts_tool_trace_key() -> None:
+    """Older snapshots may name the per-step key ``tool_trace``."""
+    usage = summarize_usage(
+        step_results=[{"id": 1, "agent": "coding", "verified": False}],
+        trace=[
+            {
+                "node": "execute",
+                "step": 1,
+                "agent": "coding",
+                "tool_trace": [{"tool": "read_file", "ok": True}],
+            }
+        ],
+    )
+    assert usage["tools_used"][0]["tool"] == "read_file"
+    assert usage["tools_used"][0]["agents"] == ["coding"]
 
 
 async def test_run_result_includes_usage(employee) -> None:

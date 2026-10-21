@@ -7,6 +7,7 @@ validated Pydantic object regardless of provider.
 
 from __future__ import annotations
 
+import re
 from typing import Literal
 
 from pydantic import BaseModel, Field, create_model
@@ -14,6 +15,7 @@ from pydantic import BaseModel, Field, create_model
 from ai_employee.brains.base import Brain
 from ai_employee.brains.schemas import Message
 from ai_employee.core.logging import get_logger
+from ai_employee.core.text_paths import strip_urls
 from ai_employee.core.trace import clip
 
 log = get_logger("planner")
@@ -131,10 +133,51 @@ def _has_cycle(by_id: dict[int, PlanStep]) -> bool:
 #: when the model chose `research` — a model that already picked a specialist is
 #: never overridden here.
 _GENERIC_OVERRIDES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("testing", ("regression test", "test suite", "runtests", "write test", "add test", "run test", "tests pass")),
-    ("git", ("git clone", "git checkout", "git commit", "git diff", "git status", "git rev-parse", "clone", "check out", "checkout")),
-    ("coding", ("implement", "fix", "patch", "refactor", "debug", "reproduce", "reproduction", "write code", "modify", "script")),
-    ("data_analysis", ("eda", "kpi", "pandas", "chart", "plot", "csv", "data analysis", "profiling")),
+    (
+        "testing",
+        (
+            "regression test",
+            "test suite",
+            "runtests",
+            "write test",
+            "add test",
+            "run test",
+            "tests pass",
+        ),
+    ),
+    (
+        "git",
+        (
+            "git clone",
+            "git checkout",
+            "git commit",
+            "git diff",
+            "git status",
+            "git rev-parse",
+            "clone",
+            "check out",
+            "checkout",
+        ),
+    ),
+    (
+        "coding",
+        (
+            "implement",
+            "fix",
+            "patch",
+            "refactor",
+            "debug",
+            "reproduce",
+            "reproduction",
+            "write code",
+            "modify",
+            "script",
+        ),
+    ),
+    (
+        "data_analysis",
+        ("eda", "kpi", "pandas", "chart", "plot", "csv", "data analysis", "profiling"),
+    ),
     ("documentation", ("readme", "writeup", "write up", "documentation")),
     ("devops", ("docker", "deploy", "kubernetes", "ci/cd")),
 )
@@ -155,6 +198,210 @@ def _correct_generic_assignment(description: str, agent: str, valid: set[str]) -
         if target in valid and any(k in d for k in keywords):
             return target
     return agent
+
+
+#: Deterministic routing vocabulary. `scout` is for public hubs (models,
+#: datasets, papers) — never for a local checkout. These patterns detect when a
+#: step's wording is actually local code/repo work so the planner can repair the
+#: assignment even when the model ignored the prompt.
+_GIT_OP_RE = re.compile(
+    r"\b(?:"
+    r"git\s+(?:clone|check-?out|commit|diff|status|fetch|reset|clean|"
+    r"rev-parse|log|show|branch|pull|push)|"
+    r"clone|check-?out|check\s+out|commit|diff"
+    r")\b",
+    re.I,
+)
+_GIT_HEAD_RE = re.compile(r"\bHEAD\b")  # case-sensitive: git's commit pointer
+_GIT_SETUP_RE = re.compile(r"\b(?:clone|check-?out|check\s+out)\b", re.I)
+_CODE_EXT = (
+    r"(?:py|pyi|js|mjs|cjs|ts|tsx|jsx|java|kt|kts|go|rs|c|cc|cpp|cxx|h|hh|hpp|"
+    r"rb|php|cs|scala|swift|m|mm|sh|bash|zsh|ps1|sql|ipynb|json|ya?ml|toml|ini|"
+    r"cfg|conf|gradle|xml|html|css|scss|sass|less|vue|svelte)"
+)
+_LOCAL_PATH_RE = re.compile(
+    rf"(?:"
+    rf"(?:^|[\s'\"(])(?:\.{{1,2}}/|~/|/[\w.@+-]+/)"
+    rf"|[\w.@+-]+\.{_CODE_EXT}\b"
+    rf"|(?:^|[\s'\"(])"
+    rf"(?:src|lib|app|pkg|packages?|tests?|scripts?|modules?|cmd|bin|core|utils|"
+    rf"services?|components?|internal)/[\w.@+-]+"
+    rf")",
+    re.I,
+)
+_SCOUT_INSPECT_RE = re.compile(
+    r"\b(?:locate|inspect|examine|identify|find|search|grep|read|analy[sz]e|"
+    r"trace|diagnose|investigate|debug|reproducer|reproduce|function|method|bug)\b",
+    re.I,
+)
+_LOCAL_CONTEXT_RE = re.compile(
+    r"\b(?:local|code|source|file|repo|repository|workspace|project|module|"
+    r"script|test|tests|traceback|stack\s+trace|root[\s-]+cause|parser|compiler|"
+    r"implementation|bug|function|method)\b",
+    re.I,
+)
+_EXTERNAL_RESOURCE_RE = re.compile(
+    r"\b(?:dataset|datasets|paper|papers|huggingface|kaggle|arxiv|hub|"
+    r"benchmark|leaderboard|function[\s-]+calling)\b",
+    re.I,
+)
+_EDIT_RE = re.compile(
+    r"\b(?:implement|fix|patch|edit|modify|change|refactor|apply|update|write|"
+    r"add|remove|replace|create|delete|rename|move)\b",
+    re.I,
+)
+
+
+def _first_valid(targets: tuple[str, ...], valid: set[str]) -> str | None:
+    return next((target for target in targets if target in valid), None)
+
+
+def _has_git_op(text: str) -> bool:
+    return bool(_GIT_OP_RE.search(text) or _GIT_HEAD_RE.search(text))
+
+
+def _looks_like_code_work(text: str) -> bool:
+    """True when wording describes local code work rather than a public-hub lookup."""
+    if _EDIT_RE.search(text) or _LOCAL_PATH_RE.search(text):
+        return True
+    if _SCOUT_INSPECT_RE.search(text) and _LOCAL_CONTEXT_RE.search(text):
+        # "find a paper about function calling" / "find a bug-fix dataset" are
+        # external-resource searches, not local source inspection.
+        return not bool(_EXTERNAL_RESOURCE_RE.search(text))
+    return False
+
+
+def _scout_target(text: str, valid: set[str]) -> str | None:
+    """Pick the specialist a misrouted `scout` step should use, if any."""
+    has_git = _has_git_op(text)
+    has_inspect = bool(_SCOUT_INSPECT_RE.search(text))
+    code_work = _looks_like_code_work(text)
+    if has_git and not (has_inspect or code_work):
+        # A pure clone/checkout/fetch is version-control work.
+        return _first_valid(("git", "coding"), valid)
+    if has_git or code_work:
+        return _first_valid(("coding", "git"), valid)
+    return None
+
+
+def _is_inspection_only(description: str) -> bool:
+    text = strip_urls(description or "")
+    return bool(_SCOUT_INSPECT_RE.search(text)) and not bool(_EDIT_RE.search(text))
+
+
+def _is_implementation(description: str) -> bool:
+    return bool(_EDIT_RE.search(strip_urls(description or "")))
+
+
+def _merge_steps(inspect: PlanStep, implement: PlanStep, steps: list[PlanStep]) -> None:
+    """Fold an inspection-only step into the coding step that implements the fix."""
+    kept_id, merged_id = implement.id, inspect.id
+    inspect_desc = inspect.description.strip().rstrip(".")
+    impl_desc = implement.description.strip()
+    if inspect_desc and inspect_desc.lower() not in impl_desc.lower():
+        implement.description = f"{inspect_desc}; then {impl_desc}"
+    criteria = [
+        c.strip() for c in (inspect.success_criteria, implement.success_criteria) if c and c.strip()
+    ]
+    implement.success_criteria = "; ".join(dict.fromkeys(criteria))
+    deps = [*implement.depends_on, *inspect.depends_on]
+    implement.depends_on = sorted({d for d in deps if d not in {inspect.id, implement.id}})
+    steps.remove(inspect)
+    for step in steps:
+        if inspect.id in step.depends_on:
+            step.depends_on = [
+                implement.id if dep == inspect.id else dep for dep in step.depends_on
+            ]
+            step.depends_on = list(dict.fromkeys(step.depends_on))
+    _renumber_steps(steps)
+    log.info(
+        "planner.merged_inspection_step",
+        kept_step=kept_id,
+        merged_step=merged_id,
+        description=clip(implement.description, 300),
+    )
+
+
+def _renumber_steps(steps: list[PlanStep]) -> None:
+    """Re-number steps contiguously and remap dependency ids after a merge."""
+    mapping = {step.id: new_id for new_id, step in enumerate(steps, start=1)}
+    for new_id, step in enumerate(steps, start=1):
+        old_id = step.id
+        step.id = new_id
+        step.depends_on = sorted(
+            {mapping[dep] for dep in step.depends_on if dep in mapping and dep != old_id}
+        )
+
+
+def _collapse_inspection_then_fix(steps: list[PlanStep]) -> None:
+    """Merge adjacent/dependent "locate" + "implement" coding steps.
+
+    Splitting exploration and editing across two coding steps makes the first one
+    stop at a report and the second one start without the discovery context. One
+    coding pass owning both is both cheaper and less likely to lose the thread.
+    """
+    ordered = sorted(steps, key=lambda s: s.id)
+    for index, inspect in enumerate(list(ordered)):
+        if inspect not in steps:
+            continue
+        if inspect.agent != "coding" or not _is_inspection_only(inspect.description):
+            continue
+        for offset, implement in enumerate(ordered[index + 1 :], start=index + 1):
+            if implement not in steps:
+                continue
+            if implement.agent != "coding" or not _is_implementation(implement.description):
+                continue
+            adjacent = offset == index + 1
+            if adjacent or inspect.id in implement.depends_on:
+                _merge_steps(inspect, implement, steps)
+            break
+
+
+def normalize_plan_routing(plan: Plan, valid_names: set[str]) -> Plan:
+    """Repair specialist routing the LLM got wrong, deterministically.
+
+    * A first-step repo clone/checkout assigned to `scout` or `devops` → `git`.
+    * `scout` on local paths, git operations, or local code inspection → `coding`
+      (pure clone/checkout → `git`).
+    * A coding "locate/inspect" step followed by a coding "implement" step is
+      collapsed into one step so the same agent owns discovery and editing.
+    """
+    if not plan.steps:
+        return plan
+
+    ordered = sorted(plan.steps, key=lambda s: s.id)
+    first_id = ordered[0].id
+    for step in ordered:
+        original = step.agent
+        text = strip_urls(step.description or "")
+
+        # Rule 1: the first step that sets up a repo belongs to the git agent.
+        if (
+            step.id == first_id
+            and step.agent in {"scout", "devops"}
+            and _GIT_SETUP_RE.search(text)
+            and "git" in valid_names
+        ):
+            step.agent = "git"
+
+        # Rule 2: `scout` is strictly for external public-hub resources.
+        if step.agent == "scout":
+            target = _scout_target(text, valid_names)
+            if target:
+                step.agent = target
+
+        if step.agent != original:
+            log.info(
+                "planner.rerouted_agent",
+                step=step.id,
+                from_agent=original,
+                to_agent=step.agent,
+                reason="repo_setup" if step.agent == "git" else "local_code",
+            )
+
+    # Rule 3: collapse redundant local inspection + implementation steps.
+    _collapse_inspection_then_fix(plan.steps)
+    return plan
 
 
 def _plan_schema_for(valid_names: list[str]) -> type[BaseModel]:
@@ -229,16 +476,14 @@ class Planner:
                 if a["name"] == pinned
             )
         # The planner's *input*: the goal, and the agents it may delegate to.
-        log.info(
-            "planner.input", goal=clip(goal), agents=sorted(valid_names), base_agent=pinned
-        )
+        log.info("planner.input", goal=clip(goal), agents=sorted(valid_names), base_agent=pinned)
 
         pin_rule = ""
         if pinned:
             pin_rule = (
                 f"AGENT PINNING — this run is pinned to `{pinned}`. Assign EVERY "
                 f"step to `{pinned}`: the `agent` field must be exactly "
-                f"\"{pinned}\". Split the work into steps, not across agents, and "
+                f'"{pinned}". Split the work into steps, not across agents, and '
                 f"plan only work that agent can do with its own tools. Do not route "
                 f"any step to another agent.\n\n"
             )
@@ -260,8 +505,21 @@ class Planner:
             "- Cloning/checking out/committing → `git`.\n"
             "- Dataset analysis/EDA/charts → `data_analysis`.\n"
             "- Writing docs/READMEs → `documentation`.\n"
-            "- Finding models/datasets/papers (ML resources) → `scout` or `research`.\n"
+            "- Finding external ML models/datasets/papers on public hubs → `scout` or "
+            "`research`. `scout` is STRICTLY for external public-hub resources — "
+            "NEVER use it to inspect, read, grep, or debug local source-code files "
+            "in a repository; local code is always `coding`.\n"
+            "- Diagnosing and fixing a bug (or implementing a feature) in a LOCAL "
+            "codebase: combine code exploration, root-cause diagnosis, and code "
+            "editing into a SINGLE `coding` step. Do NOT split exploration or "
+            "diagnosis across separate agents.\n"
             "Do not fall back to `research` for code or test work.\n\n"
+            "FILE PATHS IN STEPS — NEVER guess, invent, or hardcode specific source "
+            "file paths or function names in step descriptions unless the user's "
+            "prompt explicitly named them. Instruct the `coding` agent to search and "
+            "identify the root-cause files itself based on the actual behavior and "
+            "stack trace. A guessed path locks the coding agent into the wrong file; "
+            "describe the behavior/symptom instead and let it locate the source.\n\n"
             "PURE QUESTIONS: a goal that is a simple factual question and asks for "
             "no deliverable (e.g. 'do you update the actual code?', 'what is X?', "
             "'why did Y fail?', 'how does Z work?') is a SINGLE step assigned to "
@@ -351,7 +609,7 @@ class Planner:
             # pinned run none of them execute, so close with an explicit override.
             system += (
                 f"\n\nFINAL REMINDER: this run is pinned to `{pinned}`. Every step's "
-                f"`agent` MUST be \"{pinned}\"; ignore any rule above that assigns a "
+                f'`agent` MUST be "{pinned}"; ignore any rule above that assigns a '
                 f"step to a different agent. Describe each step as work `{pinned}` "
                 f"itself will carry out, and keep the plan within its tools."
             )
@@ -389,6 +647,10 @@ class Planner:
                     )
                     resolved = corrected
             step.agent = resolved
+        # Deterministic safety net for the routing the prompt could not enforce.
+        # Pinned runs are authoritative and must never drift to another agent.
+        if not pinned:
+            normalize_plan_routing(plan, valid_names)
         if not plan.steps:
             default_agent = pinned or (
                 "research" if "research" in valid_names else sorted(valid_names)[0]

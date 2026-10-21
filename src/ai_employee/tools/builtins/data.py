@@ -8,6 +8,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from ai_employee.tools.base import Tool, ToolResult
+from ai_employee.tools.builtins._internal_state import check_path_access
 from ai_employee.tools.builtins._sandbox import resolve_in_workspace
 
 # utf-8-sig covers BOM and plain UTF-8. cp1252/latin-1 cover Superstore-style
@@ -48,6 +49,7 @@ class CsvPreviewTool(Tool):
     async def _run(self, args: CsvPreviewTool.Args) -> ToolResult:
         import csv
 
+        check_path_access(args.path, self._ws)
         p = resolve_in_workspace(self._ws, args.path, must_exist=True)
         encoding = detect_text_encoding(p)
         with p.open(newline="", encoding=encoding) as fh:

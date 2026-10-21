@@ -814,6 +814,45 @@ body {
 }
 .key-status.ok { color: var(--green, #6c6); }
 
+/* ── 💡 Learned skills modal ─────────────────────────────────────────────── */
+.skills-modal { max-width: 780px; }
+.skill-toolbar { display: flex; align-items: center; gap: 8px; padding: 12px 18px 0; flex-wrap: wrap; }
+.skill-toolbar .skill-status { flex: 1; }
+.skills-body { padding: 4px 18px 18px; overflow-y: auto; }
+.skill-card {
+  border: 1px solid var(--line); border-radius: 10px; background: var(--bg-3);
+  padding: 10px 12px; margin-top: 10px;
+}
+.skill-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.skill-title { min-width: 0; }
+.skill-name { font-size: 13.5px; font-weight: 600; line-height: 1.35; overflow-wrap: anywhere; }
+.skill-meta { color: var(--muted); font-size: 11px; margin-top: 2px; }
+.skill-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
+.skill-tag {
+  font-size: 10px; color: var(--accent-2); border: 1px solid var(--line);
+  border-radius: 999px; padding: 1px 7px;
+}
+.skill-actions { display: flex; gap: 6px; flex: none; }
+.skill-actions .btn { padding: 4px 8px; font-size: 11.5px; }
+.skill-desc { margin-top: 8px; font-size: 12.5px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
+.skill-steps {
+  margin: 7px 0 0; padding-left: 18px; color: var(--muted); font-size: 12px;
+  line-height: 1.45; display: flex; flex-direction: column; gap: 3px;
+}
+.skill-steps li { overflow-wrap: anywhere; }
+.skill-del { color: var(--red); }
+.skill-del:hover:not(:disabled) { border-color: var(--red); }
+.skill-form { display: flex; flex-direction: column; gap: 10px; padding-top: 6px; }
+.skill-form label { display: flex; flex-direction: column; gap: 4px; color: var(--muted); font-size: 11px; }
+.skill-form input, .skill-form textarea {
+  width: 100%; box-sizing: border-box; background: var(--bg-3); border: 1px solid var(--line);
+  color: var(--text); border-radius: 8px; padding: 8px 10px; font-size: 13px; font-family: inherit;
+}
+.skill-form textarea { resize: vertical; min-height: 64px; line-height: 1.45; }
+.skill-form input:focus, .skill-form textarea:focus { outline: none; border-color: var(--accent-2); }
+.skill-form-actions { display: flex; align-items: center; gap: 8px; }
+.skill-form-actions .skill-status { flex: 1; }
+
 /* ── 🗂 Resources modal (task <-> source links) ─────────────────────────── */
 .resources-modal { max-width: 780px; }
 .res-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 4px; }

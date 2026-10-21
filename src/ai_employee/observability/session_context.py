@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from ai_employee.config import get_settings
+from ai_employee.core.text_paths import clean_for_path_extraction
 
 _URL_RE = re.compile(r"https?://[^\s<>\"')\]]+")
 _TRAILING_PUNCT = re.compile(r"[.,;:!?)}\]]+$")
@@ -59,9 +60,12 @@ def extract_urls(text: str) -> list[str]:
 def extract_paths(text: str) -> list[str]:
     if not text:
         return []
+    # Do not treat URL path components or git diff "a/"/"b/" headers as local
+    # files — they are not download targets and must not appear as missing.
+    cleaned = clean_for_path_extraction(text)
     out: list[str] = []
     seen: set[str] = set()
-    for raw in _PATH_RE.findall(text):
+    for raw in _PATH_RE.findall(cleaned):
         p = raw.strip().rstrip("`")
         if p and p not in seen:
             seen.add(p)

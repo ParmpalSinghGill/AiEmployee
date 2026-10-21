@@ -80,6 +80,11 @@ def summarize_usage(
     """
     agents: dict[str, dict[str, Any]] = {}
     tools: dict[str, dict[str, Any]] = {}
+    # Step ids already counted from ``step_results`` so a matching execute trace
+    # entry does not count the same step twice.
+    counted_steps: set[Any] = set()
+    # Auxiliary phases (plan / synthesize) have no step id; count each once.
+    counted_phases: set[tuple[str, str]] = set()
 
     # 1. Planned steps → one count per agent, and capture any per-step tool trace
     #    a caller attached directly to the record.
@@ -89,10 +94,13 @@ def summarize_usage(
             continue
         entry = _agent_entry(agents, name)
         entry["steps"] += 1
+        step_id = record.get("id")
+        if step_id is not None:
+            counted_steps.add(step_id)
         if record.get("skipped"):
             continue
         _accumulate_tool_trace(
-            record.get("tool_trace"),
+            record.get("tool_trace") or record.get("tools"),
             agent=name,
             tools=tools,
             agents=agents,
@@ -100,14 +108,25 @@ def summarize_usage(
 
     # 2. Execute-node trace → tool calls attributed to the running agent. Steps
     #    that halted before producing a record (e.g. approval gate) still show up
-    #    here, which is exactly when an operator wants to see what ran.
+    #    here, which is exactly when an operator wants to see what ran. A trace
+    #    entry for a step without a record also counts as one attempted step.
     for entry in trace or []:
         name = entry.get("agent")
+        step_id = entry.get("step")
         if name:
-            # Register the agent even when it made no tool calls (planner, ceo).
-            _agent_entry(agents, name)
+            if step_id is None:
+                key = (name, str(entry.get("node") or ""))
+                if key not in counted_phases:
+                    counted_phases.add(key)
+                    _agent_entry(agents, name)["steps"] += 1
+            elif step_id not in counted_steps:
+                counted_steps.add(step_id)
+                _agent_entry(agents, name)["steps"] += 1
+            else:
+                # Register the agent even when it made no tool calls.
+                _agent_entry(agents, name)
         _accumulate_tool_trace(
-            entry.get("tools"),
+            entry.get("tools") or entry.get("tool_trace"),
             agent=name,
             tools=tools,
             agents=agents,

@@ -29,6 +29,12 @@ def _describe_fs(entry: dict) -> str:
     parts = [str(entry.get("kind"))]
     if entry.get("git_head"):
         parts.append(f"HEAD={entry['git_head']}")
+    if entry.get("git_status"):
+        parts.append(f"git status: {entry['git_status']}")
+    if entry.get("git_diff_stat"):
+        parts.append(f"git diff: {entry['git_diff_stat']}")
+    if entry.get("git_staged_stat"):
+        parts.append(f"git staged: {entry['git_staged_stat']}")
     if entry.get("kind") == "dir":
         parts.append(f"{entry.get('entry_count', 0)} entries")
         names = entry.get("entries") or []
