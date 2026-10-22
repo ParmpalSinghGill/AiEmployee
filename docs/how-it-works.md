@@ -255,7 +255,7 @@ It logs `employee.ready` with the agent and tool counts.
 | `await run(goal, *, session_id, approved_ops, resource_decision, workflow_checkpoint, session_context, base_agent, on_progress)` | The full pipeline. `base_agent` is **opt-in**: pass a name to pin every step to one agent; leave it `None` (default) for the normal multi-agent run where the planner assigns each step to the best specialist. The **model is frozen per run**: the brain selected when the run is launched is used by every agent in it, and switching the brain for a later task never affects a run that is still executing. Returns `{goal, base_agent, brain_provider, brain_model, answer, confidence, plan, steps, tokens, needs_approval, trace, workflow_checkpoint}`. |
 | `await research(goal, *, auto_run)` | The ML research decision tree (see §5.3). |
 | `await plan(goal)` | The how-to guide (see §5.2). |
-| `await download(goal, *, approved_ops, resource_decision)` | Runs the `resource_downloader` agent directly on URLs in the goal (normalizes a bare URL into a download task). |
+| `await download(goal, *, approved_ops, resource_decision)` | Runs the `research` agent directly on URLs in the goal, with a "download these URLs, don't search" brief (normalizes a bare URL into a download task). |
 | `await chat(message, *, session_id)` | Single-turn chat with conversation memory. No planning. |
 | `await ask_agent(name, task, *, session_id)` | Runs one named agent directly, skipping the pipeline. |
 | `await name_task(goal)` | A tiny (~24-token) LLM call for a short human task title; best-effort with a truncation fallback. |
@@ -321,7 +321,7 @@ agent's roster line and is told to assign every step to it, and after planning
 every step's `agent` field is forced to the base agent
 (`workflow.base_agent_pinned`). The single-purpose modes map to their owner in
 `agents/routing.py` (`research → research`, `plan → planner`,
-`download → resource_downloader`).
+`download → research`).
 
 #### Node: `execute` — sequential or parallel
 
@@ -392,8 +392,8 @@ than poisoning recall.
 
 Guide-only: research how to achieve a goal and produce a structured `PlanGuide`
 (`summary`, `approach`, `tools` with `kind = open_source|proprietary|freemium|saas|
-unknown`, `steps`, `alternatives`, `risks`). It runs `plan_researcher` (fallback
-`scout`), synthesizes via structured output, normalizes ids, and assembles tools into
+unknown`, `steps`, `alternatives`, `risks`). It runs `research` with download/write
+tools denied (`NO_ACQUISITION_TOOLS`), synthesizes via structured output, normalizes ids, and assembles tools into
 open-source vs proprietary buckets. **No code runs and nothing downloads.**
 
 ### 5.3 ResearchOrchestrator (`workflows/research_graph.py`)
@@ -404,14 +404,14 @@ The ML-problem decision tree:
 discover → decide → [hardware] → generate → [run?] → assemble
 ```
 
-- **discover** — the `scout` agent searches HF/PapersWithCode/Kaggle/arXiv/GitHub;
+- **discover** — the `research` agent (download tools denied) searches HF/PapersWithCode/Kaggle/arXiv/GitHub;
   findings are coerced into a typed `Discovery` (the coercion prompt forbids inventing
   ids; an empty Discovery = "found nothing").
 - **decide** — pure Python picks a branch: `both` (model+dataset) → eval script;
   `model_only` → inference pipeline; `data_only` → training script; `neither` →
   reproduce-from-paper.
-- **hardware** — runs only if a model was found; `hardware_analyst` estimates VRAM.
-- **generate** — `codesmith` writes the appropriate code + README into the workspace.
+- **hardware** — runs only if a model was found; `research` estimates VRAM with `estimate_hardware`.
+- **generate** — `coding` writes the appropriate code + README into the workspace, using only the resources discovery found (it has no web access).
 - **run** — *approval-gated* by the key `run_research_code`; without it, `assemble`
   surfaces an approval request and stops instead of executing.
 - **assemble** — a structured `ResearchResult` for the UI (found model/dataset/papers,
@@ -466,25 +466,29 @@ re-run with `approved=True` (if the op was pre-approved) or batched into a singl
 
 `SimpleLLMAgent` is the trivial subclass with `allowed_tools = []` (pure reasoning).
 
-### 6.2 The roster — 29 agents
+### 6.2 The roster — 8 workers + 3 orchestration roles
 
-**26 declarative `AgentSpec`s** in `agents/specs.py` (role, prompt, allowed tools,
+**8 declarative `AgentSpec`s** in `agents/specs.py` (role, prompt, allowed tools,
 `max_iterations`) — the registry instantiates a `ToolUsingAgent` for each. One of them,
 `coding`, is instantiated as the custom `CodingAgent` (below). **Plus 3 bespoke classes**
-in `agents/custom.py`.
+in `agents/custom.py`. Each kind of work has exactly one owner:
 
-| Group | Agents |
+| Agent | Owns |
 |---|---|
-| **knowledge** | `research`, `rag`, `knowledge_manager`, `learning` |
-| **engineering** | `coding`*, `documentation`, `git`, `testing` |
-| **quality** | `qa`, `reviewer`, `security` |
-| **data** | `data_analysis`, `database` |
-| **ops** | `devops`, `monitoring` |
-| **comms** | `email`, `calendar` |
-| **management** | `task_manager`, `memory_manager` |
-| **web** | `browser` |
-| **research team** | `plan_researcher`, `resource_downloader`, `resource_acquirer`, `scout`, `hardware_analyst`, `codesmith` |
-| **bespoke (custom.py)** | `planner`, `ceo`, `human_approval` |
+| `research` | web research, hub search (HF/PwC/arXiv/Kaggle/Roboflow/GitHub/YouTube), downloads, `estimate_hardware` |
+| `coding`* | local code, infra (Docker/CI/deploy), SQL/schemas, ML scripts — no web tools |
+| `testing` | tests + pass/fail QA |
+| `git` | version control |
+| `data_analysis` | data fetching-by-code, EDA, charts |
+| `documentation` | prose docs and notes |
+| `reviewer` | read-only code / security / ops review |
+| `comms` | Gmail + Calendar; `requires="google"`, so it is left out of the planner's roster until Google is connected |
+| **bespoke (custom.py)** | `planner`, `ceo`, `human_approval` — never assignable as a step (`INTERNAL_AGENTS`) |
+
+The roster was consolidated from 26 specialists on 2026-10-22. `LEGACY_AGENT_ALIASES`
+(`agents/routing.py`) maps every retired name to its successor, so old checkpoints,
+pinned `base_agent`s, per-agent limits in `.env`, and LLM output that remembers the old
+names all keep working; saved runs still display the name that actually ran.
 
 \* `coding` is a spec but is instantiated as `CodingAgent` so its backend is switchable.
 

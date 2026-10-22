@@ -131,8 +131,8 @@ async def test_research_reports_total_tokens(employee):
     assert tok["total_tokens"] > 0 and tok["calls"] > 0
     # The total equals the sum of the per-agent buckets (no double counting / drops).
     assert tok["total_tokens"] == sum(b["total_tokens"] for b in tok["by_purpose"].values())
-    # Every agent in the run is attributed (scout always runs).
-    assert any(k.startswith("agent:scout") for k in tok["by_purpose"])
+    # Every agent in the run is attributed (discovery always runs on research).
+    assert any(k.startswith("agent:research") for k in tok["by_purpose"])
     # Surfaced on the result for the UI too.
     assert out["result"]["tokens"] == tok
 

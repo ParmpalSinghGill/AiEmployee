@@ -254,7 +254,7 @@ async def test_skill_recall_is_skipped_when_disabled(monkeypatch) -> None:
             self.recall_called = False
             self.find_skill_called = False
 
-        async def recall(self, *args, **kwargs):
+        async def find_knowledge(self, *args, **kwargs):
             self.recall_called = True
             return []
 

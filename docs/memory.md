@@ -23,6 +23,17 @@ top bar (or **Manage learned skills…** in the Memory menu) to list, create, ed
 delete them. Saving re-embeds the corrected skill and persists it through the normal
 memory backend, so future tasks recall the fixed version instead of a bad one.
 
+**Task-specific guard** (`memory/skill_policy.py`). Skills must be general — scoped to
+a language, framework/repo family, dataset type, or tooling pattern. A skill is
+rejected on save, skipped on recall, and dropped on snapshot import when it contains a
+benchmark instance id (`owner__repo-1234`), a 40-hex commit SHA, raw task-dump headers
+(`## 1. Repository Information`), an issue/PR/ticket number, a one-bug-fix title, or a
+conversational follow-up ("do you update the code"). Saved skills are capped at 150
+words and merged by title. The same check (`task_specific_reason`) also guards
+`long_term` `GOAL:` memories — `find_knowledge` never injects a stored raw benchmark
+prompt, and the reflect node no longer stores one.
+`MemoryManager.purge_task_specific_memories()` removes legacy offenders.
+
 ## Backends
 
 - **In-memory** (`in_memory.py`) — cosine over numpy. Default offline; zero infra.

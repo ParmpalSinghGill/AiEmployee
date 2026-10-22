@@ -106,7 +106,8 @@ async def run_task(req: TaskRequest, emp: AIEmployee = Depends(get_employee)) ->
 
 @router.get("/agents", tags=["agents"])
 async def list_agents(emp: AIEmployee = Depends(get_employee)) -> dict:
-    return {"agents": emp.agents.catalog()}
+    # Full roster, flagging agents whose integration is not connected yet.
+    return {"agents": emp.agents.catalog(include_unavailable=True)}
 
 
 @router.post("/agents/run", tags=["agents"])

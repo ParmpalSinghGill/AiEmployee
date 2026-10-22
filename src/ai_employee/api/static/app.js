@@ -936,7 +936,9 @@ function renderSession(s) {
   strip.innerHTML = "";
   s.runs.forEach((r, i) => {
     const label = i === 0 ? "Task" : "Follow-up " + i;
-    const chip = el(`<div class="run-chip ${r.id === s.activeRun ? "active" : ""}">
+    const rLogPath = s.id && r.id ? `data/sessions/${s.id}/runs/${r.id}.json` : "";
+    const tip = `${label}: ${r.goal}${rLogPath ? '\nSaved log file: ' + rLogPath : ''}`;
+    const chip = el(`<div class="run-chip ${r.id === s.activeRun ? "active" : ""}" title="${esc(tip)}">
       <span class="dot ${r.status}"></span>
       <span class="run-chip-label">${label}: ${esc(r.goal.slice(0, 30))}</span>
       ${i > 0 ? `<button type="button" class="run-chip-del" title="Delete this follow-up">×</button>` : ""}
@@ -1024,6 +1026,38 @@ function renderActiveView(s) {
   else result.innerHTML = problemHeader(task) + renderResult(task, s);
 }
 
+/* Derive the saved run log file path on disk (under sessions/runs) */
+function taskLogFilePath(task) {
+  if (!task) return "";
+  if (task.log_file) return task.log_file;
+  if (task.session_id && task.id) {
+    return `data/sessions/${task.session_id}/runs/${task.id}.json`;
+  }
+  return "";
+}
+
+/* Shared Saved-Log-File bar shown in Flow, Result, and Logs views */
+function runLogFileBar(task) {
+  const p = taskLogFilePath(task);
+  if (!p) return "";
+  const sid = task.session_id;
+  const tid = task.id;
+  const fileUrl = sid && tid
+    ? `/ui/api/sessions/${encodeURIComponent(sid)}/runs/${encodeURIComponent(tid)}/file`
+    : `/ui/api/tasks/${encodeURIComponent(tid)}`;
+  return `<div class="run-log-bar" title="Full execution log and results snapshot saved on disk">
+    <div class="rlb-left">
+      <span class="rlb-icon">💾</span>
+      <span class="rlb-label">Saved Log:</span>
+      <code class="rlb-path" data-copy-path="${esc(p)}" title="Click to copy: ${esc(p)}">${esc(p)}</code>
+    </div>
+    <div class="rlb-actions">
+      <button type="button" class="btn icon-btn rlb-copy-btn" data-copy-path="${esc(p)}" title="Copy file path to clipboard">📋 Copy path</button>
+      <a href="${fileUrl}" target="_blank" rel="noopener noreferrer" class="btn icon-btn rlb-view-btn" title="View raw JSON log file">↗ View file</a>
+    </div>
+  </div>`;
+}
+
 /* The base problem (the goal the user gave) — pinned to the top of Result & Explain. */
 function problemHeader(task) {
   const goal = (task && task.goal) || "";
@@ -1033,7 +1067,9 @@ function problemHeader(task) {
     : task.mode === "plan"
     ? `<span class="pb-tag">📋 Plan</span>`
     : (task.mode === "download" ? `<span class="pb-tag">⬇ Download</span>` : "");
-  return `<div class="problem-banner"><div class="pb-head"><span class="pb-label">Problem</span>${tag}${modelBadges()}</div>
+  const p = taskLogFilePath(task);
+  const logBadge = p ? `<span class="pb-log-file" title="Saved log file: ${esc(p)}">💾 <code>${esc(p)}</code></span>` : "";
+  return `<div class="problem-banner"><div class="pb-head"><span class="pb-label">Problem</span>${tag}${modelBadges()}${logBadge}</div>
     <div class="pb-goal">${linkify(goal)}</div></div>`;
 }
 
@@ -1335,7 +1371,7 @@ function renderFlow(task, session) {
     }, 0);
   }
 
-  return coolingBar + summary + parallelBar + `<div class="flow">` + nodes.join(conn()) + `</div>`;
+  return coolingBar + summary + runLogFileBar(task) + parallelBar + `<div class="flow">` + nodes.join(conn()) + `</div>`;
 }
 
 function statusLabel(s) {
@@ -1667,22 +1703,38 @@ function renderExplain(task, session) {
   return intro + toolbar + `<div class="x-trace">` + comps.map(c => compCard(c, order)).join(`<div class="x-conn"></div>`) + `</div>`;
 }
 
+/* ── Format event timestamp into user's local time (HH:MM:SS) ─────────── */
+function fmtLogTime(iso) {
+  if (!iso) return { time: "", full: "" };
+  try {
+    const d = new Date(iso);
+    if (!Number.isNaN(d.getTime())) {
+      const time = d.toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
+      const full = d.toLocaleString();
+      return { time, full };
+    }
+  } catch {}
+  const raw = String(iso || "").slice(11, 19);
+  return { time: raw, full: String(iso || "") };
+}
+
 /* ── Logs ──────────────────────────────────────────────────────────────── */
 function renderLogs(task) {
+  const logBar = runLogFileBar(task);
   const lines = (task.events || []).map(e => {
     const f = e.fields || {};
     const fields = Object.entries(f).map(([k, v]) =>
       `<b>${esc(k)}</b>=${esc(typeof v === "object" ? JSON.stringify(v) : v)}`).join(" ");
-    const ts = (e.ts || "").slice(11, 19);
+    const tInfo = fmtLogTime(e.ts);
     const approved = e.event === "approval.granted";
     return `<div class="log-line${approved ? " approved" : ""}">
-      <span class="log-ts">${esc(ts)}</span>
+      <span class="log-ts" title="${esc(tInfo.full)}">${esc(tInfo.time)}</span>
       <span class="log-lvl ${esc(e.level)}">${approved ? "✅" : esc(e.level)}</span>
       <span class="log-event">${approved ? "APPROVED" : esc(e.event)}</span>
       <span class="log-fields">${fields}</span></div>`;
   });
-  if (!lines.length) return `<div class="placeholder">No log events yet…</div>`;
-  return `<div class="logs">${lines.join("")}</div>`;
+  if (!lines.length) return logBar + `<div class="placeholder">No log events yet…</div>`;
+  return logBar + `<div class="logs">${lines.join("")}</div>`;
 }
 
 /* ── Result ────────────────────────────────────────────────────────────── */
@@ -1755,6 +1807,7 @@ function lastVerdict(task, stepId) {
 }
 
 function renderResult(task, session) {
+  const logBar = runLogFileBar(task);
   if (task.resumable) {
     const reason = task.error || "This run was interrupted before it finished.";
     const partial = task.result && task.result.answer
@@ -1764,7 +1817,7 @@ function renderResult(task, session) {
       const btn = document.getElementById(`resume-${task.id}`);
       if (btn) btn.addEventListener("click", () => resumeTask(session.id, task.id));
     }, 0);
-    return `<div class="approval-banner result-approval-banner">
+    return logBar + `<div class="approval-banner result-approval-banner">
       <div class="result-appr-head">⏸ Run interrupted</div>
       <div class="appr-body">${linkify(reason)}</div>
       <button class="btn primary" id="resume-${task.id}" style="margin-top:10px">Resume from last checkpoint</button>
@@ -1793,19 +1846,19 @@ function renderResult(task, session) {
         if (btn) btn.addEventListener("click", () => resumeTask(session.id, task.id));
       }, 0);
     }
-    return `<div class="approval-banner" style="border-color:${color};color:${color};background:${bg}">`
+    return logBar + `<div class="approval-banner" style="border-color:${color};color:${color};background:${bg}">`
       + `${label}: ${detail}${progress}${action}</div>`;
   }
   const r = task.result;
   // ``task.result`` only lands when the whole pipeline finishes, but finished
   // steps are already in the event stream — show them as they arrive instead of
   // a spinner that looks like nothing is happening.
-  if (!r) return renderPartialResult(task);
+  if (!r) return logBar + renderPartialResult(task);
 
-  if (task.mode === "research" && r.result) return renderResearch(task, session, r);
-  if (task.mode === "plan" && r.result) return renderPlan(task, session, r);
+  if (task.mode === "research" && r.result) return logBar + renderResearch(task, session, r);
+  if (task.mode === "plan" && r.result) return logBar + renderPlan(task, session, r);
 
-  let html = "";
+  let html = logBar;
   if (r.needs_approval && taskAwaitingApproval(task)) {
     const na = r.needs_approval;
     const op = na.operation || "operation";
@@ -3854,6 +3907,30 @@ function drawOrgEdges(body, edges) {
 }
 
 $("#orgchart-badge").addEventListener("click", openOrgChartModal);
+
+// Global click handler to copy saved log path to clipboard
+document.addEventListener("click", (e) => {
+  const target = e.target.closest(".rlb-copy-btn, .rlb-path");
+  if (!target) return;
+  const path = target.dataset.copyPath || target.getAttribute("title") || target.textContent.trim();
+  if (path) {
+    const cleanPath = path.startsWith("Click to copy: ") ? path.replace("Click to copy: ", "") : path;
+    navigator.clipboard.writeText(cleanPath).then(() => {
+      const btn = target.classList.contains("rlb-copy-btn")
+        ? target
+        : target.closest(".run-log-bar")?.querySelector(".rlb-copy-btn");
+      if (btn) {
+        const orig = btn.innerHTML;
+        btn.innerHTML = "✓ Copied!";
+        btn.classList.add("copied");
+        setTimeout(() => {
+          btn.innerHTML = orig;
+          btn.classList.remove("copied");
+        }, 2000);
+      }
+    }).catch(() => {});
+  }
+});
 
 // Populate the saved-tasks panel + brain/coding badges on load. The identity
 // call runs first so the very first request mints the guest cookie before the

@@ -30,6 +30,17 @@ def _short_goal(goal: str) -> str:
     return (g[:42] + "…") if len(g) > 42 else (g or "Untitled task")
 
 
+#: Download mode runs the research agent; this brief keeps it on "fetch the URLs
+#: given", not "go research alternatives" (the job the old resource_downloader had).
+_DOWNLOAD_BRIEF = (
+    "DOWNLOAD MODE: download every direct URL below into the workspace with "
+    "download_resource right away — do NOT web-search unless no URL is given. If one "
+    "fails, continue with the next; only after every URL failed, call "
+    "request_resource_input once with the failed URLs and real errors. Report each "
+    "resource's saved local path and status."
+)
+
+
 def _normalize_download_goal(goal: str) -> str:
     g = goal.strip()
     if not g:
@@ -37,13 +48,13 @@ def _normalize_download_goal(goal: str) -> str:
     if ("http://" in g or "https://" in g) and not re.search(
         r"\b(download|save|clone|pull|fetch|acquire)\b", g, re.I
     ):
-        return (
+        g = (
             "Download this resource URL into the workspace and report the saved path. "
             "If it is YouTube, GitHub, Hugging Face, or Kaggle, use the automated "
             "downloader.\n\n"
             f"URL:\n{g}"
         )
-    return g
+    return f"{_DOWNLOAD_BRIEF}\n\n{g}"
 
 
 class AIEmployee:
@@ -157,8 +168,12 @@ class AIEmployee:
         ``on_progress`` receives a resume checkpoint after each completed node, so a
         run stopped mid-flight can be continued instead of restarting from scratch.
         """
+        from ai_employee.agents.routing import resolve_agent_name
         from ai_employee.core.usage import track_usage
 
+        if base_agent:
+            # A pin by a retired name (e.g. "scout") still pins its successor.
+            base_agent = resolve_agent_name(base_agent)
         with track_usage() as meter:
             state = await self.orchestrator.run(
                 goal,
@@ -275,7 +290,7 @@ class AIEmployee:
             bind_resource_decision(resource_decision)
             bind_resource_session(session_id)
             try:
-                result = await self.agents.get("resource_downloader").run(task, ctx)
+                result = await self.agents.get("research").run(task, ctx)
             finally:
                 clear_resource_decision()
         usage = summarize_usage(agent=result.agent, tool_trace=result.tool_trace)

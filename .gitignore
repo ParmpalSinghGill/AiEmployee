@@ -52,6 +52,7 @@ data/*
 *.sqlite3
 logs/
 *.log
+*.jsonl
 
 # ── ML / model artifacts ──────────────────────────────────────────────────────
 *.pt

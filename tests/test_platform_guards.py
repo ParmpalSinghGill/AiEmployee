@@ -24,7 +24,6 @@ _needs_git = pytest.mark.skipif(_GIT is None, reason="git is not installed")
 
 _PLANNER_CATALOG = [
     {"name": "research", "role": "Research Analyst", "description": "investigates"},
-    {"name": "scout", "role": "Resource Scout", "description": "finds public resources"},
     {"name": "coding", "role": "Software Engineer", "description": "writes code"},
     {"name": "git", "role": "Version Control Engineer", "description": "runs git"},
     {"name": "testing", "role": "Test Engineer", "description": "writes tests"},
@@ -67,24 +66,30 @@ def test_git_prompt_resets_existing_clone_before_checkout() -> None:
     assert "leftover edits or different commits" in prompt
 
 
-def test_learning_prompt_bans_task_specific_skills() -> None:
-    prompt = spec_by_name()["learning"].system_prompt
+def test_skill_extraction_prompt_bans_task_specific_skills() -> None:
+    # The retired `learning` agent never ran; skills are distilled by the reflect
+    # step with this prompt, so the rules must live here.
+    from ai_employee.memory.skill_policy import SKILL_EXTRACTION_SYSTEM as prompt
+
     assert "NEVER create a skill for a specific task instance" in prompt
     assert "django__django-11555" in prompt
-    assert "do NOT create or save a skill" in prompt
+    assert "should_save=false" in prompt
     assert "general-purpose, reusable workflows" in prompt
 
 
-def test_planner_prompt_restricts_scout_and_combines_local_code_work() -> None:
+def test_planner_prompt_gives_each_kind_of_work_one_owner() -> None:
     import inspect
 
     from ai_employee.planning.planner import Planner
 
     src = inspect.getsource(Planner.make_plan)
-    assert "STRICTLY" in src
-    assert "NEVER use it to inspect" in src
+    assert "exactly ONE owner" in src
+    assert "never reads, edits or runs local project code" in src
+    assert "NO web access" in src
     assert "SINGLE `coding` step" in src
     assert "root-cause diagnosis" in src
+    for retired in ("scout", "resource_acquirer", "devops", "hardware_analyst"):
+        assert f"`{retired}`" not in src
 
 
 def test_planner_prompt_forbids_guessing_file_paths() -> None:
@@ -99,56 +104,25 @@ def test_planner_prompt_forbids_guessing_file_paths() -> None:
     assert "stack trace" in src
 
 
-async def test_planner_reroutes_scout_off_local_code_and_repo_setup() -> None:
+async def test_planner_maps_retired_agent_names_to_successors() -> None:
+    """An LLM that remembers the old roster still produces a runnable plan."""
     from ai_employee.planning.planner import Plan, Planner, PlanStep
 
     plan = Plan(
-        goal="fix the parser",
+        goal="find a model, size it, write the training code",
         steps=[
-            PlanStep(
-                id=1,
-                description=(
-                    "Clone https://github.com/sympy/sympy.git and check out commit abc123"
-                ),
-                agent="scout",
-            ),
-            PlanStep(
-                id=2,
-                description=(
-                    "Inspect sympy/parsing/latex/_parse_latex_antlr.py to locate the parser bug"
-                ),
-                agent="scout",
-                depends_on=[1],
-            ),
+            PlanStep(id=1, description="Search Hugging Face for a model", agent="scout"),
+            PlanStep(id=2, description="Estimate VRAM for it", agent="hardware_analyst"),
+            PlanStep(id=3, description="Write a Dockerfile for training", agent="devops"),
+            PlanStep(id=4, description="Validate the result", agent="qa"),
         ],
     )
 
     out = await Planner(_StaticPlanBrain(plan)).make_plan(
-        "fix the parser", agent_catalog=_PLANNER_CATALOG
+        "find a model", agent_catalog=_PLANNER_CATALOG
     )
 
-    assert [step.agent for step in out.steps] == ["git", "coding"]
-
-
-async def test_planner_routes_first_step_devops_clone_to_git() -> None:
-    from ai_employee.planning.planner import Plan, Planner, PlanStep
-
-    plan = Plan(
-        goal="set up the repo",
-        steps=[
-            PlanStep(
-                id=1,
-                description="clone the target repository and check out the requested commit",
-                agent="devops",
-            )
-        ],
-    )
-
-    out = await Planner(_StaticPlanBrain(plan)).make_plan(
-        "set up the repo", agent_catalog=_PLANNER_CATALOG
-    )
-
-    assert out.steps[0].agent == "git"
+    assert [step.agent for step in out.steps] == ["research", "research", "coding", "testing"]
 
 
 async def test_planner_collapses_inspection_then_fix_coding_steps() -> None:
@@ -203,43 +177,10 @@ async def test_planner_normalization_does_not_override_a_pinned_run() -> None:
     )
 
     out = await Planner(_StaticPlanBrain(plan)).make_plan(
-        "stay pinned", agent_catalog=_PLANNER_CATALOG, base_agent="scout"
+        "stay pinned", agent_catalog=_PLANNER_CATALOG, base_agent="research"
     )
 
-    assert out.steps[0].agent == "scout"
-
-
-async def test_planner_keeps_external_scout_steps_as_scout() -> None:
-    from ai_employee.planning.planner import Plan, Planner, PlanStep
-
-    plan = Plan(
-        goal="find resources",
-        steps=[
-            PlanStep(
-                id=1,
-                description=(
-                    "Search HuggingFace and arXiv for a small text-classification model and dataset"
-                ),
-                agent="scout",
-            ),
-            PlanStep(
-                id=2,
-                description="Find a paper about function calling",
-                agent="scout",
-            ),
-            PlanStep(
-                id=3,
-                description="Find the head of the dataset table",
-                agent="scout",
-            ),
-        ],
-    )
-
-    out = await Planner(_StaticPlanBrain(plan)).make_plan(
-        "find resources", agent_catalog=_PLANNER_CATALOG
-    )
-
-    assert [step.agent for step in out.steps] == ["scout", "scout", "scout"]
+    assert out.steps[0].agent == "research"
 
 
 # ── path extraction ──────────────────────────────────────────────────────────
@@ -651,3 +592,72 @@ def test_skill_guard_filters_serialized_record() -> None:
     }
     assert skill_rejection_reason_from_dict(bad) is not None
     assert skill_rejection_reason_from_dict(good) is None
+
+
+def test_skill_guard_rejects_conversational_titles_without_question_mark() -> None:
+    # The exact legacy title that leaked into prompts had no trailing "?".
+    assert _reason(name="do you update the acutal code") is not None
+    assert _reason(name="Can you fix it") is not None
+    assert _reason(name="did we push the branch") is not None
+
+
+def test_skill_guard_rejects_issue_refs_and_specific_bug_titles() -> None:
+    assert _reason(name="Ticket #30557 fix") is not None
+    assert _reason(name="Parser cleanup", description="See issue 1234") is not None
+    assert _reason(name="x", steps=["read github.com/o/r/pull/88"]) is not None
+    assert _reason(name="Fix IndexError in export_text when tree has one feature") is not None
+
+
+def test_skill_guard_allows_general_titles_near_the_new_rules() -> None:
+    assert _reason("Debugging Python ImportError in virtualenvs", "check sys.path") is None
+    assert _reason("Fix flaky pytest tests", "rerun, isolate state, seed RNG") is None
+    assert _reason("Matplotlib chart styling", "", ["use #333333 for axis text"]) is None
+    assert _reason("JSONL dataset generation", "write one JSON object per line") is None
+    assert _reason("Run SymPy tests", "", ["bin/test sympy/core"]) is None
+
+
+def test_task_specific_reason_for_long_term_text() -> None:
+    from ai_employee.memory.skill_policy import task_specific_reason
+
+    assert task_specific_reason("GOAL: # Task: django__django-11555\nRESULT: ok") is not None
+    assert (
+        task_specific_reason("GOAL: checkout 8dd5877f58f84f2b11126afbd0813e24545919ed") is not None
+    )
+    assert task_specific_reason("GOAL: x\n## 1. Repository Information\n- repo") is not None
+    assert task_specific_reason("GOAL: summarize sales.csv\nRESULT: revenue up 4%") is None
+    # The agent's own report may use numbered headings; only the goal is checked.
+    assert task_specific_reason("GOAL: add /health\nRESULT: done\n### 1. Changes") is None
+
+
+async def test_long_term_recall_and_import_skip_task_dumps(brain) -> None:
+    from ai_employee.memory import MemoryNamespace
+    from ai_employee.memory.in_memory import InMemoryVectorStore
+    from ai_employee.memory.manager import MemoryManager
+
+    memory = MemoryManager(InMemoryVectorStore(), brain)
+    memory.import_records(
+        [
+            {
+                "id": "dump",
+                "namespace": "long_term",
+                "content": "GOAL: # Task: scikit-learn__scikit-learn-14053\n## 1. Repository Information",
+                "metadata": {},
+            },
+            {"id": "note", "namespace": "long_term", "content": "GOAL: tidy csv", "metadata": {}},
+        ]
+    )
+    assert {r["id"] for r in memory.export_records()} == {"note"}
+
+    # A dump recorded live (pre-guard) is still never surfaced, and purge removes it.
+    await memory.record(
+        "GOAL: Work on SWE-bench task django__django-11555\nRESULT: done",
+        namespace=MemoryNamespace.long_term,
+        embed=False,
+    )
+    good = await memory.record(
+        "GOAL: run django tests\nRESULT: use manage.py test", namespace=MemoryNamespace.long_term
+    )
+    hits = await memory.find_knowledge("django task", k=5)
+    assert [h.id for h in hits] == [good.id]
+    assert await memory.purge_task_specific_memories() == 1
+    assert {r["id"] for r in memory.export_records()} == {"note", good.id}

@@ -710,6 +710,69 @@ body {
 .pb-tag { font-size: 10px; color: var(--accent-2); border: 1px solid var(--accent-2);
   border-radius: 999px; padding: 1px 7px; }
 .pb-goal { font-size: 14px; font-weight: 600; line-height: 1.4; color: var(--text); }
+.pb-log-file {
+  font-size: 11px; color: var(--muted, #8e94a5);
+  display: inline-flex; align-items: center; gap: 5px; margin-left: auto;
+}
+.pb-log-file code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  color: var(--accent-2, #818cf8); background: rgba(99, 102, 241, 0.08);
+  padding: 2px 6px; border-radius: 4px; font-size: 11px;
+  border: 1px solid rgba(99, 102, 241, 0.2);
+}
+
+/* ── Saved run log file bar (Flow, Result, Logs) ────────── */
+.run-log-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  background: var(--bg-2, #181b24); border: 1px solid var(--line, #282c39);
+  border-left: 3px solid var(--accent, #6366f1); border-radius: var(--radius, 8px);
+  padding: 8px 12px; margin-bottom: 12px; font-size: 12px; flex-wrap: wrap;
+}
+.rlb-left {
+  display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1 1 auto;
+}
+.rlb-icon { font-size: 14px; flex: none; }
+.rlb-label {
+  font-weight: 600; color: var(--muted, #8e94a5); font-size: 11px;
+  text-transform: uppercase; letter-spacing: 0.05em; white-space: nowrap; flex: none;
+}
+.rlb-path {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px;
+  color: var(--accent-2, #818cf8); background: rgba(99, 102, 241, 0.08);
+  padding: 2px 7px; border-radius: 4px; border: 1px solid rgba(99, 102, 241, 0.25);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer;
+  user-select: all; transition: all .15s ease;
+}
+.rlb-path:hover {
+  background: rgba(99, 102, 241, 0.18); border-color: var(--accent, #6366f1);
+}
+.rlb-actions {
+  display: flex; align-items: center; gap: 6px; flex: none;
+}
+.rlb-copy-btn, .rlb-view-btn {
+  font-size: 11.5px; padding: 4px 10px; border-radius: 5px; cursor: pointer;
+  text-decoration: none; display: inline-flex; align-items: center; gap: 5px;
+  white-space: nowrap; transition: all .15s ease;
+}
+.rlb-copy-btn {
+  background: var(--bg-1, #12141a); border: 1px solid var(--line, #282c39);
+  color: var(--text, #e2e8f0);
+}
+.rlb-copy-btn:hover {
+  background: var(--accent, #6366f1); color: #fff; border-color: var(--accent, #6366f1);
+}
+.rlb-copy-btn.copied {
+  background: rgba(70, 201, 139, 0.2); color: var(--green, #46c98b);
+  border-color: var(--green, #46c98b);
+}
+.rlb-view-btn {
+  color: var(--muted, #8e94a5); background: transparent;
+  border: 1px solid var(--line, #282c39);
+}
+.rlb-view-btn:hover {
+  color: var(--text, #e2e8f0); background: var(--bg-1, #12141a);
+  border-color: var(--muted, #8e94a5);
+}
 
 /* ── ⏰ Schedules & 🛡 Autonomy modals ─────────────────────────────────────── */
 .sched-modal, .autonomy-modal { max-width: 760px; }

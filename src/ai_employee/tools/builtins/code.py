@@ -4,29 +4,53 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import re
 import sys
 from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from ai_employee.core.workspace_repos import pythonpath_for
 from ai_employee.tools.base import Tool, ToolResult
 from ai_employee.tools.builtins._internal_state import restricted_command
 from ai_employee.tools.builtins._sandbox import ensure_workspace
 
 
-async def _run_subprocess(cmd: list[str], cwd: Path, timeout: int, stdin: str | None = None):
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=str(cwd),
-        stdin=asyncio.subprocess.PIPE if stdin else None,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+async def _run_subprocess(
+    cmd: list[str],
+    cwd: Path,
+    timeout: int,
+    stdin: str | None = None,
+    env: dict[str, str] | None = None,
+):
+    spawn = asyncio.ensure_future(
+        asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(cwd),
+            env=env,
+            stdin=asyncio.subprocess.PIPE if stdin else None,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
     )
+    try:
+        # Shielded: cancelling a spawn halfway leaves its pipe transport half
+        # connected, which hangs event-loop shutdown. Let it finish, then kill.
+        proc = await asyncio.shield(spawn)
+    except asyncio.CancelledError:
+        with contextlib.suppress(Exception):
+            await _kill(await spawn)
+        raise
     try:
         out, err = await asyncio.wait_for(
             proc.communicate(stdin.encode() if stdin else None), timeout=timeout
         )
+    except asyncio.CancelledError:
+        # The run was stopped (user Stop, shutdown): never leave the child running.
+        with contextlib.suppress(Exception):
+            await _kill(proc)
+        raise
     except TimeoutError:
         with contextlib.suppress(ProcessLookupError, OSError):
             proc.kill()
@@ -41,6 +65,30 @@ async def _run_subprocess(cmd: list[str], cwd: Path, timeout: int, stdin: str | 
             "subprocess exited unexpectedly (ProcessLookupError)",
         )
     return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
+
+
+async def _kill(proc: asyncio.subprocess.Process) -> None:
+    """Kill and reap a child process (no-op if it already exited)."""
+    if proc.returncode is None:
+        with contextlib.suppress(ProcessLookupError, OSError):
+            proc.kill()
+    await proc.wait()
+
+
+def _repo_env(text: str, workspace: Path) -> tuple[dict[str, str] | None, list[str]]:
+    """Put Python repos the command references first on ``PYTHONPATH``.
+
+    A checked-out project (e.g. ``django/``) must import from the checkout, not
+    from the copy installed in the environment — otherwise its own test runner
+    fails with confusing ImportErrors. Returns ``(env or None, added roots)``.
+    """
+    roots = pythonpath_for(text, workspace)
+    if not roots:
+        return None, []
+    env = os.environ.copy()
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join([*roots, *([existing] if existing else [])])
+    return env, roots
 
 
 # ── Shell output caps & redirection parsing ──────────────────────────────────
@@ -124,11 +172,17 @@ class PythonExecTool(Tool):
 
     async def _run(self, args: PythonExecTool.Args) -> ToolResult:
         ws = ensure_workspace(self._ws)
+        env, roots = _repo_env(args.code, ws)
         # Same interpreter as pip_install / the running API process.
-        code, out, err = await _run_subprocess([sys.executable, "-c", args.code], ws, args.timeout)
+        code, out, err = await _run_subprocess(
+            [sys.executable, "-c", args.code], ws, args.timeout, env=env
+        )
+        output: dict = {"stdout": out, "stderr": err, "returncode": code}
+        if roots:
+            output["pythonpath_added"] = roots
         return ToolResult(
             ok=(code == 0),
-            output={"stdout": out, "stderr": err, "returncode": code},
+            output=output,
             error=None if code == 0 else (err or f"exited {code}"),
         )
 
@@ -245,11 +299,17 @@ class ShellTool(Tool):
                 error=f"{restriction.message} Blocked target: {restriction.target}",
             )
         ws = ensure_workspace(self._ws)
-        code, out, err = await _run_subprocess(["bash", "-lc", args.command], ws, args.timeout)
+        env, roots = _repo_env(args.command, ws)
+        code, out, err = await _run_subprocess(
+            ["bash", "-lc", args.command], ws, args.timeout, env=env
+        )
         out = _truncate_output(out)
         err = _truncate_output(err)
+        output: dict = {"stdout": out, "stderr": err, "returncode": code}
+        if roots:
+            output["pythonpath_added"] = roots
         return ToolResult(
             ok=(code == 0),
-            output={"stdout": out, "stderr": err, "returncode": code},
+            output=output,
             error=None if code == 0 else (err or f"exited {code}"),
         )

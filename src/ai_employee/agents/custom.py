@@ -30,6 +30,7 @@ class CodingAgent(ToolUsingAgent):
         self.category = spec.category
         self.allowed_tools = list(spec.tools) if spec.tools is not None else None
         self.max_iterations = spec.max_iterations
+        self.requires = spec.requires
 
     async def run(self, task: str, ctx: AgentContext) -> AgentResult:
         from ai_employee.config import get_settings

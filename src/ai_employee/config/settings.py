@@ -59,7 +59,24 @@ def parse_agent_limits(spec: str) -> dict[str, int]:
             out[name] = max(0, int(float(raw.strip())))
         except (TypeError, ValueError):
             continue
-    return out
+    return _fold_legacy_agent_names(out)
+
+
+def _fold_legacy_agent_names(limits: dict[str, int]) -> dict[str, int]:
+    """Apply limits written for retired agents (``devops=20``) to their successor.
+
+    An explicit entry for the successor always wins; among several retired names
+    that merged into one agent, the largest limit is kept.
+    """
+    from ai_employee.agents.routing import resolve_agent_name
+
+    explicit = {k: v for k, v in limits.items() if resolve_agent_name(k) == k}
+    folded = dict(explicit)
+    for name, value in limits.items():
+        target = resolve_agent_name(name)
+        if target != name and target not in explicit:
+            folded[target] = max(value, folded.get(target, value))
+    return folded
 
 
 class Settings(BaseSettings):
@@ -267,6 +284,9 @@ class Settings(BaseSettings):
     # Abort an agent's ReAct loop after a tool fails this many times with the
     # SAME error class (e.g. repeated IndentationError) instead of looping blindly.
     agent_repeat_failure_limit: int = 2
+    # A step that must change files (implement/fix/modify/…) but has made this many
+    # tool calls without writing anything is told to apply its edit now. 0 = off.
+    agent_write_nudge_after: int = 10
     # Shrink the content of older messages once history exceeds this many turns,
     # so per-call latency stops compounding as a long step accumulates context.
     agent_history_window: int = 14

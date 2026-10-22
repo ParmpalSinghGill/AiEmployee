@@ -24,6 +24,7 @@ from ai_employee.memory.skill_policy import (
     skill_rejection_reason_from_dict,
     skill_rejection_reason_from_record,
     skill_slug,
+    task_specific_reason,
 )
 
 log = get_logger("memory")
@@ -114,6 +115,20 @@ class MemoryManager:
         # Over-fetch so filtering out banned skills still leaves up to ``k``.
         records = await self.recall(query, namespace=MemoryNamespace.skill, k=max(k * 3, 6))
         kept = [r for r in records if skill_rejection_reason_from_record(r) is None]
+        return kept[:k]
+
+    async def find_knowledge(
+        self, query: str, *, k: int = 4, session_id: str | None = None
+    ) -> list[MemoryRecord]:
+        """Recall long-term memories for prompt injection, skipping task-specific ones.
+
+        A stored ``GOAL: <raw benchmark prompt>`` would re-inject its instance id,
+        commit SHA and issue dump into unrelated runs, so it is never surfaced.
+        """
+        records = await self.recall(
+            query, namespace=MemoryNamespace.long_term, k=max(k * 3, 6), session_id=session_id
+        )
+        kept = [r for r in records if task_specific_reason(r.content or "") is None]
         return kept[:k]
 
     async def list_skills(self, *, limit: int = 500) -> list[MemoryRecord]:
@@ -213,6 +228,16 @@ class MemoryManager:
                 log.info("memory.skill_purged", id=record.id, name=str(name)[:120])
         return len(bad)
 
+    async def purge_task_specific_memories(self) -> int:
+        """Purge task-specific skills *and* long-term memories (raw task dumps)."""
+        removed = await self.purge_task_specific_skills()
+        long_term = await self._store.recent(MemoryNamespace.long_term, limit=100000)
+        bad = [r for r in long_term if task_specific_reason(r.content or "") is not None]
+        if bad:
+            await self._store.delete([r.id for r in bad])
+            log.info("memory.long_term_purged", count=len(bad))
+        return removed + len(bad)
+
     async def delete_skill(self, skill_id: str) -> bool:
         """Delete a skill by id. Returns False when it is not a known skill."""
         if await self.get_skill(skill_id) is None:
@@ -245,8 +270,9 @@ class MemoryManager:
         import_records = getattr(self._store, "import_records", None)
         if import_records is None:
             return
-        # Never resurrect a legacy task-specific skill from an old snapshot: the
-        # same policy that guards saves also guards what enters the live store.
+        # Never resurrect a legacy task-specific skill (or raw task-dump long-term
+        # memory) from an old snapshot: the same policy that guards saves and
+        # recall also guards what enters the live store.
         kept: list[dict] = []
         dropped = 0
         for record in records:
@@ -256,9 +282,14 @@ class MemoryManager:
             ):
                 dropped += 1
                 continue
+            if namespace == MemoryNamespace.long_term.value and (
+                task_specific_reason(str(record.get("content") or "")) is not None
+            ):
+                dropped += 1
+                continue
             kept.append(record)
         if dropped:
-            log.info("memory.skills_dropped_on_import", count=dropped)
+            log.info("memory.task_specific_dropped_on_import", count=dropped)
         import_records(kept)
 
 

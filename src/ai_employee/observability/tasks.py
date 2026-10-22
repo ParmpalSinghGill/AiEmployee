@@ -46,7 +46,7 @@ _FLOW_EVENTS = {
 
 
 def _now() -> datetime:
-    return datetime.now(UTC)
+    return datetime.now().astimezone()
 
 
 def _uid() -> str:
@@ -242,6 +242,7 @@ class TaskRecord:
             "auto_approve": self.auto_approve,
             "token_budget": self.token_budget,
             "tokens_used": self.tokens_used,
+            "log_file": f"data/sessions/{self.session_id}/runs/{self.id}.json",
         }
 
     @classmethod

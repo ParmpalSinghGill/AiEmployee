@@ -42,7 +42,9 @@ async def test_api_health(client):
 
 
 async def test_api_agents_and_tools(client):
-    assert len((await client.get("/agents")).json()["agents"]) >= 20
+    names = {a["name"] for a in (await client.get("/agents")).json()["agents"]}
+    # The full listing includes comms even before Google is connected.
+    assert {"research", "coding", "testing", "git", "reviewer", "comms"} <= names
     assert len((await client.get("/tools")).json()["tools"]) >= 8
 
 

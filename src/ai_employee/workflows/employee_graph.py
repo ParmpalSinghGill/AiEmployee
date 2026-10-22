@@ -23,6 +23,7 @@ from typing import Annotated, Any, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from ai_employee.agents import AgentContext, AgentRegistry
+from ai_employee.agents.routing import resolve_agent_name
 from ai_employee.brains.base import Brain
 from ai_employee.config import get_settings
 from ai_employee.core.logging import bind_context, get_logger
@@ -31,6 +32,7 @@ from ai_employee.memory.skill_policy import (
     SKILL_EXTRACTION_SYSTEM,
     SkillDraft,
     SkillRejectedError,
+    task_specific_reason,
 )
 from ai_employee.tools.invocation_history import (
     begin_task_tool_history,
@@ -43,6 +45,12 @@ from ai_employee.verification import (
     audit_filesystem,
     audit_resources,
     build_waiting_for_user_payload,
+)
+from ai_employee.verification.evidence import (
+    expects_code_change,
+    no_change_issue,
+    snapshot_for_change_check,
+    summarize_tool_evidence,
 )
 from ai_employee.workflows.scheduler import (
     describe_schedule,
@@ -78,9 +86,7 @@ def _looks_like_refusal(text: str) -> bool:
 
 # Analysis/report agents failing a writeup must not cancel the rest of the
 # pipeline — downstream can still use earlier artifacts (e.g. the source CSV).
-_SOFT_DEPENDENCY_AGENTS = frozenset(
-    {"data_analysis", "documentation", "database", "rag", "knowledge_manager"}
-)
+_SOFT_DEPENDENCY_AGENTS = frozenset({"data_analysis", "documentation"})
 
 #: Per-prerequisite cap on handoff text. Generous enough to carry a full traceback,
 #: repro commands and fix rationale, but bounded so a downstream prompt can't
@@ -131,15 +137,15 @@ def _looks_unusable(record: dict[str, Any]) -> bool:
     """True if a completed step produced nothing a dependent step could build on."""
     if record.get("skipped"):
         return True
-    if (record.get("agent") or "") in _SOFT_DEPENDENCY_AGENTS:
+    if resolve_agent_name(record.get("agent") or "") in _SOFT_DEPENDENCY_AGENTS:
         return False
     audit = record.get("resource_audit") or {}
     outcome = audit.get("outcome", "")
     if outcome in ("completed", "waiting_for_user", "partial"):
         return False
-    # An audit issue is not the same as "no usable output". A scout that found real
-    # model URLs but didn't download them has issues logged, yet its report is
-    # exactly what a hardware_analyst or codesmith needs. Treating every issue as
+    # An audit issue is not the same as "no usable output". A research step that
+    # found real model URLs but didn't download them has issues logged, yet its
+    # report is exactly what a VRAM estimate or a coding step needs. Treating every issue as
     # fatal cascaded one imperfect step into skipping the whole rest of the plan.
     # Only block dependents when the step produced no resource references at all.
     if audit.get("issues") and outcome not in ("waiting_for_user",):
@@ -619,6 +625,13 @@ class Orchestrator:
         # Wall-clock start of this step: the filesystem audit uses it to distinguish
         # a commit made now (changes saved) from a pre-existing clean checkout.
         step_started = time.time()
+        # A step that must change code is checked against the real repo state,
+        # so an edit that was only described in prose cannot pass review.
+        change_snapshot = (
+            snapshot_for_change_check(settings.workspace_dir)
+            if expects_code_change(step["description"])
+            else {}
+        )
         result = await agent.run(task, ctx)
         if (
             not result.needs_approval
@@ -719,6 +732,8 @@ class Orchestrator:
             resource_audit=resource_audit,
             artifact_audit=artifact_audit,
             fs_audit=fs_audit,
+            tool_evidence=summarize_tool_evidence(result.tool_trace),
+            change_issue=self._change_issue(change_snapshot, step, task, result.output),
         )
         retries = 0
         # Accumulate every issue raised across attempts so a retry fixes ALL of
@@ -764,6 +779,8 @@ class Orchestrator:
                 resource_audit=resource_audit,
                 artifact_audit=artifact_audit,
                 fs_audit=fs_audit,
+                tool_evidence=summarize_tool_evidence(result.tool_trace),
+                change_issue=self._change_issue(change_snapshot, step, task, result.output),
             )
             all_issues = _dedupe([*all_issues, *(verdict.issues or [])])
             # If the retry produced essentially the same answer, stop — it's stalled.
@@ -820,6 +837,19 @@ class Orchestrator:
             "trace": [{"node": "synthesize", "agent": "ceo"}],
         }
 
+    @staticmethod
+    def _change_issue(
+        snapshot: dict[str, dict[str, object]], step: dict, task: str, output: str
+    ) -> str | None:
+        """Issue text when a code-change step left every targeted repo unchanged."""
+        if not snapshot:
+            return None
+        return no_change_issue(
+            before=snapshot,
+            workspace=get_settings().workspace_dir,
+            scope_text=f"{task}\n{output}",
+        )
+
     async def _reflect_node(self, state: EmployeeState) -> EmployeeState:
         bind_context(node="reflect")
         log.info("workflow.node", node="reflect")
@@ -837,12 +867,19 @@ class Orchestrator:
             and not unverified
         ):
             try:
-                await self._memory.record(
-                    f"GOAL: {state['goal']}\nRESULT: {state.get('final', '')}",
-                    namespace=MemoryNamespace.long_term,
-                    session_id=state.get("session_id"),
-                    metadata={"confidence": confidence},
-                )
+                goal_record = f"GOAL: {state['goal']}\nRESULT: {state.get('final', '')}"
+                # A raw benchmark/issue prompt is never recalled (see
+                # MemoryManager.find_knowledge), so don't store it either.
+                skip_reason = task_specific_reason(goal_record)
+                if skip_reason:
+                    log.info("reflect.long_term_skipped", reason=skip_reason)
+                else:
+                    await self._memory.record(
+                        goal_record,
+                        namespace=MemoryNamespace.long_term,
+                        session_id=state.get("session_id"),
+                        metadata={"confidence": confidence},
+                    )
                 plan_steps = state.get("plan", {}).get("steps", [])
                 if len(plan_steps) >= 2:
                     await self._remember_general_skill(state)

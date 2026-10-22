@@ -67,6 +67,8 @@ class Verifier:
         resource_audit: dict | None = None,
         artifact_audit: dict | None = None,
         fs_audit: dict | None = None,
+        tool_evidence: dict | None = None,
+        change_issue: str | None = None,
     ) -> Verdict:
         criteria = success_criteria or "The output fully and correctly addresses the task."
         system = (
@@ -126,7 +128,33 @@ class Verifier:
                 "measured HEAD and flag any mismatch. A path the output correctly says "
                 "does NOT exist is not a defect."
             )
+        runs = (tool_evidence or {}).get("test_runs") or []
+        if tool_evidence is not None:
+            system += (
+                "\n\nTOOL EXECUTION EVIDENCE: the platform recorded what this step's "
+                "tools actually did — the test commands it ran with their real results, "
+                "and how many file-writing calls succeeded. This is not the agent's "
+                "self-report. Judge test outcomes from it: if the evidence shows the "
+                "requested tests ran and passed, do NOT fail the step for 'tests not "
+                "run' even if the prose says they were blocked. If the prose claims "
+                "tests passed but the evidence shows failures or no test run, that is a "
+                "real defect. If the task requires changing code and there were 0 "
+                "file-writing calls, claims that changes were applied are unsupported."
+            )
         user = f"TASK:\n{task}\n\nSUCCESS CRITERIA:\n{criteria}\n\nOUTPUT TO REVIEW:\n{output}"
+        if tool_evidence is not None:
+            user += (
+                "\n\nTOOL EXECUTION EVIDENCE (recorded by the platform):\n"
+                f"- successful file-writing calls: {tool_evidence.get('write_calls', 0)}\n"
+            )
+            if runs:
+                user += "- test commands run (oldest first):\n" + "\n".join(
+                    f"  * [{'ok' if r.get('ok') else 'FAILED'}] {r.get('command', '')[:200]}\n"
+                    f"    result tail: {r.get('tail', '')}"
+                    for r in runs
+                )
+            else:
+                user += "- no test commands were run in this step\n"
         if resource_audit and resource_audit.get("issues"):
             user += "\n\nPROGRAMMATIC RESOURCE AUDIT ISSUES:\n" + "\n".join(
                 f"- {issue}" for issue in resource_audit["issues"]
@@ -136,8 +164,9 @@ class Verifier:
                 f"- {c['file']}: {_describe_checked(c)}" for c in artifact_audit["checked"]
             )
         if fs_audit and fs_audit.get("checked"):
-            user += "\n\nGROUND-TRUTH FILESYSTEM FACTS (measured directly from disk):\n" + "\n".join(
-                f"- {c['path']}: {_describe_fs(c)}" for c in fs_audit["checked"]
+            user += (
+                "\n\nGROUND-TRUTH FILESYSTEM FACTS (measured directly from disk):\n"
+                + "\n".join(f"- {c['path']}: {_describe_fs(c)}" for c in fs_audit["checked"])
             )
         if fs_audit and fs_audit.get("issues"):
             user += "\n\nPROGRAMMATIC FILESYSTEM AUDIT — prose vs. ground truth:\n" + "\n".join(
@@ -185,6 +214,16 @@ class Verifier:
                         "Web URL, Local path (or NOT DOWNLOADED), and the model used."
                     ),
                 )
+        # Deterministic: a code-change step that left its repo untouched failed,
+        # whatever the prose says.
+        if change_issue:
+            verdict = Verdict(
+                passed=False,
+                confidence=min(verdict.confidence, 0.2),
+                issues=[*verdict.issues, change_issue],
+                suggestion=verdict.suggestion
+                or "Apply the change to the files on disk, then verify it with tests.",
+            )
         # The verifier's *output*: verdict plus the concrete reasoning behind it.
         log.info(
             "verifier.verdict",
@@ -194,5 +233,8 @@ class Verifier:
             suggestion=clip(verdict.suggestion),
             artifact_audit_issues=(artifact_audit or {}).get("issues") or [],
             fs_audit_issues=(fs_audit or {}).get("issues") or [],
+            change_issue=change_issue or "",
+            test_runs=len(runs),
+            write_calls=(tool_evidence or {}).get("write_calls"),
         )
         return verdict

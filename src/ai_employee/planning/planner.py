@@ -12,6 +12,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, create_model
 
+from ai_employee.agents.routing import INTERNAL_AGENTS, resolve_agent_name
 from ai_employee.brains.base import Brain
 from ai_employee.brains.schemas import Message
 from ai_employee.core.logging import get_logger
@@ -179,7 +180,7 @@ _GENERIC_OVERRIDES: tuple[tuple[str, tuple[str, ...]], ...] = (
         ("eda", "kpi", "pandas", "chart", "plot", "csv", "data analysis", "profiling"),
     ),
     ("documentation", ("readme", "writeup", "write up", "documentation")),
-    ("devops", ("docker", "deploy", "kubernetes", "ci/cd")),
+    ("coding", ("docker", "deploy", "kubernetes", "ci/cd", "sql", "migration")),
 )
 
 
@@ -200,49 +201,11 @@ def _correct_generic_assignment(description: str, agent: str, valid: set[str]) -
     return agent
 
 
-#: Deterministic routing vocabulary. `scout` is for public hubs (models,
-#: datasets, papers) — never for a local checkout. These patterns detect when a
-#: step's wording is actually local code/repo work so the planner can repair the
-#: assignment even when the model ignored the prompt.
-_GIT_OP_RE = re.compile(
-    r"\b(?:"
-    r"git\s+(?:clone|check-?out|commit|diff|status|fetch|reset|clean|"
-    r"rev-parse|log|show|branch|pull|push)|"
-    r"clone|check-?out|check\s+out|commit|diff"
-    r")\b",
-    re.I,
-)
-_GIT_HEAD_RE = re.compile(r"\bHEAD\b")  # case-sensitive: git's commit pointer
-_GIT_SETUP_RE = re.compile(r"\b(?:clone|check-?out|check\s+out)\b", re.I)
-_CODE_EXT = (
-    r"(?:py|pyi|js|mjs|cjs|ts|tsx|jsx|java|kt|kts|go|rs|c|cc|cpp|cxx|h|hh|hpp|"
-    r"rb|php|cs|scala|swift|m|mm|sh|bash|zsh|ps1|sql|ipynb|json|ya?ml|toml|ini|"
-    r"cfg|conf|gradle|xml|html|css|scss|sass|less|vue|svelte)"
-)
-_LOCAL_PATH_RE = re.compile(
-    rf"(?:"
-    rf"(?:^|[\s'\"(])(?:\.{{1,2}}/|~/|/[\w.@+-]+/)"
-    rf"|[\w.@+-]+\.{_CODE_EXT}\b"
-    rf"|(?:^|[\s'\"(])"
-    rf"(?:src|lib|app|pkg|packages?|tests?|scripts?|modules?|cmd|bin|core|utils|"
-    rf"services?|components?|internal)/[\w.@+-]+"
-    rf")",
-    re.I,
-)
-_SCOUT_INSPECT_RE = re.compile(
+#: Wording that marks a step as read-only inspection vs. one that edits. Used to
+#: fold a "locate the code" coding step into the coding step that fixes it.
+_INSPECT_RE = re.compile(
     r"\b(?:locate|inspect|examine|identify|find|search|grep|read|analy[sz]e|"
     r"trace|diagnose|investigate|debug|reproducer|reproduce|function|method|bug)\b",
-    re.I,
-)
-_LOCAL_CONTEXT_RE = re.compile(
-    r"\b(?:local|code|source|file|repo|repository|workspace|project|module|"
-    r"script|test|tests|traceback|stack\s+trace|root[\s-]+cause|parser|compiler|"
-    r"implementation|bug|function|method)\b",
-    re.I,
-)
-_EXTERNAL_RESOURCE_RE = re.compile(
-    r"\b(?:dataset|datasets|paper|papers|huggingface|kaggle|arxiv|hub|"
-    r"benchmark|leaderboard|function[\s-]+calling)\b",
     re.I,
 )
 _EDIT_RE = re.compile(
@@ -252,41 +215,9 @@ _EDIT_RE = re.compile(
 )
 
 
-def _first_valid(targets: tuple[str, ...], valid: set[str]) -> str | None:
-    return next((target for target in targets if target in valid), None)
-
-
-def _has_git_op(text: str) -> bool:
-    return bool(_GIT_OP_RE.search(text) or _GIT_HEAD_RE.search(text))
-
-
-def _looks_like_code_work(text: str) -> bool:
-    """True when wording describes local code work rather than a public-hub lookup."""
-    if _EDIT_RE.search(text) or _LOCAL_PATH_RE.search(text):
-        return True
-    if _SCOUT_INSPECT_RE.search(text) and _LOCAL_CONTEXT_RE.search(text):
-        # "find a paper about function calling" / "find a bug-fix dataset" are
-        # external-resource searches, not local source inspection.
-        return not bool(_EXTERNAL_RESOURCE_RE.search(text))
-    return False
-
-
-def _scout_target(text: str, valid: set[str]) -> str | None:
-    """Pick the specialist a misrouted `scout` step should use, if any."""
-    has_git = _has_git_op(text)
-    has_inspect = bool(_SCOUT_INSPECT_RE.search(text))
-    code_work = _looks_like_code_work(text)
-    if has_git and not (has_inspect or code_work):
-        # A pure clone/checkout/fetch is version-control work.
-        return _first_valid(("git", "coding"), valid)
-    if has_git or code_work:
-        return _first_valid(("coding", "git"), valid)
-    return None
-
-
 def _is_inspection_only(description: str) -> bool:
     text = strip_urls(description or "")
-    return bool(_SCOUT_INSPECT_RE.search(text)) and not bool(_EDIT_RE.search(text))
+    return bool(_INSPECT_RE.search(text)) and not bool(_EDIT_RE.search(text))
 
 
 def _is_implementation(description: str) -> bool:
@@ -358,49 +289,78 @@ def _collapse_inspection_then_fix(steps: list[PlanStep]) -> None:
 
 
 def normalize_plan_routing(plan: Plan, valid_names: set[str]) -> Plan:
-    """Repair specialist routing the LLM got wrong, deterministically.
+    """Deterministic clean-up of the plan's routing.
 
-    * A first-step repo clone/checkout assigned to `scout` or `devops` → `git`.
-    * `scout` on local paths, git operations, or local code inspection → `coding`
-      (pure clone/checkout → `git`).
+    * Retired agent names (``scout``, ``devops``, …) map to their successors via
+      ``LEGACY_AGENT_ALIASES`` — the roster's single owner for that work.
     * A coding "locate/inspect" step followed by a coding "implement" step is
       collapsed into one step so the same agent owns discovery and editing.
     """
-    if not plan.steps:
-        return plan
+    for step in plan.steps:
+        target = resolve_agent_name(step.agent)
+        if target != step.agent and target in valid_names:
+            log.info("planner.legacy_agent", step=step.id, from_agent=step.agent, to_agent=target)
+            step.agent = target
+    if plan.steps:
+        _collapse_inspection_then_fix(plan.steps)
+    return plan
 
-    ordered = sorted(plan.steps, key=lambda s: s.id)
-    first_id = ordered[0].id
-    for step in ordered:
-        original = step.agent
-        text = strip_urls(step.description or "")
 
-        # Rule 1: the first step that sets up a repo belongs to the git agent.
-        if (
-            step.id == first_id
-            and step.agent in {"scout", "devops"}
-            and _GIT_SETUP_RE.search(text)
-            and "git" in valid_names
-        ):
-            step.agent = "git"
+_SOURCE_PATH_RE = re.compile(
+    r"(?<![\w/.-])((?:[\w.-]+/)*[\w-]+\.(?:py|pyx|js|jsx|ts|tsx|java|go|rs|rb|c|cc|cpp|h|hpp|"
+    r"cs|php|kt|swift|scala))\b"
+)
 
-        # Rule 2: `scout` is strictly for external public-hub resources.
-        if step.agent == "scout":
-            target = _scout_target(text, valid_names)
-            if target:
-                step.agent = target
+_DIAGNOSE_VERB_RE = re.compile(
+    r"^\W*(?:locate|inspect|investigate|diagnose|find|search|identify|analy[sz]e|"
+    r"explore|examine|trace|debug|read)\b",
+    re.I,
+)
 
-        if step.agent != original:
-            log.info(
-                "planner.rerouted_agent",
-                step=step.id,
-                from_agent=original,
-                to_agent=step.agent,
-                reason="repo_setup" if step.agent == "git" else "local_code",
+GUESSED_PATH_NOTE = (
+    "NOTE: {paths} {verb} named by the planner, not by the user — treat {pron} as a "
+    "starting guess only. Find where the ROOT CAUSE actually lives (it may be a "
+    "different module than where the symptom shows, e.g. a printer/serializer rather "
+    "than the parser) and fix it there."
+)
+
+
+def flag_guessed_paths(plan: Plan, goal: str) -> Plan:
+    """Mark source-file paths in steps that the goal never mentioned.
+
+    The planner sometimes pins the file to fix from the issue title before any
+    diagnosis; the coding agent then dutifully patches the symptom. Rather than
+    rewrite the step, tell the agent the path is a guess.
+    """
+    from ai_employee.verification.evidence import expects_code_change
+
+    goal_text = goal or ""
+    for step in plan.steps:
+        desc = step.description or ""
+        if "named by the planner, not by the user" in desc:
+            continue
+        # Only where a guess steers the work: fixing or diagnosing, not running tests.
+        if not (expects_code_change(desc) or _DIAGNOSE_VERB_RE.match(desc)):
+            continue
+        guessed: list[str] = []
+        for match in _SOURCE_PATH_RE.finditer(strip_urls(desc)):
+            path = match.group(1)
+            name = path.rsplit("/", 1)[-1]
+            if name in goal_text or path in guessed:
+                continue
+            guessed.append(path)
+        if not guessed:
+            continue
+        shown = ", ".join(f"`{p}`" for p in guessed[:4])
+        many = len(guessed) > 1
+        step.description = (
+            desc.rstrip()
+            + "\n\n"
+            + GUESSED_PATH_NOTE.format(
+                paths=shown, verb="were" if many else "was", pron="them" if many else "it"
             )
-
-    # Rule 3: collapse redundant local inspection + implementation steps.
-    _collapse_inspection_then_fix(plan.steps)
+        )
+        log.info("planner.flagged_guessed_paths", step=step.id, paths=guessed[:4])
     return plan
 
 
@@ -462,6 +422,10 @@ class Planner:
         that one agent and every step is assigned to it, so the workforce cannot
         drift to a different agent mid-task.
         """
+        # Orchestration roles (planner/ceo/approval) are never step owners.
+        agent_catalog = [
+            a for a in agent_catalog if a["name"] not in INTERNAL_AGENTS or a["name"] == base_agent
+        ]
         roster = "\n".join(
             f"- {a['name']}: {a['role']} — {a['description']}" for a in agent_catalog
         )
@@ -494,26 +458,27 @@ class Planner:
             "exactly one agent from the roster (use the agent's `name`). "
             "Keep it minimal but complete.\n\n"
             f"{pin_rule}"
-            "AGENT ASSIGNMENT — the single most important decision. Match each step "
-            "to the ONE agent whose description matches what it actually does:\n"
-            "- `research` ONLY searches the web/hubs and reports findings. It never "
-            "writes or edits code, never writes or runs tests, never clones or "
-            "commits a repo. Do NOT use it for those.\n"
-            "- Writing/editing/refactoring application code, or fixing a bug → "
-            "`coding`.\n"
-            "- Writing or running tests → `testing`.\n"
-            "- Cloning/checking out/committing → `git`.\n"
-            "- Dataset analysis/EDA/charts → `data_analysis`.\n"
-            "- Writing docs/READMEs → `documentation`.\n"
-            "- Finding external ML models/datasets/papers on public hubs → `scout` or "
-            "`research`. `scout` is STRICTLY for external public-hub resources — "
-            "NEVER use it to inspect, read, grep, or debug local source-code files "
-            "in a repository; local code is always `coding`.\n"
+            "AGENT ASSIGNMENT — the single most important decision. Every kind of "
+            "work has exactly ONE owner; match each step to it:\n"
+            "- External information → `research`: web research, finding ML models/"
+            "datasets/papers on public hubs, downloading resources into the workspace, "
+            "and GPU/VRAM estimates. It never reads, edits or runs local project code.\n"
+            "- Local code → `coding`: application code, bug fixes, Docker/CI/deploy "
+            "config, database schemas/SQL, ML inference/training/eval scripts. It has "
+            "NO web access — if it needs external facts (model ids, API docs), add a "
+            "`research` step first and make the coding step depend on it.\n"
+            "- Tests and requirement validation → `testing`.\n"
+            "- Clone / checkout / commit → `git`.\n"
+            "- Dataset fetching-by-code, analysis, EDA and charts → `data_analysis`.\n"
+            "- READMEs, reports, written explanations → `documentation`.\n"
+            "- Read-only review of code, security, or logs/health → `reviewer`.\n"
+            "- Email and calendar → `comms` (only if it is in the roster).\n"
+            "Do not fall back to `research` for code, test or repo work just because "
+            "it is listed first.\n"
             "- Diagnosing and fixing a bug (or implementing a feature) in a LOCAL "
             "codebase: combine code exploration, root-cause diagnosis, and code "
             "editing into a SINGLE `coding` step. Do NOT split exploration or "
-            "diagnosis across separate agents.\n"
-            "Do not fall back to `research` for code or test work.\n\n"
+            "diagnosis across separate agents.\n\n"
             "FILE PATHS IN STEPS — NEVER guess, invent, or hardcode specific source "
             "file paths or function names in step descriptions unless the user's "
             "prompt explicitly named them. Instruct the `coding` agent to search and "
@@ -546,46 +511,47 @@ class Planner:
             "  consumes several earlier outputs.\n"
             "Worked example — 'find a model and a dataset, size the GPU, write "
             "training code, document it':\n"
-            "  1 scout (find model)              depends_on: []\n"
-            "  2 resource_acquirer (find data)   depends_on: []      <- independent of 1\n"
-            "  3 hardware_analyst (VRAM)         depends_on: [1]     <- needs the model\n"
-            "  4 coding (training script)        depends_on: [1, 2]  <- needs both\n"
-            "  5 documentation (README)          depends_on: [4]     <- not [1,2,3,4]\n"
+            "  1 research (find model)            depends_on: []\n"
+            "  2 research (find + download data)  depends_on: []      <- independent of 1\n"
+            "  3 research (VRAM for the model)    depends_on: [1]     <- needs the model\n"
+            "  4 coding (training script)         depends_on: [1, 2]  <- needs both\n"
+            "  5 documentation (README)           depends_on: [4]     <- not [1,2,3,4]\n"
             "Here steps 1 and 2 run at once, and 3 runs as soon as 1 lands.\n\n"
             "BEFORE adding any acquisition step, check these two shortcuts:\n"
             "- FILE ALREADY IN THE WORKSPACE (the goal names a local file such as "
             "sales.csv): do NOT add an acquire step. Go straight to data_analysis.\n"
             "- FETCHABLE PUBLIC DATA (stock/ETF/index/FX/crypto prices, ticker "
             "fundamentals, weather, or any documented public API): do NOT use "
-            "resource_acquirer or hub search — those look for pre-made dataset files. "
+            "a research hub search — that looks for pre-made dataset files. "
             "Assign ONE data_analysis step that writes Python to fetch it directly "
             "(e.g. yfinance for market history), saves it as CSV, and analyzes it.\n\n"
             "RESOURCE TASKS — pick ONE modality. Never mix them up "
             "(a sales CSV is not a video; LibriSpeech is not Roboflow images).\n"
             "TABULAR (csv, xlsx, kaggle tables, sales/finance):\n"
             "- Only when the data must be FOUND as an existing dataset file: acquire "
-            "via resource_acquirer + hub_search_all kind=tabular (no YouTube). "
+            "via research + hub_search_all kind=tabular (no YouTube). "
             "Analyze with data_analysis, report with documentation.\n"
             "VIDEO (cctv, youtube, mp4, people counting):\n"
-            "- Acquire via resource_acquirer / research + hub_search_all kind=video. "
+            "- Acquire via research + hub_search_all kind=video. "
             "Process with coding; document results.\n"
             "IMAGE (photos, png/jpg, detection/segmentation, Roboflow, COCO-style):\n"
-            "- Acquire via resource_acquirer + hub_search_all kind=image "
+            "- Acquire via research + hub_search_all kind=image "
             "(Roboflow/HF/Kaggle; no YouTube). Inventory/labels with data_analysis "
             "or coding; training/inference scripts with coding.\n"
             "SPEECH / audio (wav, mp3, ASR, TTS, LibriSpeech-style corpora):\n"
-            "- Acquire via resource_acquirer + hub_search_all kind=speech "
+            "- Acquire via research + hub_search_all kind=speech "
             "(HF/Kaggle; no YouTube/Roboflow). Profile with data_analysis/coding "
-            "(durations, sample rate, transcripts); models via scout+coding.\n"
+            "(durations, sample rate, transcripts); find models with research, run "
+            "them with coding.\n"
             "GENERIC (data, dataset, file, model weights):\n"
             "- Step 1 should LOCATE suitable resources, ATTEMPT automatic download, and "
             "record the original URL plus local path when download succeeds.\n"
             "- If automatic download cannot complete (403, login, CAPTCHA, etc.), the "
             "step succeeds by returning the download URL and entering WAITING_FOR_USER "
             "for a manual local path — do NOT treat that as failure.\n"
-            "- Use research or scout to FIND and verify URLs across hubs.\n"
-            "- Use resource_acquirer to search, download, or pause for manual download.\n"
-            "- Do not assign download work to research alone.\n"
+            "- One `research` step finds, verifies AND downloads. Write it as 'find and "
+            "download …' so it attempts the download (a 'find …' step only reports "
+            "candidates).\n"
             "- Success criteria must NOT require a workspace file before download is "
             "attempted. Accept: (found + downloaded) OR (found + manual download needed).\n"
             "- Never mark a step failed when a suitable URL exists but automation was blocked.\n\n"
@@ -597,8 +563,8 @@ class Planner:
             "step exists in the plan.\n\n"
             "DO NOT DUPLICATE ROLES: each step should be owned by exactly one agent "
             "whose description matches it. Data fetching/cleaning/EDA/charts → "
-            "data_analysis. Application/engineering code → coding. Tests → testing. "
-            "Commits/pushes → git. Docker/CI/deploy config → devops. Never assign the "
+            "data_analysis. Application/engineering/infra code → coding. Tests → testing. "
+            "Commits/pushes → git. External lookups and downloads → research. Never assign the "
             "same kind of work to two different agents in one plan on the assumption "
             "either could do it.\n\n"
             "AGENT ROSTER:\n"
@@ -629,8 +595,13 @@ class Planner:
             raw = step.agent
             resolved = raw
             if raw not in valid_names:
-                log.info("planner.invalid_agent", step=step.id, from_agent=raw)
-                resolved = "research" if "research" in valid_names else sorted(valid_names)[0]
+                aliased = resolve_agent_name(raw)
+                if aliased in valid_names:
+                    log.info("planner.legacy_agent", step=step.id, from_agent=raw, to_agent=aliased)
+                    resolved = aliased
+                else:
+                    log.info("planner.invalid_agent", step=step.id, from_agent=raw)
+                    resolved = "research" if "research" in valid_names else sorted(valid_names)[0]
             # A pinned run is authoritative: force every step onto the base agent.
             # Otherwise apply the multi-agent safety net (correct a generic
             # `research` to the specialist the step's wording names).
@@ -651,6 +622,7 @@ class Planner:
         # Pinned runs are authoritative and must never drift to another agent.
         if not pinned:
             normalize_plan_routing(plan, valid_names)
+        flag_guessed_paths(plan, goal)
         if not plan.steps:
             default_agent = pinned or (
                 "research" if "research" in valid_names else sorted(valid_names)[0]

@@ -50,11 +50,17 @@ class Evidence:
         return list(plan.get("steps") or [])
 
     def planned_agents(self) -> list[str]:
-        return [s.get("agent") for s in self.plan_steps if s.get("agent")]
+        # Normalized through the legacy aliases, so evidence recorded under the
+        # old 26-agent roster ("scout", "devops", …) grades against today's names.
+        from ai_employee.agents.routing import resolve_agent_name
+
+        return [resolve_agent_name(s["agent"]) for s in self.plan_steps if s.get("agent")]
 
     def executed_agents(self) -> set[str]:
+        from ai_employee.agents.routing import resolve_agent_name
+
         return {
-            a.get("agent")
+            resolve_agent_name(a["agent"])
             for a in (self.result.get("agents_used") or [])
             if a.get("agent")
         }
@@ -97,6 +103,8 @@ class Evidence:
 
 #: A scenario seeds a workspace, runs a goal, and is graded by named checks.
 Seed = Callable[[Path], None]
+
+
 @dataclass
 class Scenario:
     id: str

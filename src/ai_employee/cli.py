@@ -414,8 +414,11 @@ async def _run_async(args) -> int:
                 )
                 _render_usage(out)
         elif args.command == "agents":
-            for a in emp.agents.catalog():
-                console.print(f"[cyan]{a['name']:18}[/] {a['role']} — {a['description']}")
+            for a in emp.agents.catalog(include_unavailable=True):
+                note = (
+                    "  [dim](needs Google — not connected)[/]" if a.get("available") == "no" else ""
+                )
+                console.print(f"[cyan]{a['name']:18}[/] {a['role']} — {a['description']}{note}")
         elif args.command == "tools":
             for t in emp.tools.all():
                 console.print(f"[magenta]{t.name:16}[/] [{t.category}] {t.description}")

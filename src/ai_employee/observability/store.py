@@ -38,12 +38,22 @@ class SessionStore:
         d = self._sdir(meta["id"])
         _write_json(d / "session.json", meta)
 
+    def task_path(self, session_id: str, task_id: str) -> Path:
+        return self.root / session_id / "runs" / f"{task_id}.json"
+
+    def rel_task_path(self, session_id: str, task_id: str) -> str:
+        p = self.task_path(session_id, task_id)
+        try:
+            return str(p.relative_to(Path.cwd()))
+        except ValueError:
+            return str(p)
+
     def save_task(self, session_id: str, snapshot: dict[str, Any]) -> None:
         d = self._sdir(session_id)
-        _write_json(d / "runs" / f"{snapshot['id']}.json", snapshot)
+        _write_json(self.task_path(session_id, snapshot["id"]), snapshot)
 
     def delete_task(self, session_id: str, task_id: str) -> None:
-        path = self.root / session_id / "runs" / f"{task_id}.json"
+        path = self.task_path(session_id, task_id)
         if path.exists():
             path.unlink()
 

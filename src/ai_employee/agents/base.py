@@ -20,6 +20,12 @@ from ai_employee.core.trace import clip, clip_obj, tool_clip
 from ai_employee.memory import MemoryManager, MemoryNamespace
 from ai_employee.tools import ToolRegistry
 from ai_employee.tools.invocation_history import bind_dedup_scope, reset_dedup_scope
+from ai_employee.verification.evidence import (
+    expects_code_change,
+    is_mutating_call,
+    is_test_call,
+    output_tail,
+)
 
 _SCOPE_SEQ = itertools.count()
 
@@ -32,7 +38,11 @@ def _scope_counter() -> int:
 log = get_logger("agent")
 
 _PROBE_TOOLS = frozenset({"fetch_page", "http_request"})
-_RESOURCE_DOWNLOAD_AGENTS = frozenset({"research", "resource_acquirer", "resource_downloader"})
+#: Wording that asks a step to obtain resources (not merely find them). Only
+#: such steps get pushed to call download_resource before finishing.
+_ACQUIRE_RE = re.compile(
+    r"\b(?:download|acquire|obtain|fetch|grab|save)\w*\b|\binto the workspace\b", re.I
+)
 
 
 @dataclass
@@ -51,6 +61,10 @@ class AgentContext:
     session_context: str = ""
     # Operations the human has pre-approved for this run (e.g. {"shell_write"}).
     approved_ops: set[str] = field(default_factory=set)
+    #: Tools withheld for this run even if the agent normally has them — e.g.
+    #: plan mode runs ``research`` without download tools. Hidden from the model
+    #: and refused if it calls them anyway.
+    denied_tools: frozenset[str] = frozenset()
     scratch: dict[str, Any] = field(default_factory=dict)
 
 
@@ -101,7 +115,11 @@ class ToolUsingAgent(BaseAgent):
     async def _run_inner(self, task: str, ctx: AgentContext) -> AgentResult:
         log.info("agent.start", agent=self.name, session=ctx.session_id)
         messages = await self._build_initial_messages(task, ctx)
-        tool_specs = ctx.tools.specs(self.allowed_tools)
+        tool_specs = self._exposed_specs(ctx)
+        exposed = {spec.name for spec in tool_specs}
+        # Push toward download_resource only when this step is meant to obtain
+        # resources and can: "find a model" must not turn into a download.
+        acquiring = "download_resource" in exposed and bool(_ACQUIRE_RE.search(task[:2000]))
         trace: list[dict[str, Any]] = []
         settings = get_settings()
         # Count tool failures by (tool, error-class) so we can bail out of a
@@ -123,9 +141,17 @@ class ToolUsingAgent(BaseAgent):
         )
         extensions_used = 0
         loop_checks: list[dict[str, Any]] = []
+        # A step that must change files but keeps only reading gets nudged to
+        # apply its edit, instead of spending the whole budget re-reading code.
+        change_task = expects_code_change(task)
+        nudge_every = max(0, int(settings.agent_write_nudge_after))
+        writes = 0
+        calls_since_write = 0
+        nudges = 0
+        final_nudge_sent = False
 
         while True:
-            for _ in range(max_iterations):
+            for iteration in range(max_iterations):
                 steps_done += 1
                 # Keep context (and per-call latency) from compounding as the loop runs.
                 messages = self._compact_history(messages, settings.agent_history_window)
@@ -153,8 +179,11 @@ class ToolUsingAgent(BaseAgent):
                             messages,
                             trace,
                             ctx,
+                            acquiring=acquiring,
                             stop_reason=(
-                                "truncated_at_token_limit" if truncated else "empty_or_truncated_answer"
+                                "truncated_at_token_limit"
+                                if truncated
+                                else "empty_or_truncated_answer"
                             ),
                             previous=output if truncated else "",
                         )
@@ -177,12 +206,35 @@ class ToolUsingAgent(BaseAgent):
 
                 # Record the assistant's tool request, then execute each call.
                 messages.append(
-                    Message(role=Role.assistant, content=result.content, tool_calls=result.tool_calls)
+                    Message(
+                        role=Role.assistant, content=result.content, tool_calls=result.tool_calls
+                    )
                 )
                 abort = False
                 pending_exc: ApprovalRequired | None = None
                 batched_pending: list[dict[str, Any]] = []
                 for call in result.tool_calls:
+                    if call.name not in exposed:
+                        # Outside this agent's (or this run's) tool set: refuse
+                        # rather than execute a tool the agent was never given.
+                        note = (
+                            f"Tool '{call.name}' is not available to the '{self.name}' "
+                            f"agent in this run. Available: {', '.join(sorted(exposed)) or 'none'}."
+                        )
+                        log.info("agent.tool_refused", agent=self.name, tool=call.name)
+                        trace.append(
+                            {
+                                "tool": call.name,
+                                "args": call.arguments,
+                                "ok": False,
+                                "output": "",
+                                "error": note,
+                                "observation": note,
+                            }
+                        )
+                        calls_since_write += 1
+                        messages.append(Message.tool(note, tool_call_id=call.id, name=call.name))
+                        continue
                     try:
                         tool_result = await ctx.tools.execute(
                             call.name,
@@ -199,10 +251,7 @@ class ToolUsingAgent(BaseAgent):
                                 count=dup_total,
                             )
                             if dup_total >= 3:
-                                if (
-                                    self.name in _RESOURCE_DOWNLOAD_AGENTS
-                                    and not self._downloads_attempted(trace)
-                                ):
+                                if acquiring and not self._downloads_attempted(trace):
                                     observation += (
                                         "\n\n[SYSTEM] Too many repeated searches. Stop searching "
                                         "and call download_resource on your best YouTube and "
@@ -216,16 +265,26 @@ class ToolUsingAgent(BaseAgent):
                                     )
                                     stop_reason = "aborted after repeated duplicate tool calls"
                                     abort = True
-                        trace.append(
-                            {
-                                "tool": call.name,
-                                "args": call.arguments,
-                                "ok": tool_result.ok,
-                                "output": tool_clip(tool_result.output),
-                                "error": tool_result.error,
-                                "observation": tool_clip(observation),
-                            }
-                        )
+                        entry: dict[str, Any] = {
+                            "tool": call.name,
+                            "args": call.arguments,
+                            "ok": tool_result.ok,
+                            "output": tool_clip(tool_result.output),
+                            "error": tool_result.error,
+                            "observation": tool_clip(observation),
+                        }
+                        # Keep the END of test output: that is where runners print
+                        # "Ran N tests ... OK"/"FAILED", which tool_clip cuts off.
+                        if is_test_call(call.name, call.arguments):
+                            entry["result_tail"] = output_tail(
+                                tool_result.output, tool_result.error
+                            )
+                        trace.append(entry)
+                        if tool_result.ok and is_mutating_call(call.name, call.arguments):
+                            writes += 1
+                            calls_since_write = 0
+                        else:
+                            calls_since_write += 1
                         if not tool_result.ok:
                             ecls = self._error_class(tool_result.error)
                             sig = f"{call.name}:{ecls}"
@@ -259,7 +318,7 @@ class ToolUsingAgent(BaseAgent):
                                     count=fail_counts[sig],
                                 )
                                 if (
-                                    self.name in _RESOURCE_DOWNLOAD_AGENTS
+                                    acquiring
                                     and call.name in _PROBE_TOOLS
                                     and not self._downloads_attempted(trace)
                                 ):
@@ -271,7 +330,7 @@ class ToolUsingAgent(BaseAgent):
                                         "on every YouTube and Hugging Face URL before finishing."
                                     )
                                 elif (
-                                    self.name in _RESOURCE_DOWNLOAD_AGENTS
+                                    acquiring
                                     and call.name == "download_resource"
                                     and not self._downloads_succeeded(trace)
                                 ):
@@ -380,6 +439,43 @@ class ToolUsingAgent(BaseAgent):
                         tool_trace=trace,
                         needs_approval={"operation": pending_exc.operation, **payload},
                     )
+                if change_task and writes == 0 and messages and messages[-1].role == Role.tool:
+                    nudge = ""
+                    is_final = False
+                    final_window = extensions_used >= max_extensions
+                    rounds_left = max_iterations - iteration - 1
+                    if final_window and rounds_left <= 3 and not final_nudge_sent:
+                        final_nudge_sent = is_final = True
+                        nudge = (
+                            f"\n\n[PLATFORM NOTICE] Only {rounds_left} tool round(s) remain "
+                            "for this step and NOTHING has been written to disk yet. Apply "
+                            "your edit NOW (write_file, or a python_exec that rewrites the "
+                            "file). An edit described only in prose counts as not done."
+                        )
+                    elif (
+                        nudge_every
+                        and nudges < 3
+                        and calls_since_write >= nudge_every * (nudges + 1)
+                    ):
+                        nudges += 1
+                        nudge = (
+                            f"\n\n[PLATFORM NOTICE] {calls_since_write} tool calls so far and no "
+                            "file has been changed. This step must change files on disk. You "
+                            "already have enough context (earlier steps' findings are in your "
+                            "task) — stop re-reading and apply the edit now with write_file or "
+                            "a python_exec that rewrites the file, then verify it."
+                        )
+                    if nudge:
+                        log.info(
+                            "agent.write_nudge",
+                            agent=self.name,
+                            calls=calls_since_write,
+                            final=is_final,
+                        )
+                        last = messages[-1]
+                        messages[-1] = last.model_copy(
+                            update={"content": (last.content or "") + nudge}
+                        )
                 if abort:
                     break
 
@@ -424,7 +520,7 @@ class ToolUsingAgent(BaseAgent):
 
         # Loop ended (iterations exhausted, or aborted on a repeated failure).
         stop_reason = stop_reason or "max_iterations reached"
-        output = await self._final_answer(messages, trace, ctx, stop_reason)
+        output = await self._final_answer(messages, trace, ctx, stop_reason, acquiring=acquiring)
         log.info(
             "agent.answer",
             agent=self.name,
@@ -450,6 +546,8 @@ class ToolUsingAgent(BaseAgent):
         ctx: AgentContext,
         stop_reason: str | None,
         previous: str = "",
+        *,
+        acquiring: bool = False,
     ) -> str:
         """Force a non-empty step output so dependents are not skipped.
 
@@ -458,7 +556,7 @@ class ToolUsingAgent(BaseAgent):
         """
         settings = get_settings()
         history = self._compact_history(messages, settings.agent_history_window)
-        if self.name in _RESOURCE_DOWNLOAD_AGENTS and not self._downloads_attempted(trace):
+        if acquiring and not self._downloads_attempted(trace):
             prompt = (
                 "Stop using search/fetch tools. You MUST call download_resource on every "
                 "YouTube and Hugging Face URL you found (yt-dlp and huggingface_hub are "
@@ -475,10 +573,19 @@ class ToolUsingAgent(BaseAgent):
                 f"The truncated attempt started:\n{previous[:500]}"
             )
         else:
+            reason = stop_reason or "max_iterations reached"
+            why = (
+                "this step's tool-call budget is used up"
+                if "max_iterations" in reason
+                else f"tool use for this step was stopped ({reason})"
+            )
             prompt = (
-                "Stop using tools now. Write a concise final answer (under 400 words). "
-                "Lead with results and file paths. Clearly state any blocker. "
-                "Do not narrate your reasoning."
+                f"[PLATFORM NOTICE — automatic, not from the user] {why}, so no more "
+                "tools can run. Write a concise final answer now (under 400 words). Lead "
+                "with results and file paths. Be exact about what is SAVED ON DISK or was "
+                "actually RUN versus only proposed — never present an unapplied edit or "
+                "an unrun test as done. State any real blocker, but do not describe this "
+                "platform limit as a user instruction. Do not narrate your reasoning."
             )
         first = await ctx.brain.chat([*history, Message.user(prompt)], temperature=0.2)
         text = (first.content or "").strip()
@@ -515,6 +622,13 @@ class ToolUsingAgent(BaseAgent):
             snippet = re.sub(r"\s+", " ", str(payload or ""))[:700]
             lines.append(f"- {entry.get('tool')} [{status}]: {snippet}")
         return "\n".join(lines)
+
+    def _exposed_specs(self, ctx: AgentContext) -> list:
+        """The tool specs this agent may use in this run (its list minus denials)."""
+        specs = ctx.tools.specs(self.allowed_tools)
+        if ctx.denied_tools:
+            specs = [spec for spec in specs if spec.name not in ctx.denied_tools]
+        return specs
 
     @staticmethod
     def _downloads_attempted(trace: list[dict[str, Any]]) -> bool:
@@ -635,12 +749,9 @@ class ToolUsingAgent(BaseAgent):
         if ctx.session_context:
             context_blobs.append(ctx.session_context)
         if ctx.memory is not None and get_settings().use_stored_memory:
-            relevant = await ctx.memory.recall(
-                task,
-                namespace=MemoryNamespace.long_term,
-                k=4,
-                session_id=ctx.session_id,
-            )
+            # Both recalls skip task-specific records (instance ids, SHAs, raw
+            # task dumps) so old benchmark prompts never leak into new runs.
+            relevant = await ctx.memory.find_knowledge(task, k=4, session_id=ctx.session_id)
             # Zero-shot evaluations want no cross-session skill leakage.
             skills = (
                 await ctx.memory.find_skill(task, k=2)

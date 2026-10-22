@@ -53,7 +53,7 @@ class _PlanBrain:
         ("task", None),
         ("research", "research"),
         ("plan", "planner"),
-        ("download", "resource_downloader"),
+        ("download", "research"),
         (None, None),
         ("unknown-mode", None),
         ("  TASK  ", None),
@@ -72,9 +72,7 @@ async def test_planner_forces_every_step_onto_the_base_agent() -> None:
         {"name": "testing", "role": "QA", "description": "tests code"},
     ]
 
-    plan = await Planner(brain).make_plan(
-        "build it", agent_catalog=catalog, base_agent="research"
-    )
+    plan = await Planner(brain).make_plan("build it", agent_catalog=catalog, base_agent="research")
 
     assert [s.agent for s in plan.steps] == ["research", "research", "research"]
 

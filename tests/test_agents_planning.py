@@ -22,13 +22,27 @@ def test_planner_prompt_separates_tabular_from_video():
     assert "kind=speech" in src
 
 
-def test_registry_has_all_agents():
+def test_registry_has_the_consolidated_roster():
     reg = build_agent_registry()
-    names = set(reg.names())
-    for expected in ("planner", "ceo", "research", "coding", "security", "human_approval"):
-        assert expected in names
-    assert "resource_downloader" in names
-    assert len(names) >= 20
+    assert set(reg.names()) == {
+        # workers
+        "research",
+        "coding",
+        "testing",
+        "git",
+        "data_analysis",
+        "documentation",
+        "reviewer",
+        "comms",
+        # internal roles
+        "planner",
+        "ceo",
+        "human_approval",
+    }
+    # Retired names still resolve, so old checkpoints and pins keep working.
+    assert reg.get("resource_downloader").name == "research"
+    assert reg.get("security").name == "reviewer"
+    assert "codesmith" in reg
 
 
 async def test_planner_produces_plan(brain):
@@ -49,14 +63,25 @@ def test_generic_assignment_correction_routes_to_specialists():
     # A weak model leaves these on `research`; the safety net must fix them.
     assert _correct_generic_assignment("Implement the minimal fix", "research", valid) == "coding"
     assert _correct_generic_assignment("Add a regression test", "research", valid) == "testing"
-    assert _correct_generic_assignment("Clone the repo and check out the commit", "research", valid) == "git"
-    assert _correct_generic_assignment("Create a pandas EDA with charts", "research", valid) == "data_analysis"
+    assert (
+        _correct_generic_assignment("Clone the repo and check out the commit", "research", valid)
+        == "git"
+    )
+    assert (
+        _correct_generic_assignment("Create a pandas EDA with charts", "research", valid)
+        == "data_analysis"
+    )
 
     # Genuine research stays research.
-    assert _correct_generic_assignment("Search the web for a model", "research", valid) == "research"
+    assert (
+        _correct_generic_assignment("Search the web for a model", "research", valid) == "research"
+    )
 
     # A model that already picked a specialist is never overridden.
-    assert _correct_generic_assignment("Implement the minimal fix", "data_analysis", valid) == "data_analysis"
+    assert (
+        _correct_generic_assignment("Implement the minimal fix", "data_analysis", valid)
+        == "data_analysis"
+    )
 
     # If the target specialist is absent, leave the assignment alone.
     assert _correct_generic_assignment("Implement the fix", "research", {"research"}) == "research"
@@ -197,7 +222,7 @@ async def test_duplicate_abort_keeps_toolcalls_paired(settings):
         assert pending == [], f"dangling tool_call ids (no response): {pending}"
 
 
-async def test_resource_acquirer_continues_after_fetch_page_failures(settings):
+async def test_research_download_continues_after_fetch_page_failures(settings):
     """fetch_page 403 must not abort the loop before download_resource is tried."""
     from pydantic import BaseModel
 
@@ -266,7 +291,7 @@ async def test_resource_acquirer_continues_after_fetch_page_failures(settings):
             return ChatResult(content="downloaded", tool_calls=[], usage=Usage())
 
     class _Agent(ToolUsingAgent):
-        name = "resource_acquirer"
+        name = "research"
         allowed_tools = ["fetch_page", "download_resource"]
         max_iterations = 6
 
@@ -275,7 +300,9 @@ async def test_resource_acquirer_continues_after_fetch_page_failures(settings):
     reg.register(DownloadTool())
     begin_task_tool_history()
     try:
-        result = await _Agent().run("get mall video", AgentContext(brain=_Brain(), tools=reg))
+        result = await _Agent().run(
+            "download a mall video", AgentContext(brain=_Brain(), tools=reg)
+        )
     finally:
         clear_task_tool_history()
 
@@ -489,7 +516,7 @@ def test_data_analysis_spec_handles_encoding_and_budget():
     assert "image dataset" in prompt
     assert "speech/audio" in prompt
     assert "list_dir" in (spec.tools or ())
-    acquirer = spec_by_name()["resource_acquirer"]
+    acquirer = spec_by_name()["research"]
     assert "kind=tabular" in acquirer.system_prompt
     assert "kind=image" in acquirer.system_prompt
     assert "kind=speech" in acquirer.system_prompt
@@ -726,8 +753,6 @@ async def test_human_approval_agent_honors_granted_approval(brain, settings):
     first = await agent.run(op, ctx)
     assert not first.success and first.needs_approval == {"operation": op}
 
-    ctx_approved = AgentContext(
-        brain=brain, tools=default_registry(settings), approved_ops={op}
-    )
+    ctx_approved = AgentContext(brain=brain, tools=default_registry(settings), approved_ops={op})
     second = await agent.run(op, ctx_approved)
     assert second.success and not second.needs_approval

@@ -383,7 +383,7 @@ async def test_parallel_events_are_attributed_to_their_step(monkeypatch) -> None
     """
     from ai_employee.workflows.employee_graph import Orchestrator
 
-    agents = {1: "scout", 2: "research", 3: "hardware_analyst"}
+    agents = {1: "coding", 2: "research", 3: "data_analysis"}
 
     async def fake_plan(self, _state):
         return {

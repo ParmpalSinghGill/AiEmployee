@@ -85,6 +85,30 @@ async def employee():
     await emp.aclose()
 
 
+async def drain_background_tasks(timeout: float = 10.0) -> None:
+    """Stop UI task runs a test started but did not wait for.
+
+    ``TaskManager`` runs each task as a background asyncio task. A test that only
+    checks the immediate API response leaves it running; if it is still inside a
+    subprocess spawn when pytest-asyncio closes the loop, loop shutdown can
+    deadlock. Cancel and await them here, while this test's loop is still alive.
+    """
+    import asyncio
+
+    current = asyncio.current_task()
+    leftovers = [
+        t
+        for t in asyncio.all_tasks()
+        if t is not current
+        and not t.done()
+        and getattr(t.get_coro(), "__qualname__", "") == "TaskManager._execute"
+    ]
+    for task in leftovers:
+        task.cancel()
+    if leftovers:
+        await asyncio.wait(leftovers, timeout=timeout)
+
+
 @pytest.fixture
 async def client():
     from httpx import ASGITransport, AsyncClient
@@ -95,3 +119,4 @@ async def client():
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
+    await drain_background_tasks()

@@ -129,6 +129,7 @@ class RecoveredRun:
             "auto_approve": False,
             "token_budget": 0,
             "tokens_used": 0,
+            "log_file": f"data/sessions/{self.session_id}/runs/{self.task_id}.json",
         }
 
 

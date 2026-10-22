@@ -4,13 +4,16 @@ Given an ML problem, this graph:
 
     discover → decide → [hardware] → generate → [run?] → assemble → END
 
-* **discover** — the ``scout`` agent searches HF / Papers With Code / Kaggle /
-  arXiv / GitHub and we coerce its findings into a typed :class:`Discovery`.
+* **discover** — the ``research`` agent (download tools withheld) searches HF /
+  Papers With Code / Kaggle / arXiv / GitHub and we coerce its findings into a
+  typed :class:`Discovery`.
 * **decide** — pure Python picks a branch from what was found:
   ``both`` (model+data) · ``model_only`` · ``data_only`` · ``neither``.
-* **hardware** — when a model exists, the ``hardware_analyst`` estimates VRAM.
-* **generate** — the ``codesmith`` writes the right code (eval / inference /
-  training / reproduce-from-paper) **plus** download & run instructions.
+* **hardware** — when a model exists, ``research`` estimates VRAM with
+  ``estimate_hardware``.
+* **generate** — the ``coding`` agent writes the right code (eval / inference /
+  training / reproduce-from-paper) **plus** download & run instructions, using
+  only the resources discovery handed it (coding has no web access).
 * **run** — *approval-gated*. By default we only generate; if the caller approved
   ``run_research_code`` we execute the code in the workspace and capture accuracy,
   otherwise we surface an approval request and stop.
@@ -29,6 +32,7 @@ from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
 from ai_employee.agents import AgentContext, AgentRegistry
+from ai_employee.agents.specs import NO_ACQUISITION_TOOLS
 from ai_employee.brains.base import Brain
 from ai_employee.brains.schemas import Message
 from ai_employee.core.logging import bind_context, get_logger
@@ -162,13 +166,20 @@ class ResearchOrchestrator:
         return g.compile()
 
     # ── context helper ───────────────────────────────────────────────────────
-    def _context(self, state: ResearchState, extra: dict | None = None) -> AgentContext:
+    def _context(
+        self,
+        state: ResearchState,
+        extra: dict | None = None,
+        *,
+        denied_tools: frozenset[str] = frozenset(),
+    ) -> AgentContext:
         ctx = AgentContext(
             brain=self._brain,
             tools=self._tools,
             memory=self._memory,
             session_id=state.get("session_id", "default"),
             approved_ops=set(state.get("approved_ops") or set()),
+            denied_tools=denied_tools,
         )
         ctx.scratch["agent_catalog"] = self._agents.catalog()
         if extra:
@@ -177,18 +188,20 @@ class ResearchOrchestrator:
 
     # ── nodes ────────────────────────────────────────────────────────────────
     async def _discover_node(self, state: ResearchState) -> ResearchState:
-        bind_context(node="discover", agent="scout", session=state.get("session_id"))
-        ctx = self._context(state)
+        bind_context(node="discover", agent="research", session=state.get("session_id"))
+        # Discovery only: the research agent finds and reports, it does not download.
+        ctx = self._context(state, denied_tools=NO_ACQUISITION_TOOLS)
         task = (
             f"Find pretrained models, datasets and (if needed) the method paper for "
             f"this problem:\n\n{state['goal']}\n\n"
             "Search Hugging Face first, then Papers With Code, Kaggle, arXiv and GitHub "
             "(and Roboflow Universe for computer-vision problems). "
-            "Report every real resource you found with its id/url."
+            "Report every real resource you found with its id/url. Do NOT download "
+            "anything — this step only finds and reports."
         )
         narrative = ""
         try:
-            res = await self._agents.get("scout").run(task, ctx)
+            res = await self._agents.get("research").run(task, ctx)
             narrative = res.output
         except Exception as exc:  # noqa: BLE001
             log.warning("research.scout_failed", error=str(exc))
@@ -245,9 +258,9 @@ class ResearchOrchestrator:
         return {"branch": branch, "trace": [{"node": "decide", "branch": branch}]}
 
     async def _hardware_node(self, state: ResearchState) -> ResearchState:
-        bind_context(node="hardware", agent="hardware_analyst")
+        bind_context(node="hardware", agent="research")
         top = state["discovery"].models[0]
-        ctx = self._context(state)
+        ctx = self._context(state, denied_tools=NO_ACQUISITION_TOOLS)
         task = (
             f"Estimate the GPU/VRAM needed for inference and full fine-tuning of the "
             f"model '{top.id}'. Use estimate_hardware (pass model_id='{top.id}'). "
@@ -255,14 +268,14 @@ class ResearchOrchestrator:
         )
         hardware: dict[str, Any] = {"model_id": top.id}
         try:
-            res = await self._agents.get("hardware_analyst").run(task, ctx)
+            res = await self._agents.get("research").run(task, ctx)
             hardware["summary"] = res.output
         except Exception as exc:  # noqa: BLE001
             hardware["summary"] = f"(hardware estimate unavailable: {exc})"
         return {"hardware": hardware, "trace": [{"node": "hardware", "model": top.id}]}
 
     async def _generate_node(self, state: ResearchState) -> ResearchState:
-        bind_context(node="generate", agent="codesmith")
+        bind_context(node="generate", agent="coding")
         branch = state["branch"]
         d = state["discovery"]
         ctx = self._context(state)
@@ -280,7 +293,7 @@ class ResearchOrchestrator:
         )
         generated: dict[str, Any] = {"branch": branch}
         try:
-            res = await self._agents.get("codesmith").run(task, ctx)
+            res = await self._agents.get("coding").run(task, ctx)
             generated["instructions"] = res.output
             generated["files"] = res.metadata.get("written_files", [])
         except Exception as exc:  # noqa: BLE001
@@ -296,7 +309,7 @@ class ResearchOrchestrator:
         return "assemble"  # _run_node not reached; approval surfaced in assemble
 
     async def _run_node(self, state: ResearchState) -> ResearchState:
-        bind_context(node="run", agent="codesmith")
+        bind_context(node="run", agent="coding")
         ctx = self._context(state)
         task = (
             "Run the evaluation/inference script you just generated in the workspace. "
@@ -305,7 +318,7 @@ class ResearchOrchestrator:
         )
         accuracy: dict[str, Any] = {}
         try:
-            res = await self._agents.get("codesmith").run(task, ctx)
+            res = await self._agents.get("coding").run(task, ctx)
             accuracy = {"report": res.output, "ran": True}
         except Exception as exc:  # noqa: BLE001
             accuracy = {"report": f"(run failed: {exc})", "ran": False}

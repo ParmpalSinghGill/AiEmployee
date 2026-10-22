@@ -22,15 +22,17 @@ SCENARIOS: tuple[Scenario, ...] = (
             "and download status."
         ),
         table=(
-            "planner -> resource_acquirer (or research) -> ceo; human_approval only if "
+            "planner -> research -> ceo; human_approval only if "
             "needed. A suitable dataset, a verified source URL, an actual local path if "
             "the download succeeded, and an honest explanation if access is blocked. It "
             "should NOT claim a download based only on search results."
         ),
         mode="task",
-        require_any=(("resource_acquirer", "research", "resource_downloader", "scout"),),
+        require_agents=("research",),
         checks=("s1_source_url_or_notfound", "s1_no_false_download", "s1_honest_if_blocked"),
-        grant=frozenset({"shell_write", "resource_download", "resource_acquisition", "waiting_for_user"}),
+        grant=frozenset(
+            {"shell_write", "resource_download", "resource_acquisition", "waiting_for_user"}
+        ),
         notes="Network + approval heavy; the key failure mode is a false download claim.",
     ),
     Scenario(
@@ -72,7 +74,12 @@ SCENARIOS: tuple[Scenario, ...] = (
         ),
         mode="task",
         require_agents=("coding", "testing", "documentation"),
-        checks=("s3_endpoint_present", "s3_tests_present", "s3_readme_updated", "s3_summary_cites_files"),
+        checks=(
+            "s3_endpoint_present",
+            "s3_tests_present",
+            "s3_readme_updated",
+            "s3_summary_cites_files",
+        ),
         grant=_APPROVE_WRITE,
         seed=seed_sample_project,
         notes="Targets the seeded ./sampleapp project so the sandbox can read/write it.",
@@ -86,12 +93,12 @@ SCENARIOS: tuple[Scenario, ...] = (
             "script and instructions. Do not run the script."
         ),
         table=(
-            "planner -> scout -> hardware_analyst and codesmith -> ceo. Verified model "
+            "planner -> research (find + VRAM) -> coding -> ceo. Verified model "
             "and dataset references, a concrete hardware estimate with assumptions, an "
             "evaluation script and run instructions, and NO claim that evaluation ran."
         ),
         mode="task",
-        require_agents=("scout", "hardware_analyst", "codesmith"),
+        require_agents=("research", "coding"),
         checks=(
             "s4_references_model",
             "s4_references_dataset",
@@ -112,12 +119,12 @@ SCENARIOS: tuple[Scenario, ...] = (
             "files or deploy anything."
         ),
         table=(
-            "planner -> devops and security (possibly reviewer) -> ceo. Findings tied to "
+            "planner -> reviewer -> ceo. Findings tied to "
             "actual files and lines, severity and rationale, practical recommendations, "
             "and confirmation that the task was review-only."
         ),
         mode="task",
-        require_agents=("devops", "security"),
+        require_agents=("reviewer",),
         checks=(
             "s5_references_files",
             "s5_severity_language",

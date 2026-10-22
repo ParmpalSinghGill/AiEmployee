@@ -4,8 +4,9 @@ Given a high-level goal, this graph:
 
     research → synthesize → assemble → END
 
-* **research** — the ``plan_researcher`` agent searches the web and public hubs for
-  approaches, libraries, and products that can complete the goal.
+* **research** — the ``research`` agent (download/write tools withheld) searches
+  the web and public hubs for approaches, libraries, and products that can
+  complete the goal.
 * **synthesize** — the Brain produces a typed :class:`PlanGuide`: ordered steps
   ("first do this, then that"), tools to use, and whether each tool is
   open-source or proprietary.
@@ -23,6 +24,7 @@ from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
 from ai_employee.agents import AgentContext, AgentRegistry
+from ai_employee.agents.specs import NO_ACQUISITION_TOOLS
 from ai_employee.brains.base import Brain
 from ai_employee.brains.schemas import Message
 from ai_employee.core.logging import bind_context, get_logger
@@ -139,12 +141,14 @@ class PlanOrchestrator:
             memory=self._memory,
             session_id=state.get("session_id", "default"),
             approved_ops=set(),
+            # Guide-only: research may search and read, never download or write.
+            denied_tools=NO_ACQUISITION_TOOLS,
         )
         ctx.scratch["agent_catalog"] = self._agents.catalog()
         return ctx
 
     async def _research_node(self, state: PlanState) -> PlanState:
-        bind_context(node="research", agent="plan_researcher", session=state.get("session_id"))
+        bind_context(node="research", agent="research", session=state.get("session_id"))
         ctx = self._context(state)
         task = (
             f"Research how to accomplish this goal end-to-end. Do NOT download files "
@@ -162,8 +166,7 @@ class PlanOrchestrator:
         )
         notes = ""
         try:
-            agent_name = "plan_researcher" if "plan_researcher" in self._agents.names() else "scout"
-            res = await self._agents.get(agent_name).run(task, ctx)
+            res = await self._agents.get("research").run(task, ctx)
             notes = res.output or ""
         except Exception as exc:  # noqa: BLE001
             log.warning("plan.research_failed", error=str(exc))

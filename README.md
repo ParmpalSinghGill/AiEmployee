@@ -89,20 +89,25 @@ your approval before it downloads anything large.
         └────── Verification ──────────────┘   (self-review, retry, confidence)
 ```
 
-### The team (29 agents)
+### The team (8 workers + 3 orchestration roles)
 
 <details>
-<summary><b>Every agent, grouped by what it does</b> — <code>python -m ai_employee agents</code></summary>
+<summary><b>Every agent, and the one kind of work it owns</b> — <code>python -m ai_employee agents</code></summary>
 
-| Group | Agents |
+| Agent | Owns |
 |---|---|
-| **Orchestration** | `ceo` · `planner` · `task_manager` · `plan_researcher` · `human_approval` |
-| **Research & acquisition** | `research` · `browser` · `scout` · `hardware_analyst` · `resource_acquirer` · `resource_downloader` |
-| **Engineering** | `coding` · `codesmith` · `reviewer` · `testing` · `qa` · `security` · `git` |
-| **Data & knowledge** | `data_analysis` · `database` · `rag` · `knowledge_manager` · `documentation` |
-| **Infrastructure** | `devops` · `monitoring` |
-| **Memory & learning** | `memory_manager` · `learning` |
-| **Productivity** | `email` · `calendar` |
+| `research` | External information: web research, ML models/datasets/papers on public hubs, downloads, GPU/VRAM estimates |
+| `coding` | Local code: app code, bug fixes, Docker/CI/deploy config, SQL/schemas, ML scripts (no web access) |
+| `testing` | Writing/running tests and pass/fail validation against requirements |
+| `git` | Clone, checkout, status/diff, commit |
+| `data_analysis` | Fetching public data by code, EDA, KPIs, charts |
+| `documentation` | READMEs, reports, written explanations |
+| `reviewer` | Read-only code, security and logs/health review |
+| `comms` | Gmail + Google Calendar (offered to the planner only when Google is connected) |
+| *orchestration* | `planner` · `ceo` · `human_approval` (never assigned a step) |
+
+Retired names from the older 26-agent roster (`scout`, `codesmith`, `devops`, `qa`, …)
+still resolve to their successors via `LEGACY_AGENT_ALIASES` in `agents/routing.py`.
 
 Most are declarative `AgentSpec`s in `agents/specs.py` — adding one is a few lines, no
 new class. See [`docs/extending.md`](docs/extending.md).

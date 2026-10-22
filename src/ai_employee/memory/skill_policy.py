@@ -47,6 +47,31 @@ _QUESTION_RE = re.compile(
     re.I,
 )
 
+#: Conversational second-person openers ("do you update…", "can you…") — a chat
+#: follow-up, never a skill, with or without a trailing ``?``.
+_CONVERSATIONAL_RE = re.compile(
+    r"^(?:do|does|did|can|could|will|would|should|have|has|are|were|is)\s+"
+    r"(?:you|u|we|it|this|that)\b",
+    re.I,
+)
+
+#: Specific issue/PR/ticket references (``Ticket #30557``, ``issue 1234``,
+#: ``PR #88``, ``github.com/o/r/issues/12``). A bare ``#123`` is allowed so hex
+#: colours like ``#333333`` in a charting skill are not rejected.
+_ISSUE_REF_RE = re.compile(
+    r"\b(?:ticket|issue|bug|pr|pull\s+request)\s*#?\s*\d{2,}\b" r"|/(?:issues|pull)/\d+",
+    re.I,
+)
+
+#: A title describing one specific bug fix: a fix-verb, an exception class, and a
+#: concrete code identifier (``Fix IndexError in export_text when …``).
+_BUG_TITLE_RE = re.compile(
+    r"^(?:fix(?:es|ed|ing)?|resolve[sd]?|patch(?:es|ed)?|repair)\b"
+    r"(?=.*\b\w+(?:Error|Exception)\b)"
+    r"(?=.*(?:\b[a-z]+_[a-z0-9_]+\b|\b\w+\.\w+\b|\w+\(\)))",
+    re.I,
+)
+
 #: Skills must be concise; anything longer is almost certainly a pasted plan/task.
 MAX_SKILL_WORDS = 150
 
@@ -152,12 +177,38 @@ def skill_rejection_reason(
     if _RAW_TITLE_RE.search(name):
         return "title pastes the raw task prompt"
 
+    if _ISSUE_REF_RE.search(combined):
+        return "references a specific issue/PR/ticket number"
+
     title = name.splitlines()[0].strip() if name else ""
     if title.rstrip().endswith("?") and _QUESTION_RE.search(title):
         return "looks like a one-off question, not a reusable skill"
+    if _CONVERSATIONAL_RE.search(title):
+        return "looks like a conversational follow-up, not a reusable skill"
+    if _BUG_TITLE_RE.search(title):
+        return "describes one specific bug fix, not a reusable workflow"
 
     if description.lower().startswith(_RAW_GOAL_PREFIX):
         return "description echoes the raw task goal"
+    return None
+
+
+def task_specific_reason(text: str) -> str | None:
+    """Why free text (e.g. a long-term ``GOAL:`` memory) is task-specific, or ``None``.
+
+    Used for non-skill memories recalled into the same prompt block: a stored raw
+    benchmark prompt would re-inject its instance id, SHA and issue dump.
+    """
+    text = text or ""
+    if _INSTANCE_ID_RE.search(text):
+        return "contains a task/benchmark instance id"
+    if _SHA_RE.search(text):
+        return "contains a git commit SHA"
+    # Only the GOAL part is checked for raw headers: the agent's own RESULT report
+    # legitimately uses numbered headings ("## 1. Summary").
+    goal = text.split("\nRESULT:", 1)[0]
+    if _RAW_HEADER_RE.search(goal):
+        return "contains raw task markdown headers"
     return None
 
 

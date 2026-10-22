@@ -1555,6 +1555,32 @@ async def get_task(
     return snap
 
 
+@router.get("/ui/api/sessions/{session_id}/runs/{task_id}/file", tags=["ui"])
+async def get_task_run_file(
+    session_id: str,
+    task_id: str,
+    user: CurrentUser = Depends(get_current_user),
+) -> FileResponse:
+    """Serve the raw JSON run log file saved on disk under sessions/runs."""
+    tm = get_task_manager()
+    task = _require_task(tm, task_id, user)
+    if task.session_id != session_id:
+        raise HTTPException(404, "task not found in this session")
+    settings = get_settings()
+    s_root = Path(settings.sessions_dir).expanduser().resolve()
+    target = s_root / session_id / "runs" / f"{task_id}.json"
+    if not target.is_file():
+        target = Path("data/sessions") / session_id / "runs" / f"{task_id}.json"
+    if not target.is_file():
+        raise HTTPException(404, "run log file not found on disk")
+    return FileResponse(
+        target,
+        media_type="application/json",
+        filename=f"{task_id}.json",
+        content_disposition_type="inline",
+    )
+
+
 @router.get("/ui/api/workspace/file", tags=["ui"])
 async def workspace_file(path: str = Query(..., min_length=1)) -> FileResponse:
     """Serve a file from the workspace for inline preview (video/image)."""

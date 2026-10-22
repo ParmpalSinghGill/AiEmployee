@@ -16,6 +16,9 @@ async def client():
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
+    from tests.conftest import drain_background_tasks
+
+    await drain_background_tasks()
 
 
 async def _wait_done(client, task_id, timeout=10.0):
@@ -653,3 +656,40 @@ async def test_cancel_finished_task_is_noop(client):
     r = await client.post(f"/ui/api/tasks/{start['task_id']}/cancel")
     assert r.status_code == 200
     assert r.json()["cancelled"] is False
+
+
+async def test_task_snapshot_has_log_file(client):
+    start = (await client.post("/ui/api/tasks", json={"goal": "check log file path"})).json()
+    task_id = start["task_id"]
+    snap = (await client.get(f"/ui/api/tasks/{task_id}")).json()
+    assert "log_file" in snap
+    assert snap["log_file"] == f"data/sessions/{snap['session_id']}/runs/{task_id}.json"
+
+
+async def test_get_task_run_file_endpoint(client, tmp_path, monkeypatch):
+    from pathlib import Path
+    import json
+    from ai_employee.config.settings import Settings
+    from ai_employee.api import ui
+
+    start = (await client.post("/ui/api/tasks", json={"goal": "check run file download"})).json()
+    task_id = start["task_id"]
+    snap = (await client.get(f"/ui/api/tasks/{task_id}")).json()
+    session_id = snap["session_id"]
+
+    # Write a test run json to the expected session runs directory
+    run_dir = Path("data/sessions") / session_id / "runs"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    run_file = run_dir / f"{task_id}.json"
+    run_file.write_text(json.dumps({"id": task_id, "session_id": session_id, "test": True}), encoding="utf-8")
+
+    try:
+        r = await client.get(f"/ui/api/sessions/{session_id}/runs/{task_id}/file")
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("application/json")
+        data = r.json()
+        assert data["id"] == task_id
+        assert data["test"] is True
+    finally:
+        if run_file.exists():
+            run_file.unlink()

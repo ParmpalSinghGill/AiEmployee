@@ -38,12 +38,12 @@ decomposing the goal into ordered steps:
     "success_criteria": "..." }, ... ] }
 ```
 The planner assigns each step to the best-fit agent from the full roster
-(**29 agents total** — 26 declarative ones in `agents/specs.py` + 3 bespoke
-classes in `agents/custom.py`; see [The agent roster](#the-agent-roster) below):
+(**8 workers** in `agents/specs.py` + 3 orchestration roles in `agents/custom.py`
+that are never assigned a step; see [The agent roster](#the-agent-roster) below):
 research for finding things, coding for code, data_analysis for data, testing for
 tests, and so on. A run may be **pinned** to one agent only when the caller passes
 `base_agent=...` explicitly (`agents/routing.py` maps the single-purpose modes to
-their owner — `plan` → `planner`, `download` → `resource_downloader`); the general
+their owner — `plan` → `planner`, `download` → `research`); the general
 `task` mode is **not** pinned, so its steps keep their specialist assignments.
 
 ### 2. EXECUTE — one step at a time (looped)
@@ -93,41 +93,28 @@ a reusable **skill** (so similar future goals are faster/better). See `docs/memo
 
 ## The agent roster
 
-**29 agents** are registered (`agents/registry.py::build_agent_registry`). The Planner
-routes each step to one of them by `name`. The live list is also available at runtime via
-`GET /agents` (and `emp.agents.catalog()`).
+**11 agents** are registered (`agents/registry.py::build_agent_registry`): 8 workers the
+Planner routes steps to by `name`, plus 3 orchestration roles. The live list is also
+available at runtime via `GET /agents` (and `emp.agents.catalog()`).
 
-**26 declarative agents** — pure `AgentSpec` data in `agents/specs.py` (role, system
-prompt, allowed tools). Grouped by `category`:
+**8 declarative agents** — pure `AgentSpec` data in `agents/specs.py` (role, system
+prompt, allowed tools). Each kind of work has exactly one owner:
 
-| Category | Agent (`name`) | Role | Tools |
-|---|---|---|---|
-| knowledge | `research` | Research Analyst | web + read/write |
-| knowledge | `rag` | Knowledge Retriever | read_file |
-| knowledge | `knowledge_manager` | Knowledge Manager | filesystem |
-| knowledge | `learning` | Learning Agent | web + filesystem |
-| engineering | `coding` | Software Engineer | code (switchable backend) |
-| engineering | `documentation` | Technical Writer | filesystem |
-| engineering | `git` | Version Control Engineer | shell + filesystem |
-| engineering | `testing` | Test Engineer | code |
-| quality | `qa` | QA Engineer | read_file, python_exec |
-| quality | `reviewer` | Code Reviewer | read_file, list_dir |
-| quality | `security` | Security Engineer | read_file, list_dir, shell |
-| data | `data_analysis` | Data Analyst | csv/json/python |
-| data | `database` | Database Engineer | python + read/write |
-| ops | `devops` | DevOps Engineer | code |
-| ops | `monitoring` | Monitoring Engineer | read_file, shell, http |
-| comms | `email` | Email Assistant | read_file (send = approval) |
-| comms | `calendar` | Calendar Assistant | none (reasoning only) |
-| management | `task_manager` | Task Manager | none (reasoning only) |
-| management | `memory_manager` | Memory Manager | none (reasoning only) |
-| web | `browser` | Browser Operator | web |
-| research | `plan_researcher` | Plan Researcher | hub discovery (no downloads) |
-| research | `resource_downloader` | Resource Downloader | download_resource + filesystem |
-| research | `resource_acquirer` | Resource Acquirer | hub search + download_resource |
-| research | `scout` | ML Resource Scout | hub discovery (no downloads) |
-| research | `hardware_analyst` | Hardware Analyst | estimate_hardware, hf_search, fetch_page |
-| research | `codesmith` | ML Code Generator | code + hf_search, fetch_page |
+| Agent (`name`) | Role | Tools |
+|---|---|---|
+| `research` | Research & Resource Analyst | web + hubs + download_resource + estimate_hardware + read/write |
+| `coding` | Software Engineer | code only — no web/hub tools (switchable backend) |
+| `testing` | Test & QA Engineer | code |
+| `git` | Version Control Engineer | shell + filesystem |
+| `data_analysis` | Data Analyst | csv/json/python |
+| `documentation` | Technical Writer | filesystem |
+| `reviewer` | Code, Security & Ops Reviewer | read_file, list_dir, shell (read-only), http_request |
+| `comms` | Communications Assistant | gmail_* + calendar_* (offered only when Google is connected) |
+
+Retired names (`scout`, `codesmith`, `devops`, `qa`, `security`, …) resolve to these via
+`LEGACY_AGENT_ALIASES` in `agents/routing.py`. A run can also withhold tools per call
+(`AgentContext.denied_tools`) — plan mode and research-mode discovery run `research`
+without download/write tools.
 
 **3 bespoke agents** — real classes in `agents/custom.py` with logic too specific for a
 spec:
