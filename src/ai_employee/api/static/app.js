@@ -546,7 +546,7 @@ function autoApprovePausedTasks() {
       const snap = state.cache.get(run.id);
       const status = snap?.status || run.status;
       if (status === "awaiting_approval") {
-        approveTask(s.id, run.id, { approve_all_similar: true }).catch(() => {});
+        approveTask(s.id, run.id, { approve_scope: "operation" }).catch(() => {});
       } else if (status === "waiting_for_user") {
         approveTask(s.id, run.id, {
           decision: "proceed_without",
@@ -664,7 +664,10 @@ function wireResourceApproval(task, session) {
 async function approveTask(sid, taskId, body) {
   const cb = document.getElementById(`appr-allow-all-${taskId}`);
   const payload = { ...(body || {}) };
-  payload.approve_all_similar = cb ? cb.checked : true;
+  // A button that names its scope decides; otherwise the "allow all" checkbox does.
+  if (!payload.approve_scope && payload.approve_all_similar === undefined) {
+    payload.approve_all_similar = cb ? cb.checked : true;
+  }
   try { await api("POST", `/ui/api/tasks/${taskId}/approve`, payload); }
   catch (e) { alert("Approve failed: " + e.message); return; }
   const s = state.sessions.get(sid);
@@ -745,7 +748,7 @@ function poll(taskId, sid) {
       if (snap.status === "awaiting_approval") {
         snap._autoApproving = true;
         state.cache.set(taskId, snap);
-        approveTask(sid, taskId, { approve_all_similar: true }).catch(() => {});
+        approveTask(sid, taskId, { approve_scope: "operation" }).catch(() => {});
       } else if (snap.status === "waiting_for_user") {
         snap._autoApproving = true;
         state.cache.set(taskId, snap);
@@ -1204,6 +1207,52 @@ function taskAwaitingApproval(task) {
   return task.status === "awaiting_approval" || task.status === "waiting_for_user";
 }
 
+/** Plain words for an approval key, used on the "approve all" button. */
+const APPROVAL_OP_LABELS = {
+  shell_write: "file-changing shell commands and file writes",
+  resource_download: "downloads",
+  resource_acquisition: "resource downloads",
+  email_send: "email sends",
+  calendar_write: "calendar changes",
+  git_push: "git pushes",
+  db_write: "database writes",
+  deploy: "deployments",
+  mcp_tool: "MCP tool calls",
+};
+
+function approvalOpLabel(op) {
+  return APPROVAL_OP_LABELS[op] || (op ? String(op).replace(/_/g, " ") : "similar operations");
+}
+
+/* A paused tool call offers two scopes: just this exact command, or every call
+ * with the same approval key for the rest of this task. */
+function approvalScopeButtonsHtml(btnId, btnClass, a) {
+  // batched_calls already includes the shown call itself.
+  const n = Math.max(1, (a.batched_calls || []).filter(c => c.tool).length);
+  const onlyLabel = n > 1 ? `Approve these ${n} commands only` : "Approve this command only";
+  const allLabel = `Approve all ${approvalOpLabel(a.operation)} for this task`;
+  return `<div class="appr-scope-actions">
+    <button class="btn primary${btnClass}" id="${esc(btnId)}" data-scope="command">${esc(onlyLabel)}</button>
+    <button class="btn${btnClass}" id="${esc(btnId)}-all" data-scope="operation">${esc(allLabel)}</button>
+  </div>
+  <div class="appr-scope-hint">"This command only" asks again for any different command. "Approve all" stops asking for this kind of action until the task ends.</div>`;
+}
+
+/* Wire a paused task's approve button(s): the single button, or the
+ * command / all-for-task pair. Safe to call repeatedly. */
+function wireApprovalButtons(btnId, task, session) {
+  const base = task.status === "waiting_for_user" ? { decision: "proceed_without" } : {};
+  for (const id of [btnId, `${btnId}-all`]) {
+    const btn = document.getElementById(id);
+    if (!btn || btn._wired) continue;
+    btn._wired = true;
+    btn.addEventListener("click", () => {
+      const scope = btn.dataset.scope;
+      approveTask(session.id, task.id, scope ? { ...base, approve_scope: scope } : (task.status === "waiting_for_user" ? base : undefined));
+    });
+  }
+}
+
 function approvalAllowAllHtml(taskId, approval) {
   const batched = (approval && approval.batched_calls) || [];
   const n = batched.length;
@@ -1235,7 +1284,9 @@ function approvalExplainBody(a, task, opts = {}) {
     const btnLabel = opts.buttonLabel
       || (task.status === "waiting_for_user" ? "Continue" : "Approve & continue");
     const btnClass = opts.buttonClass ? ` ${opts.buttonClass}` : "";
-    actions = `${approvalAllowAllHtml(task.id, a)}<button class="btn primary${btnClass}" id="${esc(btnId)}">${btnLabel}</button>`;
+    actions = task.status === "awaiting_approval" && a.tool
+      ? approvalScopeButtonsHtml(btnId, btnClass, a)
+      : `${approvalAllowAllHtml(task.id, a)}<button class="btn primary${btnClass}" id="${esc(btnId)}">${btnLabel}</button>`;
   }
   return `<div class="appr-what">Wants to <b>${esc(w.verb)}</b>${via}</div>${detail}${actions}`;
 }
@@ -1360,15 +1411,7 @@ function renderFlow(task, session) {
 
   // Wire the in-flow approve button once it's in the DOM (mirrors the Result tab).
   if (apprInfo && session) {
-    setTimeout(() => {
-      const btn = document.getElementById(`fapprove-${task.id}`);
-      if (btn) btn.addEventListener("click", () => {
-        const body = task.status === "waiting_for_user"
-          ? { decision: "proceed_without" }
-          : undefined;
-        approveTask(session.id, task.id, body);
-      });
-    }, 0);
+    setTimeout(() => wireApprovalButtons(`fapprove-${task.id}`, task, session), 0);
   }
 
   return coolingBar + summary + runLogFileBar(task) + parallelBar + `<div class="flow">` + nodes.join(conn()) + `</div>`;
@@ -1934,13 +1977,7 @@ function renderResult(task, session) {
 
   // Defer wiring the approve button until the node is in the DOM.
   setTimeout(() => {
-    const btn = document.getElementById(`approve-${task.id}`);
-    if (btn) btn.addEventListener("click", () => {
-      const body = task.status === "waiting_for_user"
-        ? { decision: "proceed_without" }
-        : undefined;
-      approveTask(session.id, task.id, body);
-    });
+    wireApprovalButtons(`approve-${task.id}`, task, session);
     wireResourceApproval(task, session);
     loadMediaGallery(task.id);
     loadDeliverables(task.id);
@@ -2015,10 +2052,7 @@ function renderResearch(task, session, r) {
 
   html += tokensBlock(r.tokens || res.tokens);
 
-  setTimeout(() => {
-    const btn = document.getElementById(`approve-${task.id}`);
-    if (btn) btn.addEventListener("click", () => approveTask(session.id, task.id));
-  }, 0);
+  setTimeout(() => wireApprovalButtons(`approve-${task.id}`, task, session), 0);
   return html;
 }
 

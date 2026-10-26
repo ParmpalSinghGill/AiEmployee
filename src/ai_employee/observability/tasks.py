@@ -492,8 +492,15 @@ class TaskManager:
         *,
         resource_decision: dict[str, Any] | None = None,
         approve_all_similar: bool = True,
+        approve_scope: str | None = None,
     ) -> TaskRecord | None:
-        """Approve or respond to a paused task and resume it *in place*."""
+        """Approve or respond to a paused task and resume it *in place*.
+
+        ``approve_scope``: ``"command"`` lets only the exact paused call(s) run;
+        ``"operation"`` lets every call with that approval key run for the rest
+        of the task. When omitted, ``approve_all_similar`` picks (True =
+        operation, False = command), which keeps older callers working.
+        """
         task = self._tasks.get(task_id)
         if task is None or task.status not in {
             TaskStatus.awaiting_approval,
@@ -502,11 +509,14 @@ class TaskManager:
             return None
         approval = (task.result or {}).get("needs_approval") or {}
         op = approval.get("operation")
-        task.approved_ops = set(task.approved_ops) | _expand_approved_ops(
-            op,
-            approval,
-            approve_all_similar=approve_all_similar,
-        )
+        scope = approve_scope or ("operation" if approve_all_similar else "command")
+        if scope == "command":
+            granted = _command_approval(op, approval)
+        else:
+            granted = _expand_approved_ops(op, approval, approve_all_similar=True)
+        task.approved_ops = set(task.approved_ops) | granted
+        # Recorded with the grant so the flow, logs and audit show what was allowed.
+        approval = {**approval, "approved_scope": scope}
         if resource_decision:
             task.resource_decision = resource_decision
         if task.result:
@@ -619,6 +629,7 @@ class TaskManager:
                 op=approval.get("operation"),
                 tool=approval.get("tool"),
                 args=approval.get("args"),
+                scope=approval.get("approved_scope", "operation"),
             )
         # Generate a nicer session title in the background (initial task only, and
         # only if it hasn't already been named — a resume must not re-fire it).
@@ -1109,6 +1120,21 @@ def _auto_approve_ops() -> set[str]:
         | set(_TOOL_APPROVAL_KEYS.values())
         | set(_RESOURCE_WORKFLOW_OPS)
     )
+
+
+def _command_approval(op: str | None, approval: dict[str, Any]) -> set[str]:
+    """Grant only the exact paused call(s) — never the whole operation key.
+
+    A pause with no concrete tool call (a resource decision, waiting for the
+    user) has no command to pin, so it falls back to the narrow per-operation
+    grant.
+    """
+    from ai_employee.tools.approvals import call_tokens_for_approval
+
+    tokens = call_tokens_for_approval(approval)
+    if tokens and op != "waiting_for_user":
+        return tokens
+    return _expand_approved_ops(op, approval, approve_all_similar=False)
 
 
 def _expand_approved_ops(

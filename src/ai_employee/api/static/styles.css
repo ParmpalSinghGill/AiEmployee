@@ -318,6 +318,8 @@ body {
   color: var(--muted); cursor: pointer; margin: 4px 0; }
 .appr-allow-all input { margin-top: 2px; accent-color: var(--blue); }
 .approval-banner .appr-allow-all { margin: 4px 0; color: var(--text); }
+.appr-scope-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.appr-scope-hint { font-size: 11.5px; line-height: 1.4; color: var(--muted); margin-top: 6px; }
 .result-approval-banner .result-appr-head,
 .resource-banner .result-appr-head { font-size: 13px; font-weight: 600; margin-bottom: 10px; }
 .result-approval-banner .appr-body,

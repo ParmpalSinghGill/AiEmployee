@@ -19,6 +19,7 @@ from ai_employee.core.logging import get_logger
 from ai_employee.core.trace import clip, clip_obj, tool_clip
 from ai_employee.memory import MemoryManager, MemoryNamespace
 from ai_employee.tools import ToolRegistry
+from ai_employee.tools.approvals import approved_call_token
 from ai_employee.tools.invocation_history import bind_dedup_scope, reset_dedup_scope
 from ai_employee.verification.evidence import (
     expects_code_change,
@@ -810,7 +811,10 @@ class ToolUsingAgent(BaseAgent):
             if tool_name == "request_resource_input":
                 return bool(ctx.approved_ops & {"resource_acquisition", "waiting_for_user"})
             return True
-        return key in ctx.approved_ops
+        # Approved for the whole task (operation), or just this exact command.
+        return key in ctx.approved_ops or (
+            approved_call_token(tool_name, arguments) in ctx.approved_ops
+        )
 
     async def _remember(self, task: str, answer: str, ctx: AgentContext) -> None:
         if ctx.memory is not None and answer and get_settings().use_stored_memory:

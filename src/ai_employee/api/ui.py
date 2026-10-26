@@ -8,6 +8,7 @@ logs, shows results, and submits follow-up questions.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse
@@ -331,6 +332,9 @@ class ApproveTaskRequest(BaseModel):
     resource_url: str | None = None
     note: str | None = None
     approve_all_similar: bool = True  # pre-approve this op + related (e.g. all downloads in run)
+    # "command" = only the exact paused call(s); "operation" = every call with that
+    # approval key for the rest of the task. Overrides approve_all_similar when set.
+    approve_scope: Literal["command", "operation"] | None = None
 
 
 @router.post("/ui/api/tasks/{task_id}/approve", tags=["ui"])
@@ -361,6 +365,7 @@ async def approve_task(
         task_id,
         resource_decision=decision,
         approve_all_similar=req.approve_all_similar if req else True,
+        approve_scope=req.approve_scope if req else None,
     )
     if task is None:
         raise HTTPException(409, "task is not awaiting approval or waiting for user input")
