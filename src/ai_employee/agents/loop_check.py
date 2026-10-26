@@ -236,18 +236,16 @@ class LoopCheckService:
             return verdict
 
         try:
-            return await self._llm_judge(agent=agent, trace=list(trace)[-window:], settings=settings)
+            return await self._llm_judge(
+                agent=agent, trace=list(trace)[-window:], settings=settings
+            )
         except Exception as exc:  # noqa: BLE001 - never let the judge break the run
             log.warning("loop_check.judge_failed", agent=agent, error=str(exc))
             return verdict
 
     def _judge_available(self, settings: Settings) -> bool:
         provider = getattr(settings.llm_provider, "value", settings.llm_provider)
-        return (
-            self._brain is not None
-            and settings.agent_loop_check_llm
-            and str(provider) != "mock"
-        )
+        return self._brain is not None and settings.agent_loop_check_llm and str(provider) != "mock"
 
     async def _llm_judge(
         self, *, agent: str, trace: list[dict[str, Any]], settings: Settings

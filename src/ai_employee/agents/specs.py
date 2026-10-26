@@ -99,6 +99,9 @@ _FETCHING = (
 # sizing. Local-asset tools come first so an earlier download is reused.
 _RESEARCH = (
     "search_local_assets",
+    # Connected Google Drive (registered only when Google sign-in is set up).
+    "drive_search",
+    "drive_read",
     "list_resources",
     "get_resource",
     "promote_resource",
@@ -121,6 +124,10 @@ _RESEARCH = (
     "write_file",
     "list_dir",
 )
+
+#: Tools that fetch resources into the workspace — withheld from research steps
+#: of a research/report goal that never asked for files.
+DOWNLOAD_TOOLS = frozenset({"download_resource", "request_resource_input", "promote_resource"})
 
 #: Tools a "find but don't fetch" run (plan mode, research-mode discovery) denies
 #: to the research agent via ``AgentContext.denied_tools``.
@@ -412,18 +419,27 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
             "gmail_send",
             "calendar_list_events",
             "calendar_create_event",
+            "drive_search",
+            "drive_read",
             "read_file",
         ),
-        requires="google",
+        # Google sign-in OR a connected messaging/work-app MCP server (Slack,
+        # Zapier, Notion, …) — see agents/registry.py INTEGRATION_CHECKS.
+        requires="comms",
         system_prompt=(
-            "You handle the user's connected Google account.\n"
+            "You handle the user's connected accounts and work apps.\n"
             "- EMAIL: use gmail_search/gmail_read to find and read mail and gmail_send "
             "to send it. Draft professional, concise emails.\n"
             "- CALENDAR: list events with calendar_list_events and create them with "
             "calendar_create_event. Propose schedules, resolve conflicts, summarize "
             "agendas.\n"
-            "Sending mail and creating events pause for human approval automatically — "
-            "don't ask for permission in text, just call the tool."
+            "- DRIVE: find files with drive_search and read them with drive_read.\n"
+            "- OTHER APPS: tools named mcp_<service>_<action> (Slack, Zapier, Notion, "
+            "Asana, …) come from connected MCP servers — use them for that service.\n"
+            "Only the tools listed for you are connected; if the service a task needs "
+            "has no tool here, say which connection is missing instead of guessing.\n"
+            "Sending mail, creating events and other outward actions pause for human "
+            "approval automatically — don't ask for permission in text, just call the tool."
         ),
     ),
 )

@@ -21,7 +21,9 @@ from typing import Any
 import httpx
 
 _GEMINI_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
-_GEMINI_GENERATE_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+_GEMINI_GENERATE_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+)
 _TIMEOUT = 8.0
 #: A generation probe is a real round-trip to the model; allow more time than a list.
 _PROBE_TIMEOUT = 25.0
@@ -152,9 +154,7 @@ def _classify(status: int, detail: str) -> tuple[str, str]:
     return "http_error", f"The provider returned HTTP {status}."
 
 
-async def list_models(
-    settings: Any, provider: str, api_key: str | None = None
-) -> dict[str, Any]:
+async def list_models(settings: Any, provider: str, api_key: str | None = None) -> dict[str, Any]:
     """Ask ``provider`` which models the configured key can see."""
     if provider == "mock":
         return _result(
@@ -163,9 +163,7 @@ async def list_models(
             message="The mock provider is offline and has no model list.",
         )
     if provider not in _OPENAI_COMPAT_BASE and provider != "gemini":
-        return _result(
-            supported=False, provider=provider, message=f"Unknown provider: {provider}"
-        )
+        return _result(supported=False, provider=provider, message=f"Unknown provider: {provider}")
 
     key = _resolve_key(settings, provider, api_key)
     if not key and provider != "local":
@@ -226,11 +224,7 @@ async def list_models(
     ids: list[str] = []
     if isinstance(payload, dict):
         if isinstance(payload.get("data"), list):  # OpenAI-compatible
-            ids = [
-                str(m.get("id"))
-                for m in payload["data"]
-                if isinstance(m, dict) and m.get("id")
-            ]
+            ids = [str(m.get("id")) for m in payload["data"] if isinstance(m, dict) and m.get("id")]
         elif isinstance(payload.get("models"), list):  # Gemini native
             ids = [
                 str(m.get("name"))

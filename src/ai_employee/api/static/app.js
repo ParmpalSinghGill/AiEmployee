@@ -2906,8 +2906,9 @@ async function openMcpModal() {
   const overlay = el(`<div class="modal-overlay"><div class="modal mcp-modal">
     <div class="modal-head"><h3>🔌 MCP connectors</h3><button class="icon-btn modal-close" title="Close">✕</button></div>
     <p class="modal-sub">Plug external <b>Model Context Protocol</b> servers into the employee —
-       their tools appear to every agent as <code>mcp_*</code> tools. Connecting may take a
-       moment the first time (the server package is downloaded).</p>
+       each connector's tools go to the agents listed on its card as <code>mcp_*</code> tools.
+       Gmail, Google Calendar and Google Drive need no keys: they use the Google account
+       connected below. Other servers may take a moment the first time (the package is downloaded).</p>
     <div class="keys-body mcp-body"></div>
   </div></div>`);
   document.body.appendChild(overlay);
@@ -2923,7 +2924,7 @@ function renderMcp(overlay, data) {
   const body = $(".mcp-body", overlay);
   body.innerHTML = "";
   const rt = data.runtime || {};
-  renderGoogleAccounts(body);  // async — fills its own section when loaded
+  renderGoogleAccounts(body, overlay);  // async — fills its own section when loaded
   if (!rt.sdk) {
     body.appendChild(el(`<div class="key-status err" style="padding-top:10px">
       ✗ The <code>mcp</code> Python package is not installed — run <code>pip install mcp</code> and restart.</div>`));
@@ -2941,11 +2942,81 @@ function renderMcp(overlay, data) {
   }
 }
 
+function mcpUsedBy(c) {
+  const agents = c.agents || [];
+  return `<div class="key-desc mcp-agents">Used by: ${agents.length ? agents.map(esc).join(", ") : "every agent"}</div>`;
+}
+
+/* Google-backed card (Gmail / Calendar / Drive): no server, no keys — it is
+   live whenever a connected Google account has granted the card's scopes. */
+function googleMcpRow(overlay, c) {
+  const g = c.google || {};
+  let status, action = "", note = "";
+  if (g.ready) {
+    status = `<span class="key-set">● ${c.tools.length} tools · ${esc((g.accounts || []).join(", "))}</span>`;
+  } else if (!g.configured) {
+    status = `<span class="key-unset">Google sign-in not set up</span>`;
+    note = "The operator must add the Google OAuth client file first (see the Google section above).";
+  } else if ((g.connected_accounts || []).length) {
+    status = `<span class="key-unset">needs access</span>`;
+    action = "Grant access";
+    note = `Your Google account hasn't granted ${esc(c.label)} access yet — click Grant access and approve on Google's page.`;
+  } else {
+    status = `<span class="key-unset">not connected</span>`;
+    action = "Connect Google";
+  }
+  const row = el(`<div class="key-row">
+    <div class="key-info">
+      <div class="key-label">${esc(c.label)} ${status}
+        <span class="key-tag" title="Uses the Google account connected above — no API keys, key files or extra servers">🔐 Google account</span></div>
+      <div class="key-desc">${esc(c.description)}
+        ${c.docs ? ` <a class="x-link" href="${esc(c.docs)}" target="_blank" rel="noopener">docs ↗</a>` : ""}</div>
+      ${c.tools.length ? `<div class="mcp-tools">${c.tools.map(t => `<code>${esc(t)}</code>`).join(" ")}</div>` : ""}
+      ${mcpUsedBy(c)}
+    </div>
+    <div class="key-actions">
+      ${action ? `<button class="btn key-test google-card-connect">${action}</button>` : ""}
+      ${g.ready ? `<button class="btn key-test google-card-test" title="Make one read-only call to check the API answers">Test</button>` : ""}
+    </div>
+    <div class="key-status">${note}</div></div>`);
+  const testBtn = $(".google-card-test", row);
+  if (testBtn) testBtn.addEventListener("click", async () => {
+    const statusEl = $(".key-status", row);
+    testBtn.disabled = true; testBtn.textContent = "Testing…";
+    statusEl.className = "key-status"; statusEl.textContent = "";
+    try {
+      const res = await api("PUT", `/ui/api/mcp/servers/${c.id}`, { params: {}, require_approval: false });
+      if (res.ok) { statusEl.className = "key-status ok"; statusEl.textContent = `✓ Working — ${res.tools.length} tools ready.`; }
+      else { statusEl.className = "key-status err"; statusEl.textContent = "✗ " + (res.error || "not connected"); }
+    } catch (e) {
+      statusEl.className = "key-status err"; statusEl.textContent = "✗ " + e.message;
+    }
+    testBtn.disabled = false; testBtn.textContent = "Test";
+  });
+  const btn = $(".google-card-connect", row);
+  if (btn) btn.addEventListener("click", async () => {
+    const statusEl = $(".key-status", row);
+    btn.disabled = true; btn.textContent = "Waiting for approval…";
+    try {
+      if (await googleConsentFlow(statusEl)) {
+        renderMcp(overlay, await api("GET", "/ui/api/mcp/options"));
+        return;
+      }
+    } catch (e) {
+      statusEl.className = "key-status err"; statusEl.textContent = "✗ " + e.message;
+    }
+    btn.disabled = false; btn.textContent = action;
+  });
+  return row;
+}
+
 function mcpRow(overlay, c, rt) {
+  if (c.auth === "google") return googleMcpRow(overlay, c);
   const rtMissing = c.runtime && rt[c.runtime] === false;
   let status;
   if (c.error) status = `<span class="key-unset" style="color:var(--red)">error</span>`;
   else if (c.configured && c.tools.length) status = `<span class="key-set">● ${c.tools.length} tool${c.tools.length === 1 ? "" : "s"}</span>`;
+  else if (c.configured && c.auth === "oauth" && !c.authorized) status = `<span class="key-unset">sign-in needed — click Reconnect</span>`;
   else if (c.configured) status = `<span class="key-unset">no tools yet</span>`;
   else status = `<span class="key-unset">not connected</span>`;
   const tags =
@@ -2965,6 +3036,7 @@ function mcpRow(overlay, c, rt) {
       <div class="key-desc">${esc(c.description)}
         ${c.docs ? ` <a class="x-link" href="${esc(c.docs)}" target="_blank" rel="noopener">docs ↗</a>` : ""}</div>
       ${c.tools.length ? `<div class="mcp-tools">${c.tools.map(t => `<code>${esc(t)}</code>`).join(" ")}</div>` : ""}
+      ${mcpUsedBy(c)}
     </div>
     <div class="key-actions">
       ${paramInputs}
@@ -3019,9 +3091,39 @@ function mcpRow(overlay, c, rt) {
   return row;
 }
 
-/* ── Google accounts (Gmail & Calendar via the operator's OAuth app) ──────── */
-async function renderGoogleAccounts(body) {
-  const section = el(`<div class="key-group"><h4>Google accounts (Gmail &amp; Calendar)</h4></div>`);
+/* ── Google account (Gmail, Calendar & Drive via the operator's OAuth app) ── */
+
+/* Open Google's consent page and wait until the connected accounts (or the
+   scopes they granted) change. Connecting also signs a guest in, so the
+   account badge and task list are refreshed when that happens. */
+async function googleConsentFlow(statusEl) {
+  const sig = st => JSON.stringify((st.accounts || []).map(a => [a.email, a.scopes, a.connected_at]));
+  const before = sig(await api("GET", "/ui/api/google/status"));
+  const res = await api("POST", "/ui/api/google/authorize", {});
+  const popup = window.open(res.auth_url, "google-oauth", "width=620,height=760");
+  if (!popup) window.open(res.auth_url, "_blank");
+  if (statusEl) { statusEl.className = "key-status"; statusEl.textContent = "Approve in the Google window that just opened…"; }
+  const deadline = Date.now() + 3 * 60 * 1000;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 2000));
+    let cur;
+    try { cur = await api("GET", "/ui/api/google/status"); } catch { continue; }
+    if (sig(cur) !== before) {
+      const prevId = _me && _me.id;
+      const now = await loadAccountBadge();
+      if (now && now.id !== prevId) loadSessionList();
+      return true;
+    }
+  }
+  if (statusEl) {
+    statusEl.className = "key-status err";
+    statusEl.textContent = "✗ Timed out waiting for approval — try again.";
+  }
+  return false;
+}
+
+async function renderGoogleAccounts(body, overlay) {
+  const section = el(`<div class="key-group"><h4>Google account — Gmail, Calendar &amp; Drive</h4></div>`);
   body.prepend(section);
   let st;
   try { st = await api("GET", "/ui/api/google/status"); }
@@ -3031,56 +3133,52 @@ async function renderGoogleAccounts(body) {
     section.appendChild(el(`<div class="key-row"><div class="key-info">
       <div class="key-desc">One-time operator setup: put your Google Cloud
       <code>client_secret.json</code> at <code>${esc(st.client_file)}</code> and restart.
-      After that, anyone can connect their own Gmail/Calendar with one click.</div>
+      After that, anyone can connect their own Gmail, Calendar and Drive with one click.</div>
     </div></div>`));
     return;
   }
+
+  const rerender = async () => {
+    if (overlay) renderMcp(overlay, await api("GET", "/ui/api/mcp/options"));
+    else { section.remove(); renderGoogleAccounts(body, overlay); }
+  };
 
   for (const a of st.accounts) {
     const row = el(`<div class="key-row">
       <div class="key-info">
         <div class="key-label">${esc(a.email)} <span class="key-set">● connected</span></div>
-        <div class="key-desc">since ${esc(a.connected_at || "?")}</div>
+        <div class="key-desc">since ${esc(a.connected_at || "?")} — the Gmail, Google Calendar and
+          Google Drive cards below use this account.</div>
       </div>
       <div class="key-actions"><button class="btn key-del">Disconnect</button></div>
       <div class="key-status"></div></div>`);
     $(".key-del", row).addEventListener("click", async () => {
-      if (!confirm(`Disconnect ${a.email}? The AI employee loses access to this mailbox.`)) return;
-      try { await api("DELETE", `/ui/api/google/accounts/${encodeURIComponent(a.email)}`); row.remove(); }
+      if (!confirm(`Disconnect ${a.email}? The AI employee loses access to this mailbox, calendar and Drive.`)) return;
+      try { await api("DELETE", `/ui/api/google/accounts/${encodeURIComponent(a.email)}`); await rerender(); }
       catch (e) { alert("Failed: " + e.message); }
     });
     section.appendChild(row);
   }
 
+  const connected = st.accounts.length > 0;
+  const label = connected ? "Add another account" : "Connect Google account";
   const addRow = el(`<div class="key-row">
-    <div class="key-info"><div class="key-desc">Connect a Google account — approve on Google's
-      consent page; the employee's <code>gmail_*</code>/<code>calendar_*</code> tools then act on that mailbox.
-      Sending mail & creating events stay approval-gated.</div></div>
-    <div class="key-actions"><button class="btn key-test google-connect">Connect Google account</button></div>
+    <div class="key-info"><div class="key-desc">${connected
+      ? "Need a second mailbox? Connect another Google account."
+      : `Connect a Google account — approve once on Google's consent page and Gmail,
+         Calendar and Drive all work (no keys or extra servers). Sending mail and creating
+         events stay approval-gated.`}</div></div>
+    <div class="key-actions"><button class="btn ${connected ? "" : "key-test"} google-connect">${label}</button></div>
     <div class="key-status"></div></div>`);
   const btn = $(".google-connect", addRow), statusEl = $(".key-status", addRow);
   btn.addEventListener("click", async () => {
     btn.disabled = true; btn.textContent = "Waiting for approval…";
-    statusEl.className = "key-status"; statusEl.textContent = "Approve in the Google window that just opened…";
     try {
-      const res = await api("POST", "/ui/api/google/authorize", {});
-      const popup = window.open(res.auth_url, "google-oauth", "width=620,height=760");
-      if (!popup) window.open(res.auth_url, "_blank");
-      const before = st.accounts.length, deadline = Date.now() + 3 * 60 * 1000;
-      while (Date.now() < deadline) {
-        await new Promise(r => setTimeout(r, 2000));
-        let cur;
-        try { cur = await api("GET", "/ui/api/google/status"); } catch { continue; }
-        if (cur.accounts.length > before) {  // re-render the whole section fresh
-          section.remove(); renderGoogleAccounts(body); return;
-        }
-      }
-      statusEl.className = "key-status err";
-      statusEl.textContent = "✗ Timed out waiting for approval — try again.";
+      if (await googleConsentFlow(statusEl)) { await rerender(); return; }
     } catch (e) {
       statusEl.className = "key-status err"; statusEl.textContent = "✗ " + e.message;
     }
-    btn.disabled = false; btn.textContent = "Connect Google account";
+    btn.disabled = false; btn.textContent = label;
   });
   section.appendChild(addRow);
 }

@@ -567,10 +567,38 @@ async def mcp_options() -> dict:
     Secret parameter values are masked — the raw value never leaves the server.
     """
     from ai_employee.tools.mcp import CONNECTOR_CATALOG, load_servers, runtime_available
+    from ai_employee.tools.mcp.manager import google_connector_state
 
-    servers = load_servers(get_settings())
+    s = get_settings()
+    servers = load_servers(s)
     connectors = []
     for spec in CONNECTOR_CATALOG:
+        if spec.auth == "google":
+            # No server and no stored entry: the card mirrors the connected
+            # Google account(s) and the scopes they granted.
+            state = google_connector_state(s, spec)
+            connectors.append(
+                {
+                    "id": spec.id,
+                    "label": spec.label,
+                    "description": spec.description,
+                    "transport": spec.transport,
+                    "runtime": "",
+                    "docs": spec.docs,
+                    "params": [],
+                    "auth": "google",
+                    "authorized": state["ready"],
+                    "configured": state["ready"],
+                    "enabled": state["ready"],
+                    "require_approval": False,
+                    "tools": state["tools"],
+                    "error": None,
+                    "connected_at": None,
+                    "agents": list(spec.agents),
+                    "google": state,
+                }
+            )
+            continue
         entry = servers.get(spec.id) or {}
         saved_params = entry.get("params") or {}
         params = []
@@ -605,6 +633,7 @@ async def mcp_options() -> dict:
                 "tools": [t["name"] for t in entry.get("tools") or []],
                 "error": entry.get("error"),
                 "connected_at": entry.get("connected_at"),
+                "agents": list(spec.agents),
             }
         )
     return {"connectors": connectors, "runtime": runtime_available()}
@@ -631,6 +660,8 @@ async def add_mcp_server(
     result = await connect_server(
         s, server_id, params=merged, require_approval=req.require_approval
     )
+    if result.get("ok") and connector_for(server_id).auth == "google":
+        _sync_google_tools(emp)  # make sure the native tools are live
     result["registered_tools"] = sync_registry(s, emp.tools)
     return result
 
@@ -857,12 +888,40 @@ async def google_oauth_callback(
     code, state = q.get("code"), q.get("state")
     if not code or not state:
         return _oauth_result_page(False, "Missing code/state in the callback URL.")
+    s = get_settings()
     try:
-        email = await complete_authorization(get_settings(), state, code)
+        email = await complete_authorization(s, state, code)
         count = _sync_google_tools(emp)
     except Exception as exc:  # noqa: BLE001 - show the failure in the popup
         return _oauth_result_page(False, str(exc))
-    return _oauth_result_page(True, f"{email} connected — {count} Gmail/Calendar tools are live.")
+    message = f"{email} connected — {count} Gmail, Calendar & Drive tools are live."
+    # One Google connection does both jobs: a guest who connects Google is also
+    # signed in as that account (an existing signed-in user stays who they are).
+    signed_in = _signed_in_user(request)
+    account = None
+    if signed_in is None or signed_in.is_guest:
+        from ai_employee.api.users import upsert_google_user
+        from ai_employee.integrations.google_oauth import load_accounts
+
+        entry = load_accounts(s).get(email) or {}
+        account = upsert_google_user(
+            s, {"email": email, "name": entry.get("name", ""), "picture": entry.get("picture", "")}
+        )
+        message += f" You're signed in as {account.email}."
+    page = _oauth_result_page(True, message)
+    if account is not None:
+        from ai_employee.api.users import set_user_cookie
+
+        set_user_cookie(s, page, account)
+    return page
+
+
+def _signed_in_user(request: Request):  # noqa: ANN202 - CurrentUser | None
+    """The request's identity from its cookie, without minting a guest."""
+    from ai_employee.api.users import COOKIE_NAME, decode_cookie
+
+    raw = request.cookies.get(COOKIE_NAME)
+    return decode_cookie(get_settings(), raw) if raw else None
 
 
 @router.delete("/ui/api/google/accounts/{email}", tags=["ui"])

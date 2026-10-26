@@ -188,13 +188,20 @@ async def complete_authorization(
         if resp.status_code != 200:
             raise ToolError(f"Google token exchange failed ({resp.status_code}): {resp.text[:300]}")
         tokens = resp.json()
-        email = _email_from_id_token(tokens.get("id_token", ""))
+        profile = _profile_from_id_token(tokens.get("id_token", ""))
+        email = profile["email"]
         if not email:
             info = await client.get(
                 _USERINFO_URL,
                 headers={"Authorization": f"Bearer {tokens['access_token']}"},
             )
-            email = (info.json() or {}).get("email", "") if info.status_code == 200 else ""
+            data = (info.json() or {}) if info.status_code == 200 else {}
+            email = str(data.get("email") or "")
+            profile = {
+                "email": email,
+                "name": str(data.get("name") or ""),
+                "picture": str(data.get("picture") or ""),
+            }
         if not email:
             raise ToolError("could not determine the Google account's email address")
     finally:
@@ -202,11 +209,15 @@ async def complete_authorization(
             await client.aclose()
 
     accounts = load_accounts(settings)
+    previous = accounts.get(email) or {}
     accounts[email] = {
         "access_token": tokens["access_token"],
-        "refresh_token": tokens.get("refresh_token", ""),
+        # Google omits the refresh token on some re-consents — keep the old one.
+        "refresh_token": tokens.get("refresh_token") or previous.get("refresh_token", ""),
         "expires_at": _expires_at(tokens),
         "scopes": tokens.get("scope", " ".join(_scopes(settings))),
+        "name": profile.get("name") or previous.get("name", ""),
+        "picture": profile.get("picture") or previous.get("picture", ""),
         "connected_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     _save_accounts(settings, accounts)
@@ -343,9 +354,7 @@ async def ensure_access_token(settings: Any, email: str, *, client: Any = None) 
     accounts = load_accounts(settings)
     entry = accounts.get(email)
     if not entry:
-        raise ToolError(
-            f"Google account '{email}' is not connected — connect it from the console"
-        )
+        raise ToolError(f"Google account '{email}' is not connected — connect it from the console")
     if time.time() < float(entry.get("expires_at") or 0) - 60:
         return str(entry["access_token"])
     if not entry.get("refresh_token"):

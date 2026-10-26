@@ -18,6 +18,7 @@ from ai_employee.core.exceptions import ApprovalRequired
 from ai_employee.core.logging import get_logger
 from ai_employee.core.trace import clip, clip_obj, tool_clip
 from ai_employee.memory import MemoryManager, MemoryNamespace
+from ai_employee.planning.intent import asks_to_acquire, own_description
 from ai_employee.tools import ToolRegistry
 from ai_employee.tools.approvals import approved_call_token
 from ai_employee.tools.invocation_history import bind_dedup_scope, reset_dedup_scope
@@ -39,10 +40,28 @@ def _scope_counter() -> int:
 log = get_logger("agent")
 
 _PROBE_TOOLS = frozenset({"fetch_page", "http_request"})
-#: Wording that asks a step to obtain resources (not merely find them). Only
-#: such steps get pushed to call download_resource before finishing.
-_ACQUIRE_RE = re.compile(
-    r"\b(?:download|acquire|obtain|fetch|grab|save)\w*\b|\binto the workspace\b", re.I
+#: Search and fetch tools that depend on an outside service. When one keeps
+#: failing for an outside reason, the step switches it off and continues.
+_SOURCE_TOOLS = frozenset(
+    {
+        "web_search",
+        "fetch_page",
+        "http_request",
+        "github_search",
+        "hf_search",
+        "kaggle_search",
+        "roboflow_search",
+        "paperswithcode_search",
+        "arxiv_search",
+        "youtube_search",
+        "hub_search_all",
+    }
+)
+_EXTERNAL_ERROR_RE = re.compile(
+    r"\b(?:[45]\d\d|rate.?limit\w*|too many requests|timed?.?out|timeout|"
+    r"connect\w*|HTTPStatusError|ReadTimeout|ConnectError|unavailable|forbidden|"
+    r"not found|SSL\w*)\b",
+    re.I,
 )
 
 
@@ -120,7 +139,7 @@ class ToolUsingAgent(BaseAgent):
         exposed = {spec.name for spec in tool_specs}
         # Push toward download_resource only when this step is meant to obtain
         # resources and can: "find a model" must not turn into a download.
-        acquiring = "download_resource" in exposed and bool(_ACQUIRE_RE.search(task[:2000]))
+        acquiring = "download_resource" in exposed and asks_to_acquire(own_description(task))
         trace: list[dict[str, Any]] = []
         settings = get_settings()
         # Count tool failures by (tool, error-class) so we can bail out of a
@@ -148,6 +167,8 @@ class ToolUsingAgent(BaseAgent):
         nudge_every = max(0, int(settings.agent_write_nudge_after))
         writes = 0
         calls_since_write = 0
+        # Search/fetch tools switched off after repeated external failures.
+        unavailable_tools: set[str] = set()
         nudges = 0
         final_nudge_sent = False
 
@@ -215,12 +236,13 @@ class ToolUsingAgent(BaseAgent):
                 pending_exc: ApprovalRequired | None = None
                 batched_pending: list[dict[str, Any]] = []
                 for call in result.tool_calls:
-                    if call.name not in exposed:
+                    if call.name not in exposed or call.name in unavailable_tools:
                         # Outside this agent's (or this run's) tool set: refuse
                         # rather than execute a tool the agent was never given.
                         note = (
                             f"Tool '{call.name}' is not available to the '{self.name}' "
-                            f"agent in this run. Available: {', '.join(sorted(exposed)) or 'none'}."
+                            "agent in this run. Available: "
+                            f"{', '.join(sorted(exposed - unavailable_tools)) or 'none'}."
                         )
                         log.info("agent.tool_refused", agent=self.name, tool=call.name)
                         trace.append(
@@ -349,6 +371,25 @@ class ToolUsingAgent(BaseAgent):
                                 }:
                                     # Recoverable: encoding mismatch or truncated tool JSON.
                                     pass
+                                elif call.name in _SOURCE_TOOLS and _EXTERNAL_ERROR_RE.search(
+                                    f"{ecls} {tool_result.error or ''}"
+                                ):
+                                    # One unavailable source (GitHub rate limit, a 403, a
+                                    # timeout) must not end a research step: switch off
+                                    # that tool for this turn and carry on with the rest.
+                                    unavailable_tools.add(call.name)
+                                    log.info(
+                                        "agent.source_unavailable",
+                                        agent=self.name,
+                                        tool=call.name,
+                                        error_class=ecls,
+                                    )
+                                    observation += (
+                                        f"\n\n[SYSTEM] '{call.name}' is unavailable right now "
+                                        f"({ecls}); it is switched off for the rest of this step. "
+                                        "Continue with your other tools (e.g. web_search, "
+                                        "fetch_page, hub_search_all) — do not stop."
+                                    )
                                 else:
                                     observation += (
                                         f"\n\n[SYSTEM] '{call.name}' has now failed {fail_counts[sig]}× with the same "
@@ -627,6 +668,14 @@ class ToolUsingAgent(BaseAgent):
     def _exposed_specs(self, ctx: AgentContext) -> list:
         """The tool specs this agent may use in this run (its list minus denials)."""
         specs = ctx.tools.specs(self.allowed_tools)
+        if self.allowed_tools is not None:
+            # Connected MCP servers add tools on top of a fixed list, but only
+            # for the agents their connector is routed to (catalog ``agents``).
+            have = {spec.name for spec in specs}
+            for tool in ctx.tools.by_category("mcp"):
+                routes_to = getattr(tool, "routes_to", None)
+                if tool.name not in have and routes_to is not None and routes_to(self.name):
+                    specs.append(tool.to_spec())
         if ctx.denied_tools:
             specs = [spec for spec in specs if spec.name not in ctx.denied_tools]
         return specs

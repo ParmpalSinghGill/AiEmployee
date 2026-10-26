@@ -79,6 +79,12 @@ Tests force offline config via `tests/conftest.py` (sets `LLM_PROVIDER=mock` etc
   (`tools/mcp/oauth.py` — discovery, dynamic client registration, PKCE, token
   refresh) via the provider's consent page in the browser; tokens live in the
   store entry's `auth` field and refresh transparently before tool calls.
+  Set `agents=(...)` on a preset to choose which workers get its `mcp_*` tools
+  (empty = every worker); agents with a fixed tool list get routed MCP tools
+  added in `ToolUsingAgent._exposed_specs`. Gmail / Google Calendar / Google
+  Drive are `auth="google"` cards: no server — they mirror the account from
+  "Connect Google account" (scopes in `google_scopes`, native tools in
+  `tools/builtins/google_workspace.py`).
 
 After any change: `make lint && make test`.
 

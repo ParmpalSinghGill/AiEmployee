@@ -288,11 +288,39 @@ def _collapse_inspection_then_fix(steps: list[PlanStep]) -> None:
             break
 
 
+#: Estimating or comparing — answerable from published facts, not code.
+_RESEARCH_ONLY_RE = re.compile(
+    r"\b(?:estimate|estimating|estimation|compar(?:e|ing|ison)|benchmarks?|vram|"
+    r"gpu (?:memory|requirements?)|hardware(?: and deployment)? requirements?|"
+    r"survey|shortlist|trade-?offs?|pros and cons)\b",
+    re.I,
+)
+#: A code deliverable or an explicit "measure it here" ask keeps a step on coding.
+_CODE_DELIVERABLE_RE = re.compile(
+    r"\b(?:implement|fix|patch|refactor|modify|edit|debug|"
+    r"(?:write|create|build|generate)\s+(?:an?\s+|the\s+)?(?:\w+\s+){0,2}"
+    r"(?:script|code|function|module|class|program|pipeline|tool|service|app|"
+    r"api|endpoint|dockerfile|config)|"
+    r"run (?:the |a )?(?:script|code|tests?|benchmarks? (?:on|locally))|"
+    r"measure (?:on|locally)|on this machine)\b|\.py\b",
+    re.I,
+)
+
+
+def _is_research_only(description: str) -> bool:
+    """An estimate/comparison step with no code to deliver."""
+    text = strip_urls(description or "")
+    return bool(_RESEARCH_ONLY_RE.search(text)) and not _CODE_DELIVERABLE_RE.search(text)
+
+
 def normalize_plan_routing(plan: Plan, valid_names: set[str]) -> Plan:
     """Deterministic clean-up of the plan's routing.
 
     * Retired agent names (``scout``, ``devops``, …) map to their successors via
       ``LEGACY_AGENT_ALIASES`` — the roster's single owner for that work.
+    * A ``coding`` step that only estimates or compares (hardware, FPS, models)
+      and delivers no code moves to ``research``, which has the published numbers
+      and ``estimate_hardware``; coding would build and run benchmarks instead.
     * A coding "locate/inspect" step followed by a coding "implement" step is
       collapsed into one step so the same agent owns discovery and editing.
     """
@@ -301,6 +329,19 @@ def normalize_plan_routing(plan: Plan, valid_names: set[str]) -> Plan:
         if target != step.agent and target in valid_names:
             log.info("planner.legacy_agent", step=step.id, from_agent=step.agent, to_agent=target)
             step.agent = target
+        if (
+            step.agent == "coding"
+            and "research" in valid_names
+            and _is_research_only(step.description)
+        ):
+            log.info(
+                "planner.rerouted_estimate",
+                step=step.id,
+                from_agent="coding",
+                to_agent="research",
+                description=clip(step.description, 200),
+            )
+            step.agent = "research"
     if plan.steps:
         _collapse_inspection_then_fix(plan.steps)
     return plan
@@ -462,7 +503,12 @@ class Planner:
             "work has exactly ONE owner; match each step to it:\n"
             "- External information → `research`: web research, finding ML models/"
             "datasets/papers on public hubs, downloading resources into the workspace, "
-            "and GPU/VRAM estimates. It never reads, edits or runs local project code.\n"
+            "GPU/VRAM and hardware estimates, published benchmark numbers, and model/"
+            "tool comparisons. It never reads, edits or runs local project code.\n"
+            "- Hardware sizing, FPS/latency figures and comparisons for a report come "
+            "from `research` (published numbers + estimate_hardware) — never a `coding` "
+            "step that writes and runs benchmarks, unless the goal asks to measure on "
+            "this machine.\n"
             "- Local code → `coding`: application code, bug fixes, Docker/CI/deploy "
             "config, database schemas/SQL, ML inference/training/eval scripts. It has "
             "NO web access — if it needs external facts (model ids, API docs), add a "
@@ -517,7 +563,11 @@ class Planner:
             "  4 coding (training script)         depends_on: [1, 2]  <- needs both\n"
             "  5 documentation (README)           depends_on: [4]     <- not [1,2,3,4]\n"
             "Here steps 1 and 2 run at once, and 3 runs as soon as 1 lands.\n\n"
-            "BEFORE adding any acquisition step, check these two shortcuts:\n"
+            "BEFORE adding any acquisition step, check these shortcuts:\n"
+            "- RESEARCH / REPORT GOAL (research, compare, recommend, identify, report "
+            "on models/datasets/tools) that does not ask to download, save, or to "
+            "train/evaluate/run on data: record each dataset's access link, size and "
+            "licence. Do NOT plan downloads.\n"
             "- FILE ALREADY IN THE WORKSPACE (the goal names a local file such as "
             "sales.csv): do NOT add an acquire step. Go straight to data_analysis.\n"
             "- FETCHABLE PUBLIC DATA (stock/ETF/index/FX/crypto prices, ticker "

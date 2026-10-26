@@ -60,14 +60,11 @@ def _addresses(value: Any) -> list[str]:
 
 def _recipients_allowed(patterns: list[str], arguments: dict[str, Any]) -> bool:
     """Every recipient-like address in the args must match some pattern."""
-    addresses = [
-        addr for name in _RECIPIENT_ARGS for addr in _addresses(arguments.get(name))
-    ]
+    addresses = [addr for name in _RECIPIENT_ARGS for addr in _addresses(arguments.get(name))]
     if not addresses:  # nothing recipient-shaped to check — patterns don't apply
         return True
     return all(
-        any(fnmatch.fnmatch(addr.lower(), pat.lower()) for pat in patterns)
-        for addr in addresses
+        any(fnmatch.fnmatch(addr.lower(), pat.lower()) for pat in patterns) for addr in addresses
     )
 
 

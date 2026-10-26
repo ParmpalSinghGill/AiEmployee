@@ -56,9 +56,47 @@ def sanitize_url(url: str) -> str:
     return u.strip()
 
 
+# One file inside a repo: .../Org/Repo/resolve/<rev>/<path> or .../blob/<rev>/<path>
+_HF_FILE_RE = re.compile(
+    r"huggingface\.co/(?:(datasets|models|spaces)/)?((?:[^/\s?#]+/)?[^/\s?#]+)/(?:resolve|blob)/"
+    r"([^/\s?#]+)/([^\s?#]+)",
+    re.I,
+)
+
+
+def parse_huggingface_file(url: str) -> tuple[str, str, str, str] | None:
+    """(repo_type, repo_id, revision, filename) for a link to ONE file, else None.
+
+    ``huggingface.co/datasets/Org/Repo/resolve/main/annotation_val.odgt`` names a
+    single file; downloading the whole repository for it pulled 12 GB of zips.
+    """
+    m = _HF_FILE_RE.search((url or "").strip())
+    if not m:
+        return None
+    kind = (m.group(1) or "models").lower()
+    repo_type = {"datasets": "dataset", "spaces": "space"}.get(kind, "model")
+    return repo_type, m.group(2), m.group(3), m.group(4)
+
+
+def _hf_repo_bytes(repo_id: str, repo_type: str, token: str | None) -> int | None:
+    """Total size of a Hugging Face repo, or None when it can't be measured."""
+    try:
+        from huggingface_hub import HfApi
+
+        info = HfApi(token=token).repo_info(repo_id, repo_type=repo_type, files_metadata=True)
+        sizes = [getattr(s, "size", None) for s in (getattr(info, "siblings", None) or [])]
+        known = [s for s in sizes if isinstance(s, int)]
+        return sum(known) if known else None
+    except Exception:  # noqa: BLE001 - offline / private: fall through, no guard
+        return None
+
+
 def parse_huggingface_url(url: str) -> tuple[str, str] | None:
     """Return (repo_type, repo_id) for a Hugging Face URL, or None."""
     u = (url or "").strip()
+    single = parse_huggingface_file(u)
+    if single:
+        return single[0], single[1]
     m = _HF_PREFIX_RE.search(u)
     if m:
         kind = m.group(1).lower()
@@ -552,11 +590,31 @@ async def download_huggingface(
     workspace: Path,
     token: str | None = None,
     run_shell=None,  # kept for tests; HF uses huggingface_hub in-process
+    max_bytes: int | None = None,
 ) -> dict[str, Any]:
+    single = parse_huggingface_file(url)
+    if single:
+        return await _download_huggingface_file(single, dest, workspace=workspace, token=token)
     parsed = parse_huggingface_url(url)
     if not parsed:
         raise ValueError("not a huggingface datasets/models url")
     repo_type, repo_id = parsed
+    if max_bytes is None:
+        from ai_employee.config import get_settings
+
+        max_bytes = int(float(get_settings().download_max_gb or 0) * 1024**3)
+    if max_bytes > 0:
+        total = await asyncio.to_thread(
+            _hf_repo_bytes, repo_id, repo_type, (token or "").strip() or None
+        )
+        if total is not None and total > max_bytes:
+            raise RuntimeError(
+                f"Hugging Face {repo_type} '{repo_id}' is {total / 1024**3:.1f} GB, over the "
+                f"{max_bytes / 1024**3:.1f} GB whole-repository limit (DOWNLOAD_MAX_GB). "
+                "Download only the files you need with their direct links "
+                f"(https://huggingface.co/{'datasets/' if repo_type == 'dataset' else ''}"
+                f"{repo_id}/resolve/main/<file>), or raise DOWNLOAD_MAX_GB."
+            )
     dest_dir = dest if dest.suffix == "" else dest.parent / dest.stem
     dest_dir.mkdir(parents=True, exist_ok=True)
     hf_home = workspace.resolve() / ".hf_home"  # noqa: ASYNC240 — cheap path math
@@ -601,6 +659,65 @@ async def download_huggingface(
         "source": "huggingface",
         "repo_id": repo_id,
         "repo_type": repo_type,
+    }
+
+
+async def _download_huggingface_file(
+    parsed: tuple[str, str, str, str],
+    dest: Path,
+    *,
+    workspace: Path,
+    token: str | None,
+) -> dict[str, Any]:
+    """Fetch exactly one file from a Hugging Face repo to ``dest``."""
+    repo_type, repo_id, revision, filename = parsed
+    name = Path(filename).name
+    target = dest if dest.suffix else dest / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    hf_home = workspace.resolve() / ".hf_home"  # noqa: ASYNC240 — cheap path math
+    cache_dir = hf_home / "hub"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    tok = (token or "").strip() or None
+
+    def _download() -> str:
+        import os
+        import shutil
+
+        from huggingface_hub import hf_hub_download
+
+        os.environ["HF_HOME"] = str(hf_home)
+        os.environ["HUGGINGFACE_HUB_CACHE"] = str(cache_dir)
+        cached = hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            repo_type=repo_type,
+            revision=revision,
+            cache_dir=str(cache_dir),
+            token=tok,
+        )
+        # Copy out of the cache (no symlinks: not every drive supports them).
+        shutil.copyfile(cached, target)
+        return str(target)
+
+    try:
+        await asyncio.to_thread(_download)
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        if tok is None and any(
+            x in msg.lower() for x in ("gated", "authorized", "401", "private", "authenticate")
+        ):
+            msg += (
+                "\n\n[hint] This Hugging Face repo may be gated. "
+                "Set HF_TOKEN in .env or add a Hugging Face token in 🔑 Keys."
+            )
+        raise RuntimeError(msg) from exc
+    return {
+        "path": str(target),
+        "bytes": target.stat().st_size,
+        "source": "huggingface",
+        "repo_id": repo_id,
+        "repo_type": repo_type,
+        "file": filename,
     }
 
 

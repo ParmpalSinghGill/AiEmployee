@@ -24,6 +24,7 @@ from langgraph.graph import END, START, StateGraph
 
 from ai_employee.agents import AgentContext, AgentRegistry
 from ai_employee.agents.routing import resolve_agent_name
+from ai_employee.agents.specs import DOWNLOAD_TOOLS
 from ai_employee.brains.base import Brain
 from ai_employee.config import get_settings
 from ai_employee.core.logging import bind_context, get_logger
@@ -34,6 +35,7 @@ from ai_employee.memory.skill_policy import (
     SkillRejectedError,
     task_specific_reason,
 )
+from ai_employee.planning.intent import goal_withholds_downloads
 from ai_employee.tools.invocation_history import (
     begin_task_tool_history,
     clear_task_tool_history,
@@ -52,6 +54,7 @@ from ai_employee.verification.evidence import (
     snapshot_for_change_check,
     summarize_tool_evidence,
 )
+from ai_employee.verification.locate import files_changed_since
 from ai_employee.workflows.scheduler import (
     describe_schedule,
     has_runnable_work,
@@ -622,6 +625,11 @@ class Orchestrator:
         task = step["description"] + (f"\n\n{prior}" if prior else "")
 
         ctx = self._context(state, {"step_results": results})
+        # A research/report goal that never asked for files: research records
+        # links and access terms instead of downloading (whatever the plan says).
+        if agent.name == "research" and goal_withholds_downloads(state.get("goal", "")):
+            ctx.denied_tools = ctx.denied_tools | DOWNLOAD_TOOLS
+            log.info("workflow.downloads_withheld", step=step["id"], reason="report_goal")
         # Wall-clock start of this step: the filesystem audit uses it to distinguish
         # a commit made now (changes saved) from a pre-existing clean checkout.
         step_started = time.time()
@@ -641,6 +649,9 @@ class Orchestrator:
             result = result.model_copy(
                 update={"output": _output_from_tool_trace(result.tool_trace, "empty_agent_output")}
             )
+        # Every attempt's tool calls (first try + retries): files a first attempt
+        # downloaded must still count when a retry reports them.
+        step_trace: list[dict[str, Any]] = list(result.tool_trace)
 
         # Approval gate: stop the whole run and surface the request.
         if result.needs_approval:
@@ -680,7 +691,7 @@ class Orchestrator:
             task=step["description"],
             success_criteria=step.get("success_criteria", ""),
             output=result.output,
-            tool_trace=result.tool_trace,
+            tool_trace=step_trace,
             workspace=settings.workspace_dir,
         )
 
@@ -732,8 +743,9 @@ class Orchestrator:
             resource_audit=resource_audit,
             artifact_audit=artifact_audit,
             fs_audit=fs_audit,
-            tool_evidence=summarize_tool_evidence(result.tool_trace),
+            tool_evidence=summarize_tool_evidence(step_trace),
             change_issue=self._change_issue(change_snapshot, step, task, result.output),
+            disk_changes=files_changed_since(settings.workspace_dir, step_started),
         )
         retries = 0
         # Accumulate every issue raised across attempts so a retry fixes ALL of
@@ -759,11 +771,12 @@ class Orchestrator:
                 attempt=retries,
             )
             result = await agent.run(fix_task, ctx)
+            step_trace.extend(result.tool_trace)
             resource_audit = audit_resources(
                 task=step["description"],
                 success_criteria=step.get("success_criteria", ""),
                 output=result.output,
-                tool_trace=result.tool_trace,
+                tool_trace=step_trace,
                 workspace=settings.workspace_dir,
             )
             artifact_audit = audit_artifacts(
@@ -779,8 +792,9 @@ class Orchestrator:
                 resource_audit=resource_audit,
                 artifact_audit=artifact_audit,
                 fs_audit=fs_audit,
-                tool_evidence=summarize_tool_evidence(result.tool_trace),
+                tool_evidence=summarize_tool_evidence(step_trace),
                 change_issue=self._change_issue(change_snapshot, step, task, result.output),
+                disk_changes=files_changed_since(settings.workspace_dir, step_started),
             )
             all_issues = _dedupe([*all_issues, *(verdict.issues or [])])
             # If the retry produced essentially the same answer, stop — it's stalled.

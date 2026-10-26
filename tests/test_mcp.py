@@ -55,6 +55,8 @@ def test_catalog_covers_popular_connectors():
 def test_catalog_templates_render_cleanly():
     """Every {placeholder} in a connector's templates must be a declared param."""
     for spec in CONNECTOR_CATALOG:
+        if spec.auth == "google":  # no server: backed by the native Google tools
+            continue
         params = {p.name: p.default or "x" for p in spec.params}
         rendered = render_server(spec, params)
         assert rendered.transport in ("stdio", "http")
@@ -208,9 +210,7 @@ def _mock_oauth_client(requests_seen: list):
         requests_seen.append(request)
         path = request.url.path
         if path.startswith("/.well-known/oauth-protected-resource"):
-            return httpx.Response(
-                200, json={"authorization_servers": ["https://auth.example.com"]}
-            )
+            return httpx.Response(200, json={"authorization_servers": ["https://auth.example.com"]})
         if path.startswith("/.well-known/oauth-authorization-server"):
             return httpx.Response(
                 200,

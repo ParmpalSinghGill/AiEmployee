@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import asyncio
 import shlex
+import tempfile
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import IO, Any
 
 from ai_employee.core.exceptions import ToolError
 from ai_employee.core.logging import get_logger
@@ -45,8 +46,55 @@ def sdk_available() -> bool:
     return True
 
 
+def _leaf_errors(exc: BaseException) -> list[BaseException]:
+    """The real exceptions inside (possibly nested) exception groups."""
+    if isinstance(exc, BaseExceptionGroup):
+        return [leaf for sub in exc.exceptions for leaf in _leaf_errors(sub)]
+    return [exc]
+
+
+def describe_error(exc: BaseException, server_output: str = "") -> str:
+    """A one-line, human-readable reason for a failed MCP connection or call.
+
+    The SDK wraps failures in ``ExceptionGroup``s and reports a crashed stdio
+    server only as "Connection closed", so the useful part is usually the
+    leaf exception plus whatever the server printed to stderr before dying.
+    """
+    if isinstance(exc, ToolError):
+        return str(exc)
+    parts = []
+    for leaf in _leaf_errors(exc):
+        text = str(leaf).strip()
+        parts.append(f"{type(leaf).__name__}: {text}" if text else type(leaf).__name__)
+    message = "; ".join(dict.fromkeys(parts)) or type(exc).__name__
+    if isinstance(exc, FileNotFoundError) or any(
+        isinstance(leaf, FileNotFoundError) for leaf in _leaf_errors(exc)
+    ):
+        message += " (is the server's launcher — npx/uvx — installed and on PATH?)"
+    output = server_output.strip()
+    if output:
+        message += f" — server said: {output}"
+    return message
+
+
+def _stderr_tail(errlog: IO[str] | None, limit: int = 600) -> str:
+    """The last meaningful lines a stdio server wrote to stderr."""
+    if errlog is None:
+        return ""
+    try:
+        errlog.flush()
+        errlog.seek(0)
+        lines = [ln.strip() for ln in errlog.read().splitlines() if ln.strip()]
+    except (OSError, ValueError):
+        return ""
+    # Package-manager chatter ("Installed 31 packages…", npm warnings) is noise.
+    noise = ("Installed ", "Resolved ", "Downloading ", "npm WARN", "npm notice")
+    useful = [ln for ln in lines if not ln.startswith(noise)]
+    return " | ".join(useful)[-limit:]
+
+
 @asynccontextmanager
-async def _session(server: RenderedServer, *, sse: bool = False):
+async def _session(server: RenderedServer, *, sse: bool = False, errlog: IO[str] | None = None):
     """Open an initialized ClientSession for the server (stdio or HTTP)."""
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import get_default_environment, stdio_client
@@ -60,8 +108,9 @@ async def _session(server: RenderedServer, *, sse: bool = False):
             args=argv[1:],
             env={**get_default_environment(), **server.env},
         )
+        stdio = stdio_client(params, errlog=errlog) if errlog is not None else stdio_client(params)
         async with (
-            stdio_client(params) as (read, write),
+            stdio as (read, write),
             ClientSession(read, write) as session,
         ):
             await session.initialize()
@@ -103,20 +152,41 @@ async def _with_session(
     """Run ``fn(session)`` with a timeout; HTTP servers fall back to SSE once."""
     if not sdk_available():
         raise ToolError("the 'mcp' package is not installed — run: pip install mcp")
+    # Keep a stdio server's stderr: when it exits early, its own message ("OAuth
+    # keys file not found…") is the only useful explanation of the failure.
+    errlog = (
+        tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")  # noqa: SIM115
+        if server.transport == "stdio"
+        else None
+    )
 
     async def _attempt(sse: bool) -> Any:
-        async with _session(server, sse=sse) as session:
+        async with _session(server, sse=sse, errlog=errlog) as session:
             return await fn(session)
 
     try:
-        return await asyncio.wait_for(_attempt(False), timeout=timeout)
-    except (TimeoutError, ToolError):
-        raise
-    except Exception as exc:  # noqa: BLE001 - retry older HTTP servers over SSE
-        if server.transport != "http":
+        try:
+            return await asyncio.wait_for(_attempt(False), timeout=timeout)
+        except (TimeoutError, ToolError):
             raise
-        log.debug("mcp.http_fallback_sse", server=server.id, error=str(exc))
-        return await asyncio.wait_for(_attempt(True), timeout=timeout)
+        except Exception as exc:  # noqa: BLE001 - retry older HTTP servers over SSE
+            if server.transport != "http":
+                raise
+            log.debug("mcp.http_fallback_sse", server=server.id, error=str(exc))
+            return await asyncio.wait_for(_attempt(True), timeout=timeout)
+    except ToolError:
+        raise
+    except TimeoutError as exc:
+        hint = _stderr_tail(errlog)
+        raise ToolError(
+            f"no response from MCP server {server.id!r} within {timeout:.0f}s"
+            + (f" — server said: {hint}" if hint else "")
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - one readable reason for UI and agents
+        raise ToolError(describe_error(exc, _stderr_tail(errlog))) from exc
+    finally:
+        if errlog is not None:
+            errlog.close()
 
 
 async def probe_server(server: RenderedServer, *, timeout: float = 120) -> list[dict[str, Any]]:
@@ -189,6 +259,7 @@ def runtime_available() -> dict[str, bool]:
 __all__ = [
     "RenderedServer",
     "call_server_tool",
+    "describe_error",
     "probe_server",
     "runtime_available",
     "sdk_available",

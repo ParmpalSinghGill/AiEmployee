@@ -22,6 +22,9 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
+from ai_employee.core.text_paths import clean_for_path_extraction
+from ai_employee.verification.locate import find_by_name
+
 # File path followed by a claimed byte/line count or pixel dimensions, e.g.:
 #   "aapl_last_30d.csv` | 404 bytes, 23 lines"
 #   "aapl_close_chart.png` ... 99,669 bytes"
@@ -37,9 +40,7 @@ _WINDOW = 200
 
 # "last 1 year", "past 6 months", "last 30 days" — the common way a task phrases
 # a relative lookback window. Plural/singular tolerant.
-_RELATIVE_RANGE_RE = re.compile(
-    r"\b(?:last|past)\s+(\d+)\s*(day|week|month|year)s?\b", re.I
-)
+_RELATIVE_RANGE_RE = re.compile(r"\b(?:last|past)\s+(\d+)\s*(day|week|month|year)s?\b", re.I)
 _UNIT_DAYS = {"day": 1, "week": 7, "month": 30, "year": 365}
 
 # A bare 4-digit year followed by "-" then 2-digit month/day — cheap ISO date sniff,
@@ -127,7 +128,9 @@ def _resolve_path(path: str, workspace: Path) -> Path | None:
     for candidate in (raw, workspace / raw, workspace / raw.name):
         if candidate.is_file():
             return candidate.resolve()
-    return None
+    # Named without its folder ("capacity_grid.csv" for reports/capacity_grid.csv).
+    found = find_by_name(workspace, raw.name)
+    return found.resolve() if found is not None else None
 
 
 def _png_dimensions(path: Path) -> tuple[int, int] | None:
@@ -147,12 +150,42 @@ def _int(text: str) -> int:
     return int(text.replace(",", ""))
 
 
+_LOOKBACK = 60
+
+
 def _claims_near(output: str, filename: str) -> str:
-    """Slice of the output text around each mention of ``filename``, concatenated."""
+    """Text around each mention of ``filename``, concatenated.
+
+    Each window stops at the neighbouring mention of a DIFFERENT file, so a
+    number stated for one file ("report.md, 616 lines") is never attributed to
+    another file listed next to it.
+    """
+    others = [
+        (m.start(), m.end())
+        for m in _FILE_RE.finditer(output)
+        if m.group(0) != filename
+        and not filename.endswith(m.group(0))
+        and not m.group(0).endswith(filename)
+    ]
     chunks = []
     for m in re.finditer(re.escape(filename), output):
-        start = max(0, m.start() - _WINDOW)
+        # A size or row count follows its file ("x.csv — 18,183 B") or sits just
+        # before it ("saved 1,234 rows to x.csv"); a long look-back picks up
+        # numbers that belong to something else.
+        start = max(0, m.start() - _LOOKBACK)
         end = min(len(output), m.end() + _WINDOW)
+        for o_start, o_end in others:
+            if o_end <= m.start() and o_end > start:
+                # Text between another file and this one describes that file
+                # ("a.csv (168 rows), b.csv"): no look-back for this mention.
+                start = m.start()
+            if o_start >= m.end() and o_start < end:
+                end = o_start
+        # Nor across a sentence or clause break before the name.
+        before = output[start : m.start()]
+        cut = max(before.rfind(sep) for sep in (";", ". ", "\n", "|"))
+        if cut >= 0:
+            start += cut + 1
         chunks.append(output[start:end])
     return "\n".join(chunks)
 
@@ -176,7 +209,8 @@ def audit_artifacts(
     a step over; an empty list with ``applies=True`` means every claim checked out.
     """
     ws = (workspace or Path(".")).resolve()
-    filenames = list(dict.fromkeys(_FILE_RE.findall(output or "")))
+    # URLs out first: "https://host/data.json" is a link, not a workspace file.
+    filenames = list(dict.fromkeys(_FILE_RE.findall(clean_for_path_extraction(output or ""))))
     if not filenames:
         return {"applies": False, "issues": [], "checked": []}
 
@@ -208,13 +242,16 @@ def audit_artifacts(
 
         if resolved.suffix.lower() in (".csv", ".txt", ".json", ".md"):
             try:
-                actual_lines = sum(1 for _ in resolved.open("r", encoding="utf-8", errors="replace"))
+                actual_lines = sum(
+                    1 for _ in resolved.open("r", encoding="utf-8", errors="replace")
+                )
             except OSError:
                 actual_lines = None
             if actual_lines is not None:
                 entry["actual_lines"] = actual_lines
                 line_claims = {_int(m) for m in _LINES_RE.findall(claim_text)}
-                for claimed in line_claims - {actual_lines}:
+                # "N rows" of a CSV excludes its header line: N = lines - 1 is right.
+                for claimed in line_claims - {actual_lines, actual_lines - 1}:
                     issues.append(
                         f"Output claims '{name}' has {claimed:,} lines/rows, but the file "
                         f"actually has {actual_lines:,}."

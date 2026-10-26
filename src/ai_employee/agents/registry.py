@@ -36,9 +36,31 @@ def _google_connected() -> bool:
         return False
 
 
+def _mcp_services() -> dict[str, list[str]]:
+    from ai_employee.config import get_settings
+    from ai_employee.tools.mcp.manager import connected_services_by_agent
+
+    try:
+        return connected_services_by_agent(get_settings())
+    except Exception:  # noqa: BLE001 - an unreadable store means "nothing connected"
+        return {}
+
+
+def _comms_connected() -> bool:
+    """comms has something to work with: Google, or an MCP server routed to it."""
+    if INTEGRATION_CHECKS["google"]():
+        return True
+    services = _mcp_services()
+    return bool(services.get("comms") or services.get("*"))
+
+
 #: Integration name → "is it connected right now?". Checked on every catalog
-#: build, so connecting Google mid-session makes comms plannable immediately.
-INTEGRATION_CHECKS: dict[str, Callable[[], bool]] = {"google": _google_connected}
+#: build, so connecting Google (or Slack/Zapier over MCP) mid-session makes
+#: comms plannable immediately.
+INTEGRATION_CHECKS: dict[str, Callable[[], bool]] = {
+    "google": _google_connected,
+    "comms": _comms_connected,
+}
 
 
 def integration_available(name: str | None) -> bool:
@@ -92,15 +114,22 @@ class AgentRegistry:
         ``include_unavailable=True`` for a full listing (e.g. an admin view).
         """
         out: list[dict[str, str]] = []
+        services = _mcp_services()
         for a in self._agents.values():
             requires = getattr(a, "requires", None)
             available = integration_available(requires)
             if not available and not include_unavailable:
                 continue
+            description = a.description
+            if isinstance(a, ToolUsingAgent):
+                # Tell the planner which connected services this agent can reach.
+                labels = list(dict.fromkeys(services.get(a.name, []) + services.get("*", [])))
+                if labels:
+                    description += f" Connected services: {', '.join(labels)}."
             entry = {
                 "name": a.name,
                 "role": getattr(a, "role", ""),
-                "description": a.description,
+                "description": description,
                 "category": getattr(a, "category", ""),
             }
             if include_unavailable and requires:

@@ -96,15 +96,29 @@ def output_tail(output: Any, error: str | None = None, *, limit: int = TAIL_CHAR
     return text[-limit:] if len(text) > limit else text
 
 
+_SAVED_PATH_RE = re.compile(r"""["']path["']\s*:\s*["']([^"']+)["']""")
+
+#: Tools whose successful call saves files without being a "write" call.
+_DOWNLOAD_TOOLS = frozenset({"download_resource"})
+
+
 def summarize_tool_evidence(trace: list[dict[str, Any]], *, max_runs: int = 6) -> dict[str, Any]:
-    """Test-command results and the number of successful file writes in a step."""
+    """Test-command results, successful file writes and downloads in a step.
+
+    ``trace`` may span several attempts of the step (the first try and its
+    retries), so files an earlier attempt saved still count.
+    """
     runs: list[dict[str, Any]] = []
     writes = 0
+    downloads: list[str] = []
     for entry in trace or []:
         tool = str(entry.get("tool") or "")
         args = entry.get("args") or {}
         if entry.get("ok") and is_mutating_call(tool, args):
             writes += 1
+        if entry.get("ok") and tool in _DOWNLOAD_TOOLS:
+            m = _SAVED_PATH_RE.search(str(entry.get("output") or ""))
+            downloads.append(m.group(1) if m else str(args.get("destination") or "?"))
         if is_test_call(tool, args):
             command = _call_text(args).strip()
             runs.append(
@@ -116,7 +130,7 @@ def summarize_tool_evidence(trace: list[dict[str, Any]], *, max_runs: int = 6) -
                     or output_tail(entry.get("output"), entry.get("error")),
                 }
             )
-    return {"test_runs": runs[-max_runs:], "write_calls": writes}
+    return {"test_runs": runs[-max_runs:], "write_calls": writes, "downloads": downloads}
 
 
 # ── Did a code-change step change anything? ──────────────────────────────────

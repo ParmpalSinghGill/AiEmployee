@@ -69,6 +69,7 @@ class Verifier:
         fs_audit: dict | None = None,
         tool_evidence: dict | None = None,
         change_issue: str | None = None,
+        disk_changes: list[dict] | None = None,
     ) -> Verdict:
         criteria = success_criteria or "The output fully and correctly addresses the task."
         system = (
@@ -139,13 +140,28 @@ class Verifier:
                 "run' even if the prose says they were blocked. If the prose claims "
                 "tests passed but the evidence shows failures or no test run, that is a "
                 "real defect. If the task requires changing code and there were 0 "
-                "file-writing calls, claims that changes were applied are unsupported."
+                "file-writing calls, claims that changes were applied are unsupported. "
+                "Tool counts are a partial record (they cover this step's attempts "
+                "only): a file the output claims is real whenever it appears in the "
+                "on-disk facts — never call it fabricated then."
+            )
+        if disk_changes is not None:
+            system += (
+                "\n\nFILES CHANGED ON DISK (ground truth): the platform listed every "
+                "workspace file created or modified since this step started, across all "
+                "its attempts, whatever tool wrote it (downloads, shell, python, git "
+                "clone). Use it to confirm or refute claims that files were saved, "
+                "downloaded or written."
             )
         user = f"TASK:\n{task}\n\nSUCCESS CRITERIA:\n{criteria}\n\nOUTPUT TO REVIEW:\n{output}"
         if tool_evidence is not None:
             user += (
                 "\n\nTOOL EXECUTION EVIDENCE (recorded by the platform):\n"
                 f"- successful file-writing calls: {tool_evidence.get('write_calls', 0)}\n"
+            )
+            saved = tool_evidence.get("downloads") or []
+            user += f"- successful downloads: {len(saved)}\n" + "".join(
+                f"  * saved to {p}\n" for p in saved[:20]
             )
             if runs:
                 user += "- test commands run (oldest first):\n" + "\n".join(
@@ -155,6 +171,15 @@ class Verifier:
                 )
             else:
                 user += "- no test commands were run in this step\n"
+        if disk_changes is not None:
+            user += "\n\nFILES CHANGED ON DISK SINCE THIS STEP STARTED (ground truth):\n" + (
+                "\n".join(
+                    f"- {c.get('path')}"
+                    + (f" ({c['bytes']:,} bytes)" if isinstance(c.get("bytes"), int) else "")
+                    for c in disk_changes
+                )
+                or "- (none)"
+            )
         if resource_audit and resource_audit.get("issues"):
             user += "\n\nPROGRAMMATIC RESOURCE AUDIT ISSUES:\n" + "\n".join(
                 f"- {issue}" for issue in resource_audit["issues"]

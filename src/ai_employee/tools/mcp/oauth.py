@@ -267,9 +267,7 @@ def _expires_at(tokens: dict[str, Any]) -> float:
         return time.time() + 3600
 
 
-async def ensure_access_token(
-    settings: Any, server_id: str, *, client: Any = None
-) -> str | None:
+async def ensure_access_token(settings: Any, server_id: str, *, client: Any = None) -> str | None:
     """A valid access token for the server, refreshing if it is (nearly) expired.
 
     Returns ``None`` when the server was never authorized. Raises

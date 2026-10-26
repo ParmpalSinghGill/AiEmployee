@@ -66,26 +66,26 @@ def test_registry_resolves_legacy_names_transparently() -> None:
     assert resolve_agent_name("research") == "research"  # real names pass through
 
 
-# ── comms is offered only when Google is connected ──────────────────────────
+# ── comms is offered only when Google (or a comms MCP server) is connected ──────────────────────────
 
 
 def test_comms_is_hidden_from_the_roster_until_google_connects(monkeypatch) -> None:
     reg = build_agent_registry()
 
-    monkeypatch.setitem(INTEGRATION_CHECKS, "google", lambda: False)
+    monkeypatch.setitem(INTEGRATION_CHECKS, "comms", lambda: False)
     assert "comms" not in {a["name"] for a in reg.catalog()}
     full = {a["name"]: a for a in reg.catalog(include_unavailable=True)}
     assert full["comms"]["available"] == "no"
     assert "comms" in reg  # still registered: legacy `email` steps can resolve
 
-    monkeypatch.setitem(INTEGRATION_CHECKS, "google", lambda: True)
+    monkeypatch.setitem(INTEGRATION_CHECKS, "comms", lambda: True)
     assert "comms" in {a["name"] for a in reg.catalog()}
 
 
 async def test_planner_cannot_assign_internal_roles_or_unconnected_comms(monkeypatch) -> None:
     from ai_employee.planning.planner import Planner
 
-    monkeypatch.setitem(INTEGRATION_CHECKS, "google", lambda: False)
+    monkeypatch.setitem(INTEGRATION_CHECKS, "comms", lambda: False)
     seen: dict = {}
 
     class _Brain:
@@ -133,7 +133,7 @@ def test_merged_agents_keep_their_duties() -> None:
     assert "SECURITY" in reviewer and "OPERATIONS" in reviewer
     comms = spec_by_name()["comms"]
     assert {"gmail_send", "calendar_create_event"} <= set(comms.tools or ())
-    assert comms.requires == "google"
+    assert comms.requires == "comms"
 
 
 # ── per-run deny-list & refusing unexposed tools ─────────────────────────────

@@ -94,6 +94,8 @@ def test_tools_hidden_until_configured(settings):
         "gmail_send",
         "calendar_list_events",
         "calendar_create_event",
+        "drive_search",
+        "drive_read",
     }
 
 

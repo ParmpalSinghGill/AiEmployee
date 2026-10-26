@@ -44,7 +44,15 @@ class ConnectorSpec:
     docs: str = ""
     # "oauth": no keys/params — Connect opens the provider's consent page in the
     # browser (MCP OAuth 2.1: discovery + dynamic client registration + PKCE).
+    # "google": no server at all — the card is backed by the native Google tools
+    # and the account connected with "Connect Google account" (see google_scopes).
     auth: str = ""
+    # Worker agents that get this connector's tools. Empty = every worker.
+    agents: tuple[str, ...] = ()
+    # auth="google" only: OAuth scopes the account must have granted, and the
+    # native tools (tools/builtins/google_workspace.py) the card stands for.
+    google_scopes: tuple[str, ...] = ()
+    native_tools: tuple[str, ...] = ()
 
 
 CONNECTOR_CATALOG: tuple[ConnectorSpec, ...] = (
@@ -64,6 +72,7 @@ CONNECTOR_CATALOG: tuple[ConnectorSpec, ...] = (
         ),
         runtime="npx",
         docs="https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem",
+        agents=("coding", "testing", "documentation", "data_analysis"),
     ),
     ConnectorSpec(
         "github",
@@ -75,6 +84,7 @@ CONNECTOR_CATALOG: tuple[ConnectorSpec, ...] = (
         params=(ParamSpec("token", "Personal access token", secret=True),),
         runtime="npx",
         docs="https://github.com/modelcontextprotocol/servers-archived/tree/main/src/github",
+        agents=("coding", "git", "reviewer", "research"),
     ),
     ConnectorSpec(
         "slack",
@@ -89,6 +99,7 @@ CONNECTOR_CATALOG: tuple[ConnectorSpec, ...] = (
         ),
         runtime="npx",
         docs="https://github.com/modelcontextprotocol/servers-archived/tree/main/src/slack",
+        agents=("comms",),
     ),
     ConnectorSpec(
         "postgres",
@@ -106,6 +117,7 @@ CONNECTOR_CATALOG: tuple[ConnectorSpec, ...] = (
         ),
         runtime="npx",
         docs="https://github.com/modelcontextprotocol/servers-archived/tree/main/src/postgres",
+        agents=("data_analysis", "coding"),
     ),
     ConnectorSpec(
         "git",
@@ -123,53 +135,48 @@ CONNECTOR_CATALOG: tuple[ConnectorSpec, ...] = (
         ),
         runtime="uvx",
         docs="https://github.com/modelcontextprotocol/servers/tree/main/src/git",
+        agents=("git", "coding", "reviewer"),
     ),
     ConnectorSpec(
         "gmail",
         "Gmail",
-        "Read, search, send, and manage Gmail. One-time setup: put your OAuth "
-        "client keys at ~/.gmail-mcp/gcp-oauth.keys.json and run "
-        "'npx @gongrzhe/server-gmail-autoauth-mcp auth' once to sign in.",
-        transport="stdio",
-        command="npx -y @gongrzhe/server-gmail-autoauth-mcp",
-        runtime="npx",
-        docs="https://github.com/GongRzhe/Gmail-MCP-Server",
+        "Search, read, and send mail from your connected Google account. No key "
+        "files or extra setup — Connect uses Google sign-in. Sending stays "
+        "approval-gated.",
+        transport="google",
+        auth="google",
+        agents=("comms",),
+        google_scopes=(
+            "https://www.googleapis.com/auth/gmail.readonly",
+            "https://www.googleapis.com/auth/gmail.send",
+        ),
+        native_tools=("gmail_search", "gmail_read", "gmail_send"),
+        docs="https://developers.google.com/gmail/api",
     ),
     ConnectorSpec(
         "google_calendar",
         "Google Calendar",
-        "List, create, update, and search calendar events. Needs a Google Cloud "
-        "OAuth client JSON; a browser sign-in is prompted on first use.",
-        transport="stdio",
-        command="npx -y @cocal/google-calendar-mcp",
-        env={"GOOGLE_OAUTH_CREDENTIALS": "{credentials_file}"},
-        params=(
-            ParamSpec(
-                "credentials_file",
-                "OAuth credentials JSON",
-                "Path to the gcp-oauth.keys.json downloaded from Google Cloud.",
-            ),
-        ),
-        runtime="npx",
-        docs="https://github.com/nspady/google-calendar-mcp",
+        "List and create events on your connected Google account's calendar. "
+        "Connect uses Google sign-in; creating events stays approval-gated.",
+        transport="google",
+        auth="google",
+        agents=("comms",),
+        google_scopes=("https://www.googleapis.com/auth/calendar",),
+        native_tools=("calendar_list_events", "calendar_create_event"),
+        docs="https://developers.google.com/calendar/api",
     ),
     ConnectorSpec(
         "gdrive",
         "Google Drive",
-        "Search and read files in Google Drive (Docs/Sheets exported as text/CSV). "
-        "Needs pre-authorized credentials — see the server's auth instructions.",
-        transport="stdio",
-        command="npx -y @modelcontextprotocol/server-gdrive",
-        env={"GDRIVE_CREDENTIALS_PATH": "{credentials_file}"},
-        params=(
-            ParamSpec(
-                "credentials_file",
-                "Saved credentials JSON",
-                "Path to .gdrive-server-credentials.json produced by the auth flow.",
-            ),
-        ),
-        runtime="npx",
-        docs="https://github.com/modelcontextprotocol/servers-archived/tree/main/src/gdrive",
+        "Search and read files in your connected Google account's Drive (Docs, "
+        "Sheets and Slides exported as text/CSV). Read-only; Connect uses Google "
+        "sign-in.",
+        transport="google",
+        auth="google",
+        agents=("comms", "research"),
+        google_scopes=("https://www.googleapis.com/auth/drive.readonly",),
+        native_tools=("drive_search", "drive_read"),
+        docs="https://developers.google.com/drive/api",
     ),
     ConnectorSpec(
         "google_maps",
@@ -181,6 +188,7 @@ CONNECTOR_CATALOG: tuple[ConnectorSpec, ...] = (
         params=(ParamSpec("api_key", "Maps API key", secret=True),),
         runtime="npx",
         docs="https://github.com/modelcontextprotocol/servers-archived/tree/main/src/google-maps",
+        agents=("research",),
     ),
     ConnectorSpec(
         "sqlite",
@@ -191,6 +199,7 @@ CONNECTOR_CATALOG: tuple[ConnectorSpec, ...] = (
         params=(ParamSpec("db_path", "Database file", "Path to the .db/.sqlite file."),),
         runtime="uvx",
         docs="https://github.com/modelcontextprotocol/servers-archived/tree/main/src/sqlite",
+        agents=("data_analysis", "coding"),
     ),
     ConnectorSpec(
         "brave_search",
@@ -202,6 +211,7 @@ CONNECTOR_CATALOG: tuple[ConnectorSpec, ...] = (
         params=(ParamSpec("api_key", "Brave API key", secret=True),),
         runtime="npx",
         docs="https://github.com/modelcontextprotocol/servers-archived/tree/main/src/brave-search",
+        agents=("research",),
     ),
     ConnectorSpec(
         "fetch",
@@ -211,6 +221,7 @@ CONNECTOR_CATALOG: tuple[ConnectorSpec, ...] = (
         command="uvx mcp-server-fetch",
         runtime="uvx",
         docs="https://github.com/modelcontextprotocol/servers/tree/main/src/fetch",
+        agents=("research",),
     ),
     ConnectorSpec(
         "memory",
@@ -220,6 +231,7 @@ CONNECTOR_CATALOG: tuple[ConnectorSpec, ...] = (
         command="npx -y @modelcontextprotocol/server-memory",
         runtime="npx",
         docs="https://github.com/modelcontextprotocol/servers/tree/main/src/memory",
+        agents=("research", "documentation"),
     ),
     ConnectorSpec(
         "playwright",
@@ -229,6 +241,7 @@ CONNECTOR_CATALOG: tuple[ConnectorSpec, ...] = (
         command="npx -y @playwright/mcp@latest",
         runtime="npx",
         docs="https://github.com/microsoft/playwright-mcp",
+        agents=("research", "testing"),
     ),
     ConnectorSpec(
         "notion",
@@ -239,6 +252,7 @@ CONNECTOR_CATALOG: tuple[ConnectorSpec, ...] = (
         url="https://mcp.notion.com/mcp",
         auth="oauth",
         docs="https://developers.notion.com/docs/mcp",
+        agents=("documentation", "research", "comms"),
     ),
     ConnectorSpec(
         "context7",
@@ -248,6 +262,7 @@ CONNECTOR_CATALOG: tuple[ConnectorSpec, ...] = (
         command="npx -y @upstash/context7-mcp",
         runtime="npx",
         docs="https://github.com/upstash/context7",
+        agents=("coding", "research"),
     ),
     ConnectorSpec(
         "sentry",
@@ -258,6 +273,7 @@ CONNECTOR_CATALOG: tuple[ConnectorSpec, ...] = (
         url="https://mcp.sentry.dev/mcp",
         auth="oauth",
         docs="https://docs.sentry.io/product/sentry-mcp/",
+        agents=("reviewer", "coding"),
     ),
     ConnectorSpec(
         "linear",
@@ -268,6 +284,7 @@ CONNECTOR_CATALOG: tuple[ConnectorSpec, ...] = (
         url="https://mcp.linear.app/sse",
         auth="oauth",
         docs="https://linear.app/docs/mcp",
+        agents=("comms", "research", "reviewer"),
     ),
     ConnectorSpec(
         "atlassian",
@@ -278,16 +295,17 @@ CONNECTOR_CATALOG: tuple[ConnectorSpec, ...] = (
         url="https://mcp.atlassian.com/v1/sse",
         auth="oauth",
         docs="https://support.atlassian.com/rovo/docs/getting-started-with-the-atlassian-remote-mcp-server/",
+        agents=("comms", "research", "documentation"),
     ),
     ConnectorSpec(
         "asana",
         "Asana",
-        "Read and manage Asana tasks and projects. Connect opens Asana's "
-        "consent page.",
+        "Read and manage Asana tasks and projects. Connect opens Asana's " "consent page.",
         transport="http",
         url="https://mcp.asana.com/sse",
         auth="oauth",
         docs="https://developers.asana.com/docs/using-asanas-mcp-server",
+        agents=("comms", "research"),
     ),
     ConnectorSpec(
         "zapier",
@@ -299,6 +317,7 @@ CONNECTOR_CATALOG: tuple[ConnectorSpec, ...] = (
         url="https://mcp.zapier.com/api/mcp/mcp",
         auth="oauth",
         docs="https://zapier.com/mcp",
+        agents=("comms",),
     ),
     ConnectorSpec(
         "time",
@@ -317,6 +336,7 @@ CONNECTOR_CATALOG: tuple[ConnectorSpec, ...] = (
         command="npx -y @modelcontextprotocol/server-sequentialthinking",
         runtime="npx",
         docs="https://github.com/modelcontextprotocol/servers/tree/main/src/sequentialthinking",
+        agents=("research", "coding"),
     ),
     ConnectorSpec(
         "custom_stdio",

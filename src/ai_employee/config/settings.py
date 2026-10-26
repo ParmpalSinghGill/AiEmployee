@@ -205,6 +205,10 @@ class Settings(BaseSettings):
     kaggle_key: str = ""
     roboflow_api_key: str = ""
     huggingface_token: str = ""  # HF_TOKEN — gated/private repos & faster downloads
+    # Largest whole-repository download (GB) a single download_resource call may
+    # start; bigger repos are refused with a hint to fetch specific files instead.
+    # 0 = no limit. Single-file links are never blocked by this.
+    download_max_gb: float = 5.0
     # GPU VRAM available locally (GB); 0 = unknown. Used by estimate_hardware to
     # decide whether a found model can run/train on this machine.
     local_gpu_vram_gb: float = 0.0
@@ -230,9 +234,11 @@ class Settings(BaseSettings):
     # "restricted" scopes — publishing beyond test users needs Google review.
     google_oauth_scopes: str = (
         "openid,https://www.googleapis.com/auth/userinfo.email,"
+        "https://www.googleapis.com/auth/userinfo.profile,"
         "https://www.googleapis.com/auth/gmail.readonly,"
         "https://www.googleapis.com/auth/gmail.send,"
-        "https://www.googleapis.com/auth/calendar"
+        "https://www.googleapis.com/auth/calendar,"
+        "https://www.googleapis.com/auth/drive.readonly"
     )
 
     # ── User accounts (optional — the console works without signing in) ──────

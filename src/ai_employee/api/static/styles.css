@@ -660,6 +660,7 @@ body {
 .mcp-approve { display: flex; align-items: center; gap: 5px; font-size: 12px;
   color: var(--muted); white-space: nowrap; cursor: pointer; }
 .mcp-tools { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px; }
+.mcp-agents { margin-top: 4px; font-size: 11.5px; color: var(--muted, #8a8f98); }
 .mcp-tools code { background: var(--bg-3); border: 1px solid var(--line);
   border-radius: 4px; padding: 1px 6px; font-size: 11px; color: var(--muted); }
 

@@ -22,15 +22,24 @@ from pathlib import Path
 from typing import Any
 
 from ai_employee.core.text_paths import clean_for_path_extraction, has_diff_claim
+from ai_employee.verification.locate import find_by_name
 
 # Absolute Unix paths — require at least one inner slash so single-segment roots
 # and device names (e.g. "/dev/sda", "/") don't flood the audit. URLs and git diff
 # headers are stripped before matching (see ``clean_for_path_extraction``).
-_ABS_PATH_RE = re.compile(r"/(?:[\w@.+~-]+/)+[\w@.+~-]+")
+# The look-behind keeps a slash INSIDE a longer token from starting a path:
+# "data/citypersons/x.mat" must not be read as "/citypersons/x.mat", nor
+# "kaggle.com/datasets/x" or "MOT17/MOT20/CrowdHuman" as root paths.
+_ABS_PATH_RE = re.compile(r"(?<![\w@.+~:/-])/(?:[\w@.+~-]+/)+[\w@.+~-]+")
 
 # "../"-relative paths — the class that most often resolves somewhere the agent
 # didn't intend (relative to the sandbox CWD rather than the repo root).
 _REL_PATH_RE = re.compile(r"(?:\.\./)+(?:[\w@.+~-]+/)*[\w@.+~-]+(?:\.\w+)?")
+
+# Workspace-relative paths ("data/MOT17Labels.zip", "./reports/x.md"). Only
+# checked when their first folder exists in the workspace, so prose such as
+# "and/or" or "MOT17/MOT20" is never mistaken for a path.
+_WS_REL_PATH_RE = re.compile(r"(?<![\w@.+~:/-])(?:\./)?[A-Za-z_][\w@.+~-]*(?:/[\w@.+~-]+)+")
 
 _SHA_RE = re.compile(r"\b[0-9a-f]{40}\b", re.I)
 
@@ -309,6 +318,11 @@ def audit_filesystem(
     raw_paths: list[str] = []
     raw_paths += [_strip(m.group(0)) for m in _ABS_PATH_RE.finditer(cleaned)]
     raw_paths += [_strip(m.group(0)) for m in _REL_PATH_RE.finditer(cleaned)]
+    for m in _WS_REL_PATH_RE.finditer(cleaned):
+        rel = _strip(m.group(0))
+        first = rel.removeprefix("./").split("/", 1)[0]
+        if first and (ws / first).exists():
+            raw_paths.append(rel)
 
     seen: set[str] = set()
     paths: list[str] = []
@@ -333,10 +347,16 @@ def audit_filesystem(
         resolved_paths.append(resolved)
         near = _claims_near(text, p)
         if not resolved.exists():
-            checked.append({"path": p, "exists": False})
-            if _CLAIM_RE.search(near) and not _NEG_RE.search(near):
-                issues.append(f"Output claims '{p}' exists but it does not exist on disk.")
-            continue
+            # Named without its folder, or written by an earlier attempt somewhere
+            # else in the workspace: a file found by name is not "missing".
+            elsewhere = find_by_name(ws, p)
+            if elsewhere is not None:
+                resolved = elsewhere
+            else:
+                checked.append({"path": p, "exists": False})
+                if _CLAIM_RE.search(near) and not _NEG_RE.search(near):
+                    issues.append(f"Output claims '{p}' exists but it does not exist on disk.")
+                continue
         if not resolved.is_dir() and not resolved.is_file():
             # Devices, sockets, fifos — nothing useful to report to the verifier.
             continue

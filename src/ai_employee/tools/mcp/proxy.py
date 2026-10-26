@@ -45,8 +45,14 @@ class MCPProxyTool(Tool):
         require_approval: bool = False,
         timeout: float = 120,
         token_provider: Callable[[], Awaitable[str | None]] | None = None,
+        agents: tuple[str, ...] = (),
+        server_label: str = "",
     ) -> None:
         self._server = server
+        # Worker agents that may use this tool (empty = every worker); see
+        # ``routes_to``. Agents with a fixed tool list get it added on top.
+        self.agents = tuple(agents)
+        self.server_label = server_label or server.id
         self._tool_name = tool_name
         # OAuth connectors: called before every run so a refreshed access token
         # replaces the one baked into the frozen RenderedServer at build time.
@@ -63,6 +69,9 @@ class MCPProxyTool(Tool):
         )
         if require_approval:
             setattr(self, "approval_key", "mcp_tool")  # noqa: B010
+
+    def routes_to(self, agent_name: str) -> bool:
+        return not self.agents or agent_name in self.agents
 
     def to_spec(self):  # noqa: ANN201 - matches Tool.to_spec
         from ai_employee.brains.schemas import ToolSpec
