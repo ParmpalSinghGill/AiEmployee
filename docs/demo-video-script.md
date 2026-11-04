@@ -77,7 +77,7 @@ runnable training code with a README.
 | SAY | SHOW |
 |---|---|
 | "Watch what happens. It doesn't answer. It *plans*." | Hit **▶ Run**. Stay on the **⬡ Flow** tab. Let the plan nodes populate for 3 seconds with **no talking**. |
-| "It decomposed my one sentence into steps, and handed each step to a different specialist. That's a Scout for finding resources, a Hardware Analyst for the GPU question, and a Code Generator for the training script. There are 23 of these specialists in the framework." | Hover slowly over the plan nodes so each assigned agent name is readable — point out `scout`, `hardware_analyst`, `codesmith`. |
+| "It decomposed my one sentence into steps, and handed each step to the right specialist. The Research agent finds the model and dataset and sizes the GPU, the Coding agent writes the training script, and the Documentation agent writes the README. There are eight specialists in the team, and each kind of work has exactly one owner." | Hover slowly over the plan nodes so each assigned agent name is readable — point out `research`, `coding`, `documentation`. |
 
 ---
 
@@ -193,7 +193,7 @@ see the caveat below.
 |---|---|
 | "So far each specialist has worked one at a time. But most of these steps don't actually depend on each other — finding a model, finding a dataset, and sizing the GPU are three independent jobs." | Header: click **⚡ Parallel**, it flips to **On**. |
 | "So let them run at the same time." | Re-run Task A. Cut straight to the **⬡ Flow** tab. |
-| "Three agents, live, simultaneously — the scout, the researcher, and the hardware analyst. Each one is a separate specialist working its own step." | The banner: **⚡ 3 agents running in parallel**, with a named chip per agent. Zoom in on it. Hold 3 seconds — this is the shot. |
+| "Three agents, live, simultaneously — one finding the model, one finding the dataset, one sizing the GPU. Each one is a separate agent working its own step." | The banner: **⚡ 3 agents running in parallel**, with a named chip per agent. Zoom in on it. Hold 3 seconds — this is the shot. |
 | "And the step that needs all three waits. The moment its last dependency lands, it starts — no idle time." | Point at the dependent step node sitting idle, then starting the instant the others finish. |
 | "It's dependency-aware. Independent work overlaps; dependent work waits exactly as long as it has to." | The "Running now" counter in the summary stats ticking down 3 → 1 as steps land. |
 
@@ -240,7 +240,7 @@ Fast montage — type, hold output ~2s, cut.
 | "It's not UI-only." | `python -m ai_employee agents` → the agent catalog scrolling |
 | "Full CLI —" | `python -m ai_employee tools` → tool list with categories |
 | "— RAG over your own documents —" | `python -m ai_employee ingest ./README.md` then `python -m ai_employee query "What providers are supported?"` → show the answer **and the citations JSON** |
-| "— you can call one agent directly —" | `python -m ai_employee ask scout "Find a small speech-to-text model I can run locally"` |
+| "— you can call one agent directly —" | `python -m ai_employee ask research "Find a small speech-to-text model I can run locally"` |
 | "— and check exactly what's active." | `python -m ai_employee config` → brain, model, embeddings, memory backend |
 | "Plus a FastAPI server, so everything you just saw is an API too." | `http://localhost:8010/docs` — scroll `/chat`, `/task`, `/agents`, `/tools`, `/knowledge`, `/memory` |
 

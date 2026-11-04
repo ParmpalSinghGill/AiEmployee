@@ -323,9 +323,9 @@
       LLM SDK.
     </p>
     <div class="facts">
-      <span><b>29</b> agents</span>
+      <span><b>8</b> worker agents</span>
       <span><b>7</b> providers</span>
-      <span><b>23</b> tools</span>
+      <span><b>27</b> tools</span>
       <span><b>3</b> orchestrators</span>
       <span><b>7</b> memory namespaces</span>
     </div>
@@ -422,7 +422,7 @@
           <rect class="svg-box" x="62" y="240" width="176" height="62" rx="2"/>
           <text class="svg-label" x="150" y="262" text-anchor="middle">Agents</text>
           <text class="svg-sub" x="150" y="276" text-anchor="middle">registry · specs.py</text>
-          <text class="svg-sub" x="150" y="290" text-anchor="middle">29 specs + custom</text>
+          <text class="svg-sub" x="150" y="290" text-anchor="middle">8 workers + 3 roles</text>
 
           <rect class="svg-box" x="252" y="240" width="176" height="62" rx="2"/>
           <text class="svg-label" x="340" y="262" text-anchor="middle">Tools</text>
@@ -740,7 +740,7 @@
           <tr>
             <td>Agents</td>
             <td><span class="m">agents/specs.py</span></td>
-            <td>29 roles, most declared as data — system prompt, allowed tools, iteration cap — plus a few bespoke classes in <code>agents/custom.py</code>. <code>ToolUsingAgent</code> supplies the shared ReAct machinery.</td>
+            <td>8 workers declared as data — system prompt, allowed tools, iteration cap — (research, coding, testing, git, data_analysis, documentation, reviewer, comms), plus 3 orchestration roles (CEO, planner, human approval) in <code>agents/custom.py</code>. Retired names resolve through <code>LEGACY_AGENT_ALIASES</code>. <code>ToolUsingAgent</code> supplies the shared ReAct machinery.</td>
           </tr>
           <tr>
             <td>Tools</td>

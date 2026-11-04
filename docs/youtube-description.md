@@ -3,7 +3,8 @@
 Copy the block below into the YouTube description box. Fill the `[…]` placeholders
 and delete any timestamp lines for scenes you didn't film.
 
-**Verified against the code on 2026-08-10:** 29 agents, 24 tools, Apache-2.0,
+**Verified against the code on 2026-10-27:** 8 specialist agents (+ CEO, planner and
+human-approval roles), 27 tools (34 with Google Workspace), 25 MCP connector presets, Apache-2.0,
 repo `github.com/ParmpalSinghGill/AiEmployee`. Re-check with
 `python -m ai_employee agents` / `tools` before publishing if the code has moved on.
 
@@ -11,7 +12,7 @@ repo `github.com/ParmpalSinghGill/AiEmployee`. Re-check with
 
 ## Title options
 
-1. I built an AI Employee: give it one goal, it plans and delegates to 29 agents
+1. I built an AI Employee: give it one goal, it plans and delegates to a team of 8 specialist agents
 2. This AI doesn't chat — it plans, delegates, and does the work (open source)
 3. AI Employee Framework — multi-agent, any LLM, runs offline (Apache-2.0)
 
@@ -44,8 +45,10 @@ WHAT IT IS
 An open-source, provider-independent multi-agent framework built on LangChain, LangGraph,
 FastAPI and Postgres/pgvector.
 
-• 29 specialised agents (planner, research, scout, coding, security, QA, DevOps, …)
-• 24 sandboxed tools, with a human-approval gate on anything sensitive
+• 8 specialist agents — research, coding, testing, git, data analysis, documentation,
+  reviewer and comms — led by a CEO and a planner. One owner per kind of work.
+• 27 sandboxed tools (34 with Google Workspace), with a human-approval gate on anything sensitive
+• 25 plug-in MCP connectors (GitHub, Slack, Notion, Gmail, Google Drive, Postgres, …)
 • Swap the LLM with one environment variable — DeepSeek, OpenAI, Gemini, GLM, or a local
   model via Ollama. No business logic ever imports an LLM SDK.
 • Runs fully offline with a mock brain and in-memory store — no API keys, no database

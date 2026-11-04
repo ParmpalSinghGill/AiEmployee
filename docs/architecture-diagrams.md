@@ -8,8 +8,8 @@ Diagrams describe the code **as committed** (`src/ai_employee/`), not an aspirat
 design. A richer, styled version of the same four diagrams is in
 [architecture-diagrams.html](architecture-diagrams.html) — open it in a browser.
 
-Counts as of this writing: **29 agents**, **24 tools** (29 with Google Workspace
-connected), **7 providers**, **3 orchestrators**, **7 memory namespaces**, **25 MCP
+Counts as of this writing: **8 worker agents** (+ 3 orchestration roles), **27 tools** (34 with Google
+Workspace connected), **7 providers**, **3 orchestrators**, **7 memory namespaces**, **25 MCP
 connector presets**.
 
 ---
@@ -38,7 +38,7 @@ flowchart TD
     end
 
     subgraph cap["CAPABILITY"]
-        AG["Agents<br/>registry · specs.py<br/>29 roles"]
+        AG["Agents<br/>registry · specs.py<br/>8 workers + 3 roles"]
         TL["Tools<br/>registry · builtins/<br/>approval-gated"]
         ME["Memory<br/>manager · resilient<br/>7 namespaces"]
         KN["Knowledge<br/>loaders · chunking<br/>RAG over memory"]

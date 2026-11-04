@@ -6,18 +6,18 @@
 <p align="center">
   <img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg">
   <img alt="Python" src="https://img.shields.io/badge/python-3.12-blue.svg">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-333%20offline-brightgreen.svg">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-708%20offline-brightgreen.svg">
   <img alt="Providers" src="https://img.shields.io/badge/LLM-DeepSeek%20%7C%20OpenAI%20%7C%20Gemini%20%7C%20GLM%20%7C%20local-orange.svg">
 </p>
 
 Most AI tools give you a chat box: you ask, it answers, and you still do the work. This
 framework takes a **high-level goal** and runs it to completion — decomposing it into
 steps executed by the **right specialist agent** for each step (research for finding
-things, coding for code, data_analysis for data, …), calling **24 sandboxed tools**
-(29 with Google Workspace connected), self-reviewing every step, and persisting the
-whole run so it survives a restart. The **29 specialized agents** are chosen by the
-planner per step; the dedicated research/plan pipelines and `ask_agent` run agents
-directly.
+things, coding for code, data_analysis for data, …), calling **27 sandboxed tools**
+(34 with Google Workspace connected) plus any **MCP connectors** you enable,
+self-reviewing every step, and persisting the whole run so it survives a restart. A team
+of **8 specialist agents** — each owning one kind of work — is assigned step by step by
+the planner, and a CEO agent combines their verified results into the final answer.
 
 The LLM provider is swappable with a **single environment variable** — business logic
 never imports an LLM SDK. It runs **fully offline** out of the box (mock brain +
@@ -50,17 +50,22 @@ your approval before it downloads anything large.
 
 | Capability | What you get |
 |---|---|
-| **Provider independence** | DeepSeek (default), OpenAI, Gemini, GLM, and a `mock` provider — all behind one `Brain` interface. Swap via `LLM_PROVIDER`. |
-| **Multi-agent** | **29 specialized agents** (CEO, Planner, Scout, Coding, Security, QA, DevOps, …) orchestrated with **LangGraph**. The planner assigns each step to the best-fit agent, so research steps run the research agent and coding steps run the coding agent; the research/plan pipelines use their own specialist teams. |
+| **Provider independence** | DeepSeek (default), OpenAI, Gemini, GLM, OpenCode, any local OpenAI-compatible server (Ollama, vLLM, LM Studio), and a `mock` provider — all behind one `Brain` interface. Swap via `LLM_PROVIDER`. |
+| **Multi-agent** | **8 specialist workers** (research, coding, testing, git, data_analysis, documentation, reviewer, comms) plus CEO / Planner / human-approval roles, orchestrated with **LangGraph**. Each kind of work has exactly one owner, so the planner rarely misroutes: research steps run the research agent, coding steps run the coding agent. |
 | **Parallel execution** | Independent plan steps run **concurrently**; dependent steps wait and start the instant they're unblocked. One toggle in the console. |
 | **Hierarchical planning** | Goal → decomposition → specialist execution → verification → reflection → memory. |
-| **Tools** | **24 sandboxed tools** (29 with Google Workspace): filesystem, Python/shell execution, HTTP, web fetch/search, CSV/JSON, hub search (HF/Kaggle/Roboflow/arXiv/GitHub) — with a human-approval gate for sensitive ops. |
-| **MCP connectors** | Plug in popular **Model Context Protocol** servers from the console — GitHub, Git, Gmail, Google Calendar/Drive/Maps, Slack, Postgres, SQLite, Brave Search, Playwright, Notion, Linear, Sentry, Context7, or any custom stdio/HTTP server. Their tools appear to every agent as `mcp_*` tools, with an optional approval gate per connector. |
+| **Tools** | **27 sandboxed tools** (34 with Google Workspace): filesystem, Python/shell execution, HTTP, web fetch/search, CSV/JSON, hub search (HF/Kaggle/Roboflow/arXiv/GitHub) — with a human-approval gate for sensitive ops. |
+| **MCP connectors** | **25 presets** in the 🔌 MCP panel — GitHub, Git, Slack, Postgres, SQLite, Brave Search, Fetch, Playwright, Context7, Google Maps, Notion, Linear, Sentry, Jira/Confluence, Asana, Zapier, or any custom stdio/HTTP server. Remote servers connect with **one-click OAuth sign-in** (no keys); each connector's `mcp_*` tools are routed only to the agents that need them, with an optional approval gate. |
+| **Google Workspace** | Connect a Google account once: Gmail, Calendar and Drive tools for the `comms` and `research` agents. Sending mail or creating events is approval-gated. |
+| **Schedules & watchers** | ⏰ Run a task on a schedule, or watch a Gmail inbox and trigger a task when a matching mail arrives. |
+| **Autonomy & safety** | 🛡 Rule-based auto-approval policies, an audit trail of every outward action, push notifications (ntfy), and per-task token budgets. |
+| **User accounts** | 👤 Guest by default (no sign-up), or Google sign-in for a personal account; saved tasks are private to their owner. |
+| **Org chart** | 🗺 A live team view with the CEO at the top — arrows appear only for real dispatches, hand-offs and reports as the run happens. |
 | **Asset reuse** | Downloaded models/datasets are indexed workspace-wide and **never fetched twice** — enforced in the download tool, not just suggested to the model. |
 | **Memory** | Short-term, long-term, conversation, task, knowledge, project, skill — over pgvector or in-memory. |
 | **RAG** | Ingest PDF, Markdown, Word, PowerPoint, CSV, Excel, web pages, codebases; chunk, embed, retrieve, ground. |
-| **Verification** | Every step is self-reviewed; failures retry within a budget; confidence is estimated. |
-| **Learning** | Successful multi-step solutions are distilled into reusable *skills* and recalled later. |
+| **Verification** | Every step is reviewed against evidence — files on disk, real downloads, git diffs, actual tool calls — not just the agent's claims. Failures retry once, continuing from the previous attempt; confidence is estimated. |
+| **Learning** | Successful multi-step solutions are distilled into reusable *skills* and recalled later. Review, edit or delete them in the 💡 Skills panel. |
 | **Explainability** | An **Explain** tab per run: what each agent was asked, what the model chose, every tool call and the verifier's verdict. |
 | **Web Console** | A dependency-free dashboard at `/ui`: a tab per task, live n8n-style agent/tool flow, logs, results, and follow-up questions. |
 | **Resumable** | Every run is checkpointed mid-flight. Stop a task — or kill the server — and continue from the last completed step. |
@@ -82,8 +87,8 @@ your approval before it downloads anything large.
         ▼           ▼          ▼           ▼            ▼
    ┌────────┐  ┌─────────┐ ┌────────┐ ┌─────────┐  ┌──────────┐
    │ Brains │  │ Agents  │ │ Tools  │ │ Memory  │  │Knowledge │
-   │(swap-  │  │(29 spec-│ │(registry│ │(pgvector│  │  (RAG)   │
-   │ pable) │  │ialized) │ │+approval│ │/in-mem) │  │          │
+   │(swap-  │  │(8 work- │ │(registry│ │(pgvector│  │  (RAG)   │
+   │ pable) │  │ers+CEO) │ │+approval│ │/in-mem) │  │          │
    └────────┘  └─────────┘ └────────┘ └─────────┘  └──────────┘
         │                                  │
         └────── Verification ──────────────┘   (self-review, retry, confidence)
@@ -109,8 +114,13 @@ your approval before it downloads anything large.
 Retired names from the older 26-agent roster (`scout`, `codesmith`, `devops`, `qa`, …)
 still resolve to their successors via `LEGACY_AGENT_ALIASES` in `agents/routing.py`.
 
-Most are declarative `AgentSpec`s in `agents/specs.py` — adding one is a few lines, no
-new class. See [`docs/extending.md`](docs/extending.md).
+**How a run is overseen:** after every step the **Verifier** checks the output against
+evidence and sends a failed step back for one retry. The **CEO** runs once at the end: it
+merges all step results — each marked completed, unverified or skipped — into the final
+answer, without inventing anything a skipped step didn't produce.
+
+The workers are declarative `AgentSpec`s in `agents/specs.py` — adding one is a few
+lines, no new class. See [`docs/extending.md`](docs/extending.md).
 
 </details>
 
@@ -270,7 +280,7 @@ make format      # black + ruff --fix
 make typecheck   # mypy
 ```
 
-All **333 tests** run offline in seconds — no network, no database, no API keys.
+All **708 tests** run offline in seconds — no network, no database, no API keys.
 
 ---
 
@@ -288,6 +298,7 @@ All **333 tests** run offline in seconds — no network, no database, no API key
 | [docs/providers.md](docs/providers.md) | Switching LLMs, running local models |
 | [docs/extending.md](docs/extending.md) | Add a tool, an agent, or a provider |
 | [docs/memory.md](docs/memory.md) | Memory types and backends |
+| [docs/google-oauth-setup.md](docs/google-oauth-setup.md) | Set up your own Google OAuth client for Gmail / Calendar / Drive and Google sign-in |
 | [docs/deployment.md](docs/deployment.md) | Docker, Postgres/pgvector, production notes |
 
 ---
