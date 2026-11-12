@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import time
 import uuid
 from datetime import UTC, datetime
 from enum import Enum
@@ -596,6 +597,47 @@ class TaskManager:
         task.progress_saved_at = _now()
 
     async def _execute(
+        self,
+        employee: Any,
+        task: TaskRecord,
+        *,
+        approval: dict | None = None,
+        resume: bool = False,
+    ) -> None:
+        """Run a task inside one root trace (``task.run``) and record task metrics."""
+        from ai_employee.core import telemetry
+
+        started = time.perf_counter()
+        with telemetry.span(
+            "task.run",
+            **{
+                "task.id": task.id,
+                "task.session_id": task.session_id,
+                "task.mode": task.mode,
+                "task.goal": task.goal[:300],
+                "task.resume": resume,
+            },
+        ) as sp:
+            try:
+                await self._execute_inner(employee, task, approval=approval, resume=resume)
+            finally:
+                status = getattr(task.status, "value", str(task.status))
+                telemetry.set_attrs(
+                    sp,
+                    **{
+                        "task.status": status,
+                        "task.tokens_used": task.tokens_used,
+                        "task.error": task.error,
+                    },
+                )
+                if task.status is TaskStatus.failed:
+                    telemetry.mark_error(sp, task.error or "task failed")
+                telemetry.count("tasks", mode=task.mode, status=status)
+                telemetry.observe(
+                    "task_duration", time.perf_counter() - started, mode=task.mode, status=status
+                )
+
+    async def _execute_inner(
         self,
         employee: Any,
         task: TaskRecord,

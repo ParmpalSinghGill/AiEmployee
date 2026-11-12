@@ -62,6 +62,7 @@ Tests force offline config via `tests/conftest.py` (sets `LLM_PROVIDER=mock` etc
 | Schedules & watchers (⏰) | `observability/schedules.py` (store + `SchedulerRunner`, started in `api/app.py` lifespan) |
 | Autonomy & safety (🛡) | `config/approval_policies.py` (rule-based auto-approval), `observability/audit.py` (outward-action trail), `core/notify.py` (ntfy push), token budgets in `core/usage.py` + `brains/metering.py` |
 | DB models / migrations | `database/models.py`, `migrations/` |
+| OpenTelemetry (traces/metrics/logs → Tempo/Prometheus/Loki, Grafana) | `core/telemetry.py` (off unless `OTEL_ENABLED`); spans in `MeteredBrain`, `Tool.execute`, `ToolUsingAgent.run`, `_run_one_step`, `TaskManager._execute`; stack in `docker-compose.observability.yml` + `deploy/observability/`, started by `start_server.sh` |
 
 ## Extending
 

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Stop the background AI Employee server started by start_server.sh.
+#   ./stop_server.sh          # stop the server, leave the observability containers running
+#   ./stop_server.sh --all    # also stop Grafana/Prometheus/Loki/Tempo/Collector (data is kept)
 
 # Re-exec under bash if launched with sh/dash.
 if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
@@ -11,6 +13,10 @@ PID_FILE="data/server.pid"
 notify() {
   command -v notify-send >/dev/null && notify-send "AI Employee" "$1" || echo "$1"
 }
+
+if [ "${1:-}" = "--all" ] && command -v docker >/dev/null; then
+  docker compose -f docker-compose.observability.yml stop && notify "Observability containers stopped."
+fi
 
 if [ ! -f "$PID_FILE" ]; then
   notify "Server is not running (no ${PID_FILE})."

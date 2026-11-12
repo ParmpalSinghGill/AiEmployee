@@ -967,3 +967,27 @@ body {
 
 /* ── Flow: per-node token usage ─────────────────────────────────────────── */
 .node-sub.tok { font-family: ui-monospace, monospace; font-size: 11px; color: var(--muted); }
+
+/* ── 🎤 Voice input ─────────────────────────────────────────────────────── */
+.mic-btn {
+  flex: none; width: 38px; height: 38px; display: inline-flex;
+  align-items: center; justify-content: center; font-size: 16px; line-height: 1;
+  background: var(--bg-3); border: 1px solid var(--line); color: var(--text);
+  border-radius: var(--radius); cursor: pointer; position: relative;
+}
+.mic-btn:hover { border-color: var(--accent-2); }
+.mic-btn:disabled { opacity: .45; cursor: not-allowed; }
+.mic-btn.recording {
+  background: rgba(239,94,107,.16); border-color: var(--red); color: var(--red);
+  animation: mic-pulse 1.2s ease-in-out infinite;
+}
+.mic-btn.busy { cursor: progress; }
+.mic-btn .mic-timer {
+  position: absolute; bottom: -16px; left: 50%; transform: translateX(-50%);
+  font-size: 10.5px; color: var(--red); white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+@keyframes mic-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(239,94,107,.45); }
+  50%      { box-shadow: 0 0 0 6px rgba(239,94,107,0); }
+}
+@media (prefers-reduced-motion: reduce) { .mic-btn.recording { animation: none; } }

@@ -14,6 +14,7 @@
     <form id="new-task-form" class="composer">
       <input id="new-task-input" type="text" autocomplete="off"
              placeholder="Give the employee a goal…  (e.g. Research X and write a brief)" />
+      <button type="button" id="new-task-mic" class="mic-btn" title="Speak your goal (click to start, click again to stop — transcribed locally with Whisper)" aria-label="Speak instead of typing">🎤</button>
       <select id="task-mode" title="Pipeline">
         <option value="task">Task</option>
         <option value="research">🔬 Research</option>
@@ -104,6 +105,7 @@
       <form class="followup">
         <input type="text" class="followup-input" autocomplete="off"
                placeholder="Ask a follow-up or add a related task…" />
+        <button type="button" class="mic-btn followup-mic" title="Speak your follow-up (click to start, click again to stop)" aria-label="Speak instead of typing">🎤</button>
         <button type="submit" class="btn">↳ Ask follow-up</button>
       </form>
     </section>

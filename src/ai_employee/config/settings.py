@@ -98,6 +98,14 @@ class Settings(BaseSettings):
     environment: Environment = Environment.development
     log_level: str = "INFO"
     log_json: bool = False
+    # ── OpenTelemetry (traces → Tempo, metrics → Prometheus, logs → Loki) ──
+    # Off by default so the app stays offline. start_server.sh turns it on when
+    # the docker-compose.observability.yml stack is up. Endpoint = collector's
+    # OTLP/HTTP port; standard OTEL_EXPORTER_OTLP_ENDPOINT env var maps here.
+    otel_enabled: bool = False
+    otel_exporter_otlp_endpoint: str = "http://localhost:4318"
+    otel_service_name: str = "ai-employee"
+    otel_metric_export_interval_ms: int = 10000
     api_host: str = "0.0.0.0"
     api_port: int = 8000
 
@@ -212,6 +220,13 @@ class Settings(BaseSettings):
     # GPU VRAM available locally (GB); 0 = unknown. Used by estimate_hardware to
     # decide whether a found model can run/train on this machine.
     local_gpu_vram_gb: float = 0.0
+    # 🎤 Voice input — local speech-to-text with faster-whisper (no API calls).
+    # Model: tiny | base | small | medium | large-v3 | turbo (downloaded once on
+    # first use). Device: auto | cuda | cpu. Language: "" = auto-detect, or "en"…
+    whisper_model: str = "small"
+    whisper_device: str = "auto"
+    whisper_compute_type: str = "auto"
+    whisper_language: str = ""
     smtp_host: str = ""
     smtp_port: int = 587
     smtp_user: str = ""

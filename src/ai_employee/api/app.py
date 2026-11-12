@@ -14,6 +14,7 @@ from ai_employee.api.routes import router
 from ai_employee.api.ui import router as ui_router
 from ai_employee.config import get_settings
 from ai_employee.core.logging import configure_logging, get_logger
+from ai_employee.core.telemetry import TelemetryMiddleware, setup_telemetry, shutdown_telemetry
 
 log = get_logger("api")
 
@@ -22,6 +23,7 @@ log = get_logger("api")
 async def lifespan(app: FastAPI):
     s = get_settings()
     configure_logging(s.log_level, json=s.log_json)
+    setup_telemetry(s)
     log.info("api.startup", provider=s.llm_provider.value, env=s.environment.value)
     # Resume any run left mid-flight by a previous shutdown (e.g. an approval that
     # was queued but never executed) so it isn't silently orphaned in 'pending'.
@@ -50,6 +52,7 @@ async def lifespan(app: FastAPI):
         await runner.stop()
     await shutdown_employee()
     log.info("api.shutdown")
+    shutdown_telemetry()
 
 
 def create_app() -> FastAPI:
@@ -66,6 +69,8 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    # No-op unless OTEL_ENABLED (checked per request, after lifespan setup).
+    app.add_middleware(TelemetryMiddleware)
     app.include_router(router)
     app.include_router(ui_router)
 

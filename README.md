@@ -217,6 +217,91 @@ Open **http://localhost:8010/ui** for the dashboard:
 docker compose up --build          # Postgres+pgvector, Redis, API, migrations
 ```
 
+### 6. Logging & monitoring (OpenTelemetry · Prometheus · Loki · Tempo · Grafana)
+
+`./start.sh` (same as `./start_server.sh`) starts five Docker containers, starts the
+server with `OTEL_ENABLED=true`, and prints a link to each dashboard. The app sends
+traces, metrics and logs over OpenTelemetry to one Collector, which forwards each
+signal to its store. Grafana reads all three stores.
+
+```
+AI Employee ──OTLP/HTTP :4318──▶ OpenTelemetry Collector ─┬─ traces  ──▶ Tempo       :3200
+                                                          ├─ metrics ──▶ Prometheus  :9090
+                                                          └─ logs    ──▶ Loki        :3100
+                                       Grafana :3000  ◀── reads all three, "AI Employee" dashboard
+```
+
+```bash
+./start.sh                       # containers + server, then prints the links below
+OBSERVABILITY=0 ./start.sh       # server only, no Docker stack
+./stop_server.sh                 # stop the server (containers keep running)
+./stop_server.sh --all           # also stop the containers (data is kept)
+
+# Manage the stack directly
+docker compose -f docker-compose.observability.yml up -d
+docker compose -f docker-compose.observability.yml ps      # check the containers are running
+docker compose -f docker-compose.observability.yml logs -f grafana
+docker compose -f docker-compose.observability.yml down -v # remove containers and all stored data
+```
+
+**Containers** (all in the Docker project `aiemployee-observability`):
+
+| Container | Image | Host port | What it does |
+|---|---|---|---|
+| `otel-collector` | `otel/opentelemetry-collector-contrib:0.116.1` | 4317 (gRPC), 4318 (HTTP) | Receives OTLP from the app and forwards each signal to its store |
+| `prometheus` | `prom/prometheus:v3.1.0` | 9090 | Stores metrics; scrapes the Collector, and Tempo writes span metrics to it |
+| `loki` | `grafana/loki:3.3.2` | 3100 | Stores logs (each log field is queryable) |
+| `tempo` | `grafana/tempo:2.6.1` | 3200 | Stores traces; generates the service map |
+| `grafana` | `grafana/grafana:11.4.0` | 3000 | Dashboards; no login needed locally (admin / admin if asked) |
+
+**When it's running, check it with `docker compose -f docker-compose.observability.yml ps`:**
+
+```
+NAME                                        SERVICE          STATUS         PORTS
+aiemployee-observability-grafana-1          grafana          Up             0.0.0.0:3000->3000/tcp
+aiemployee-observability-loki-1             loki             Up             0.0.0.0:3100->3100/tcp
+aiemployee-observability-otel-collector-1   otel-collector   Up             0.0.0.0:4317-4318->4317-4318/tcp
+aiemployee-observability-prometheus-1       prometheus       Up             0.0.0.0:9090->9090/tcp
+aiemployee-observability-tempo-1            tempo            Up             0.0.0.0:3200->3200/tcp
+```
+
+**Links** (`start.sh` prints these):
+
+| What | Link |
+|---|---|
+| Grafana dashboard ("AI Employee") | http://localhost:3000/d/ai-employee/ai-employee |
+| Logs: Grafana → Explore → Loki, query `{service_name="ai-employee"}` | http://localhost:3000/explore |
+| Traces: Grafana → Explore → Tempo, TraceQL `{resource.service.name="ai-employee"}` | http://localhost:3000/explore |
+| Prometheus (metrics, query `ai_employee_*`) | http://localhost:9090/graph |
+| Prometheus scrape targets (all should be UP) | http://localhost:9090/targets |
+| Loki / Tempo health | http://localhost:3100/ready · http://localhost:3200/ready |
+
+**What's captured**
+
+- **Traces.** Each task is one trace: the HTTP request, then `task.run`, then each plan
+  `step`, then the `agent` turn, then every `llm.chat` / `llm.structured_output` call
+  (model and token counts) and every `tool` call (status and error). Failed spans are
+  marked red. Approval pauses and user stops are not counted as errors.
+- **Metrics.** `ai_employee_tasks_total`, `_steps_total`, `_agent_runs_total`,
+  `_llm_calls_total`, `_llm_tokens_total`, `_tool_calls_total` and
+  `_http_requests_total`, each with a matching `_duration_seconds` histogram, labelled by
+  status, agent, model, tool or route.
+- **Logs.** Every structured log event at INFO or above, the same stream the console's
+  Logs tab shows. Fields such as `task_id`, `agent`, `tool` and `step` become Loki
+  fields, and each line carries its `trace_id`. In Grafana, a log line's **View trace**
+  button opens its trace, and a span's **Logs for this span** button shows its logs.
+
+The dashboard has panels for task outcomes, LLM latency and tokens per model, agent and
+step activity, top and failing tools, HTTP latency, log volume, a filterable log viewer,
+recent task traces, slow or failing spans, and the service map.
+
+Telemetry is **off by default** (`OTEL_ENABLED=false`) so offline runs and the tests make
+no network calls. To use it without `start.sh`, start the stack and set `OTEL_ENABLED=true`
+(and `OTEL_EXPORTER_OTLP_ENDPOINT` if the Collector is not on `localhost:4318`). The
+code is in `src/ai_employee/core/telemetry.py`. The stack's config files are in
+`deploy/observability/`. You can change host ports with `GRAFANA_PORT`, `PROMETHEUS_PORT`,
+`LOKI_PORT`, `TEMPO_PORT` and `OTLP_HTTP_PORT`.
+
 ---
 
 ## Switching providers

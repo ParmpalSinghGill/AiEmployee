@@ -5,6 +5,7 @@ from __future__ import annotations
 import abc
 import itertools
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -14,6 +15,7 @@ from ai_employee.agents.loop_check import LoopCheckService, LoopVerdict
 from ai_employee.brains.base import Brain
 from ai_employee.brains.schemas import Message, Role
 from ai_employee.config import get_settings
+from ai_employee.core import telemetry
 from ai_employee.core.exceptions import ApprovalRequired
 from ai_employee.core.logging import get_logger
 from ai_employee.core.trace import clip, clip_obj, tool_clip
@@ -127,10 +129,27 @@ class ToolUsingAgent(BaseAgent):
         # agent from reading something a *different* agent had already read, which
         # tripped the repeated-duplicate abort and killed the step before it worked.
         token = bind_dedup_scope(f"{self.name}:{id(ctx)}:{_scope_counter()}")
+        started = time.perf_counter()
+        status = "error"
         try:
-            return await self._run_inner(task, ctx)
+            with telemetry.span(f"agent {self.name}", **{"agent.name": self.name}) as sp:
+                result = await self._run_inner(task, ctx)
+                status = "ok" if getattr(result, "success", True) else "failed"
+                telemetry.set_attrs(
+                    sp,
+                    **{
+                        "agent.status": status,
+                        "agent.confidence": getattr(result, "confidence", None),
+                    },
+                )
+                return result
+        except ApprovalRequired:
+            status = "approval_required"
+            raise
         finally:
             reset_dedup_scope(token)
+            telemetry.count("agent_runs", agent=self.name, status=status)
+            telemetry.observe("agent_duration", time.perf_counter() - started, agent=self.name)
 
     async def _run_inner(self, task: str, ctx: AgentContext) -> AgentResult:
         log.info("agent.start", agent=self.name, session=ctx.session_id)

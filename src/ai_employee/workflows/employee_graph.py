@@ -27,6 +27,7 @@ from ai_employee.agents.routing import resolve_agent_name
 from ai_employee.agents.specs import DOWNLOAD_TOOLS
 from ai_employee.brains.base import Brain
 from ai_employee.config import get_settings
+from ai_employee.core import telemetry
 from ai_employee.core.logging import bind_context, get_logger
 from ai_employee.memory import MemoryManager, MemoryNamespace
 from ai_employee.memory.skill_policy import (
@@ -566,6 +567,48 @@ class Orchestrator:
         }
 
     async def _run_one_step(
+        self,
+        state: EmployeeState,
+        step: dict[str, Any],
+        results: list[dict[str, Any]],
+    ) -> _StepOutcome:
+        """Run one step inside a telemetry span (see ``_run_one_step_inner``)."""
+        agent = str(step.get("agent", ""))
+        started = time.perf_counter()
+        status = "error"
+        try:
+            with telemetry.span(
+                f"step {step.get('id')} · {agent}",
+                **{
+                    "step.id": step.get("id"),
+                    "step.agent": agent,
+                    "step.description": str(step.get("description", ""))[:300],
+                },
+            ) as sp:
+                outcome = await self._run_one_step_inner(state, step, results)
+                record = outcome.record or {}
+                if outcome.record is None:
+                    status = "halted"
+                elif record.get("skipped"):
+                    status = "skipped"
+                elif record.get("verified"):
+                    status = "verified"
+                else:
+                    status = "unverified"
+                telemetry.set_attrs(
+                    sp,
+                    **{
+                        "step.status": status,
+                        "step.confidence": record.get("confidence"),
+                        "step.retries": record.get("retries"),
+                    },
+                )
+                return outcome
+        finally:
+            telemetry.count("steps", agent=agent, status=status)
+            telemetry.observe("step_duration", time.perf_counter() - started, agent=agent)
+
+    async def _run_one_step_inner(
         self,
         state: EmployeeState,
         step: dict[str, Any],

@@ -15,6 +15,7 @@ from typing import Any, ClassVar, get_type_hints
 from pydantic import BaseModel, ValidationError
 
 from ai_employee.brains.schemas import ToolSpec
+from ai_employee.core import telemetry
 from ai_employee.core.exceptions import ApprovalRequired, ToolError
 from ai_employee.core.logging import get_logger
 
@@ -73,6 +74,22 @@ class Tool(abc.ABC):
         failures — those come back as ``ToolResult(ok=False)`` so the agent loop
         can decide how to react."""
         started = time.perf_counter()
+        with telemetry.span(f"tool {self.name}", **{"tool.name": self.name}) as sp:
+            try:
+                result = await self._execute_validated(kwargs, started)
+            except ApprovalRequired:
+                telemetry.set_attrs(sp, **{"tool.status": "approval_required"})
+                telemetry.count("tool_calls", tool=self.name, status="approval_required")
+                raise
+            status = "ok" if result.ok else "error"
+            telemetry.set_attrs(sp, **{"tool.status": status, "tool.error": result.error})
+            if not result.ok:
+                telemetry.mark_error(sp, str(result.error or "tool failed"))
+            telemetry.count("tool_calls", tool=self.name, status=status)
+            telemetry.observe("tool_duration", time.perf_counter() - started, tool=self.name)
+            return result
+
+    async def _execute_validated(self, kwargs: dict[str, Any], started: float) -> ToolResult:
         kwargs = _unwrap_raw_args(kwargs)
         try:
             args = self.Args(**kwargs)

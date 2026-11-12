@@ -834,6 +834,7 @@ function buildSection(session) {
     });
   });
   wireFlowJumps($(".flow-view", node), session);
+  wireMic($(".followup-mic", node), $(".followup-input", node));
   $(".followup", node).addEventListener("submit", (e) => {
     e.preventDefault();
     const input = $(".followup-input", node);
@@ -2120,6 +2121,153 @@ function renderPlan(task, session, r) {
   return html;
 }
 
+/* ── 🎤 Voice input ─────────────────────────────────────────────────────
+ * Click the mic to record, click again (or Enter) to stop; Esc cancels. The clip
+ * is posted to /ui/api/transcribe and turned into text by a local Whisper model
+ * on the server — the text lands in the input for review before you run it. */
+const MIC_MAX_SECONDS = 120;
+let micStatus = null;        // promise of /ui/api/transcribe/status
+let micActive = null;        // the one recording in progress: {btn, stop, cancel}
+
+function micSupported() {
+  return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
+}
+
+function micMimeType() {
+  for (const t of ["audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/webm", "audio/mp4"]) {
+    if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t)) return t;
+  }
+  return "";
+}
+
+function insertTranscript(input, text) {
+  text = (text || "").trim();
+  if (!text) return;
+  const cur = input.value;
+  const start = input.selectionStart ?? cur.length;
+  const end = input.selectionEnd ?? cur.length;
+  const before = cur.slice(0, start), after = cur.slice(end);
+  const pad = before && !/\s$/.test(before) ? " " : "";
+  const padAfter = after && !/^\s/.test(after) ? " " : "";
+  input.value = before + pad + text + padAfter + after;
+  const caret = (before + pad + text).length;
+  input.focus();
+  input.setSelectionRange(caret, caret);
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+function setMicIdle(btn, title) {
+  btn.classList.remove("recording", "busy");
+  btn.disabled = false;
+  btn.innerHTML = "🎤";
+  if (title) btn.title = title;
+}
+
+async function startRecording(btn, input) {
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true },
+    });
+  } catch (err) {
+    alert("Microphone not available: " + (err.message || err.name) +
+          "\n\nAllow microphone access for this page in the browser and try again.");
+    return;
+  }
+  const mime = micMimeType();
+  const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+  const chunks = [];
+  let cancelled = false;
+  const started = Date.now();
+  rec.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+
+  btn.classList.add("recording");
+  btn.innerHTML = `⏹<span class="mic-timer">0:00</span>`;
+  btn.title = "Recording… click (or press Enter) to stop, Esc to cancel";
+  const timer = setInterval(() => {
+    const s = Math.floor((Date.now() - started) / 1000);
+    const t = btn.querySelector(".mic-timer");
+    if (t) t.textContent = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+    if (s >= MIC_MAX_SECONDS) stop();
+  }, 250);
+
+  const onKey = (e) => {
+    if (e.key === "Escape") { e.preventDefault(); cancel(); }
+    else if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); stop(); }
+  };
+  document.addEventListener("keydown", onKey, true);
+
+  function cleanup() {
+    clearInterval(timer);
+    document.removeEventListener("keydown", onKey, true);
+    stream.getTracks().forEach(t => t.stop());
+    micActive = null;
+  }
+  function stop() { if (rec.state !== "inactive") rec.stop(); }
+  function cancel() { cancelled = true; stop(); }
+
+  rec.onstop = async () => {
+    cleanup();
+    if (cancelled || !chunks.length) { setMicIdle(btn, "Speak instead of typing"); return; }
+    const blob = new Blob(chunks, { type: rec.mimeType || mime || "audio/webm" });
+    btn.classList.remove("recording");
+    btn.classList.add("busy");
+    btn.disabled = true;
+    btn.innerHTML = `<span class="spin">◌</span>`;
+    btn.title = "Transcribing locally with Whisper…";
+    try {
+      const res = await fetch("/ui/api/transcribe", {
+        method: "POST",
+        headers: { "Content-Type": blob.type || "application/octet-stream" },
+        body: blob,
+      });
+      if (!res.ok) {
+        let msg = await res.text();
+        try { msg = JSON.parse(msg).detail || msg; } catch { /* plain text */ }
+        throw new Error(msg);
+      }
+      const data = await res.json();
+      if (data.text) insertTranscript(input, data.text);
+      else alert("Didn't catch any speech — try again a little closer to the mic.");
+      setMicIdle(btn, `Speak instead of typing (Whisper ${data.model} on ${data.device})`);
+    } catch (err) {
+      setMicIdle(btn, "Speak instead of typing");
+      alert("Voice input failed: " + (err.message || err));
+    }
+  };
+
+  micActive = { btn, stop, cancel };
+  rec.start(250);
+}
+
+function wireMic(btn, input) {
+  if (!btn || !input || btn._micWired) return;
+  btn._micWired = true;
+  if (!micSupported()) {
+    btn.disabled = true;
+    btn.title = window.isSecureContext
+      ? "This browser can't record audio."
+      : "The microphone only works on https:// or http://localhost — open the console via localhost.";
+    return;
+  }
+  micStatus = micStatus || api("GET", "/ui/api/transcribe/status").catch(() => null);
+  micStatus.then(st => {
+    if (st && !st.available) {
+      btn.disabled = true;
+      btn.title = "Voice input needs faster-whisper on the server: pip install faster-whisper";
+    } else if (st) {
+      btn.title = `Speak instead of typing — local Whisper (${st.model}). Click to start, click again to stop.`;
+    }
+  });
+  btn.addEventListener("click", () => {
+    if (micActive && micActive.btn === btn) { micActive.stop(); return; }
+    if (btn._starting) return;                  // permission prompt still open
+    if (micActive) micActive.cancel();          // only one mic at a time
+    btn._starting = true;
+    startRecording(btn, input).finally(() => { btn._starting = false; });
+  });
+}
+
 /* ── Bootstrap ─────────────────────────────────────────────────────────── */
 function syncComposerModeUi() {
   const modeSel = $("#task-mode");
@@ -2151,6 +2299,7 @@ $("#new-task-form").addEventListener("submit", (e) => {
   const mode = $("#task-mode") ? $("#task-mode").value : "task";
   newTask(goal, mode).catch(err => alert("Failed to start task: " + err.message));
 });
+wireMic($("#new-task-mic"), $("#new-task-input"));
 if ($("#task-mode")) {
   $("#task-mode").addEventListener("change", syncComposerModeUi);
   syncComposerModeUi();

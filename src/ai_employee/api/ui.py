@@ -7,6 +7,7 @@ logs, shows results, and submits follow-up questions.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Literal
 
@@ -303,6 +304,66 @@ async def create_task(
         owner={"id": user.id, "name": user.name, "guest": user.is_guest},
     )
     return {"task_id": task.id, "session_id": task.session_id}
+
+
+_MAX_AUDIO_BYTES = 25 * 1024 * 1024  # ~25 min of opus; far beyond a spoken goal
+_warm_task: asyncio.Task | None = None
+
+
+def _spawn_warm_up(warm_up) -> None:
+    global _warm_task
+    if _warm_task is None or (_warm_task.done() and _warm_task.exception() is not None):
+        _warm_task = asyncio.create_task(warm_up())
+
+
+@router.get("/ui/api/transcribe/status", tags=["ui"])
+async def transcribe_status() -> dict:
+    """Whether the 🎤 button can work, and which local Whisper model it uses."""
+    from ai_employee.core.speech import speech_available, warm_up
+
+    s = get_settings()
+    available = speech_available()
+    if available and s.llm_provider != LLMProvider.mock:
+        # The console asks once on load: start loading the model now so the
+        # first 🎤 click doesn't wait for it (no-op once loaded). Skipped in
+        # offline/mock mode so tests never fetch a model.
+        _spawn_warm_up(warm_up)
+    return {
+        "available": available,
+        "model": s.whisper_model,
+        "device": s.whisper_device,
+        "language": s.whisper_language or "auto",
+    }
+
+
+@router.post("/ui/api/transcribe", tags=["ui"])
+async def transcribe(
+    request: Request,
+    language: str | None = Query(default=None, max_length=10),
+    _user: CurrentUser = Depends(get_current_user),
+) -> dict:
+    """Speech → text with a local Whisper model. Body: the raw recorded clip
+    (webm/ogg/wav/mp3). The audio is decoded in memory and never stored."""
+    from ai_employee.core.speech import SpeechUnavailableError, transcribe_audio
+
+    audio = await request.body()
+    if not audio:
+        raise HTTPException(400, "No audio received.")
+    if len(audio) > _MAX_AUDIO_BYTES:
+        raise HTTPException(413, "Recording too long — keep it under a few minutes.")
+    try:
+        result = await transcribe_audio(audio, language=language)
+    except SpeechUnavailableError as e:
+        raise HTTPException(503, str(e)) from e
+    except Exception as e:  # noqa: BLE001 — undecodable/corrupt clip
+        raise HTTPException(422, f"Could not transcribe the recording: {e}") from e
+    return {
+        "text": result.text,
+        "language": result.language,
+        "duration": round(result.duration, 2),
+        "model": result.model,
+        "device": result.device,
+    }
 
 
 @router.post("/ui/api/sessions/{session_id}/followup", tags=["ui"])

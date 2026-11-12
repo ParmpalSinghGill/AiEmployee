@@ -365,11 +365,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
 async def _run_async(args) -> int:
     from ai_employee import AIEmployee
+    from ai_employee.config import get_settings
+    from ai_employee.core import telemetry
 
     emp = AIEmployee()
+    telemetry.setup_telemetry(get_settings())  # no-op unless OTEL_ENABLED
     try:
         if args.command == "run":
-            result = await emp.run(args.goal, session_id=args.session)
+            with telemetry.span("cli.run", **{"task.goal": args.goal[:300]}):
+                result = await emp.run(args.goal, session_id=args.session)
             if getattr(args, "json", False):
                 console.print_json(json.dumps(result, default=str))
                 return 0
@@ -450,6 +454,7 @@ async def _run_async(args) -> int:
         return 0
     finally:
         await emp.aclose()
+        telemetry.shutdown_telemetry()
 
 
 def main(argv: list[str] | None = None) -> int:

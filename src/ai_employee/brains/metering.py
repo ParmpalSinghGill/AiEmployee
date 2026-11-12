@@ -15,13 +15,15 @@ tokens are counted once, without double counting here.
 
 from __future__ import annotations
 
+import time
 from collections.abc import AsyncIterator, Sequence
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from pydantic import BaseModel
 
 from ai_employee.brains.base import Brain
 from ai_employee.brains.schemas import ChatResult, Message, ToolSpec
+from ai_employee.core import telemetry
 from ai_employee.core.exceptions import BudgetExceeded
 from ai_employee.core.usage import active_meters, brain_label, record_usage
 
@@ -37,6 +39,28 @@ def _enforce_budget() -> None:
     for meter in active_meters():
         if meter.budget and meter.total_tokens >= meter.budget:
             raise BudgetExceeded(meter.total_tokens, meter.budget)
+
+
+def _record_llm(sp: Any, labels: dict[str, str], started: float, result: ChatResult) -> None:
+    """Export one finished LLM call: span attributes + latency/token metrics."""
+    if not telemetry.is_enabled():
+        return
+    usage = result.usage
+    telemetry.set_attrs(
+        sp,
+        **{
+            "gen_ai.response.model": result.model,
+            "gen_ai.response.finish_reason": result.finish_reason,
+            "gen_ai.usage.input_tokens": usage.prompt_tokens if usage else None,
+            "gen_ai.usage.output_tokens": usage.completion_tokens if usage else None,
+            "llm.tool_calls": len(result.tool_calls),
+        },
+    )
+    telemetry.count("llm_calls", status="ok", **labels)
+    telemetry.observe("llm_duration", time.perf_counter() - started, **labels)
+    if usage:
+        telemetry.count("llm_tokens", usage.prompt_tokens, type="input", **labels)
+        telemetry.count("llm_tokens", usage.completion_tokens, type="output", **labels)
 
 
 class MeteredBrain(Brain):
@@ -66,16 +90,38 @@ class MeteredBrain(Brain):
         reasoning: bool = False,
     ) -> ChatResult:
         _enforce_budget()
-        with brain_label(self._inner.name, model or self._inner.model_name):
-            result = await self._inner.chat(
-                messages,
-                tools=tools,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                model=model,
-                reasoning=reasoning,
-            )
+        model_name = model or self._inner.model_name
+        labels = {"provider": self._inner.name, "model": model_name, "kind": "chat"}
+        started = time.perf_counter()
+        with (
+            brain_label(self._inner.name, model_name),
+            telemetry.span(
+                f"llm.chat {model_name}",
+                **{
+                    "gen_ai.system": self._inner.name,
+                    "gen_ai.request.model": model_name,
+                    "gen_ai.request.max_tokens": max_tokens,
+                    "llm.messages": len(messages),
+                    "llm.tools": len(tools or ()),
+                    "llm.reasoning": reasoning,
+                },
+            ) as sp,
+        ):
+            try:
+                result = await self._inner.chat(
+                    messages,
+                    tools=tools,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    model=model,
+                    reasoning=reasoning,
+                )
+            except Exception:
+                telemetry.count("llm_calls", status="error", **labels)
+                telemetry.observe("llm_duration", time.perf_counter() - started, **labels)
+                raise
             record_usage(result.usage)
+            _record_llm(sp, labels, started, result)
         return result
 
     async def structured_output(
@@ -87,7 +133,18 @@ class MeteredBrain(Brain):
         model: str | None = None,
     ) -> TModel:
         _enforce_budget()
-        with brain_label(self._inner.name, model or self._inner.model_name):
+        model_name = model or self._inner.model_name
+        with (
+            brain_label(self._inner.name, model_name),
+            telemetry.span(
+                f"llm.structured_output {schema.__name__}",
+                **{
+                    "gen_ai.system": self._inner.name,
+                    "gen_ai.request.model": model_name,
+                    "llm.schema": schema.__name__,
+                },
+            ),
+        ):
             return await self._inner.structured_output(
                 messages, schema, temperature=temperature, model=model
             )

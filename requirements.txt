@@ -27,6 +27,9 @@ uvicorn[standard]>=0.30
 sse-starlette>=2.1
 python-multipart>=0.0.9
 
+# ── Voice input (🎤 local speech-to-text; model downloaded on first use) ─────
+faster-whisper>=1.0
+
 # ── Persistence ──────────────────────────────────────────────────────────────
 sqlalchemy[asyncio]>=2.0.31
 asyncpg>=0.29
@@ -53,3 +56,7 @@ secretstorage>=3.3; sys_platform == "linux"  # yt-dlp --cookies-from-browser on 
 
 # ── Observability ────────────────────────────────────────────────────────────
 prometheus-client>=0.20
+# OpenTelemetry → collector → Tempo / Prometheus / Loki (see docker-compose.observability.yml)
+opentelemetry-api>=1.39
+opentelemetry-sdk>=1.39
+opentelemetry-exporter-otlp-proto-http>=1.39
