@@ -91,3 +91,6 @@ docker-compose.override.yml
 pip-log.txt
 pip-delete-this-directory.txt
 secrates/
+
+# Local qualification notes (not part of the project)
+possible_questions.pdf
